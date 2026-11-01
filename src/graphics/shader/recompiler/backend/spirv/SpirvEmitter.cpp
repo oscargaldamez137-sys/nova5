@@ -202,6 +202,14 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
 			}
+			if (program.stage == ShaderType::Pixel && program.ps_helper_atomics_skip) {
+				const auto buffer = IR::BufferAccessOf(inst.GetOpcode());
+				const auto shared = IR::SharedAccessOf(inst.GetOpcode());
+				requirements.helper_invocation |=
+				    buffer == IR::BufferAccess::Write || buffer == IR::BufferAccess::Atomic ||
+				    shared == IR::SharedAccess::Write || shared == IR::SharedAccess::Atomic ||
+				    IR::ImageOpcodeInfoOf(inst.GetOpcode()).access == IR::ImageAccess::Atomic;
+			}
 			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
 			if (address_access != IR::AddressAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
@@ -251,11 +259,18 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
 					MarkBallot();
+					requirements.helper_invocation |= program.stage == ShaderType::Pixel && program.ps_append_live_election;
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::IsHelperInvocation:
+					if (program.stage != ShaderType::Pixel) {
+						Fail(program, "helper-invocation query outside a pixel shader");
+					}
+					requirements.helper_invocation = true;
+					break;
 				case IR::ValueOpcode::Ballot:
 				case IR::ValueOpcode::AnyLane: MarkBallot(); break;
 				case IR::ValueOpcode::DppMoveU32:

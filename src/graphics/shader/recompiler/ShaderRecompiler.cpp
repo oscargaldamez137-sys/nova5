@@ -807,6 +807,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	    (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureNativeFloatMinMax) != 0;
 	ir.bda_group_walks = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureBdaGroupWalks) != 0;
 	ir.pixel_quad_reads = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePixelQuadReads) != 0;
+	ir.ps_append_live_election = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePsAppendLiveElection) != 0;
+	ir.ps_helper_atomics_skip = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePsHelperAtomicsSkip) != 0;
 	ir.unfused_mad = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureUnfusedMad) != 0;
 	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
 	DumpShaderIr(options, ir);

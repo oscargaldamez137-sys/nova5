@@ -1190,7 +1190,24 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto count =
 	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), low),
 	           Unary(state, OpBitCount, TypeU32(state), high));
-	const auto first       = ctx.FirstLane(ballot);
+	// Keep popcount(EXEC) for MBCNT indexing, but never broadcast a helper's discarded atomic.
+	auto elected_ballot = ballot;
+	auto lane_guard     = exec;
+	if (state.stage == ShaderType::Pixel && state.program.ps_append_live_election && state.lane_count == 1) {
+		const auto live = AndCondition(state, exec, EmitLogicalNotBool(state, EmitIsHelperInvocation(state)));
+		elected_ballot = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), elected_ballot,
+		                           ConstantU32(state, ScopeSubgroup), live});
+		const auto elected_low  = state.builder.AllocateId();
+		const auto elected_high = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, TypeU32(state), elected_low, elected_ballot, 0});
+		state.builder.AddFunction({OpCompositeExtract, TypeU32(state), elected_high, elected_ballot, 1});
+		const auto any_live = Binary(state, OpINotEqual, TypeBool(state),
+		                            Binary(state, OpBitwiseOr, TypeU32(state), elected_low, elected_high),
+		                            ConstantU32(state, 0));
+		lane_guard = AndCondition(state, exec, any_live);
+	}
+	const auto first       = ctx.FirstLane(elected_ballot);
 	const auto source_lane = state.lane_count == 2 ? Binary(state, OpBitwiseAnd, TypeU32(state),
 	                                                        first, ConstantU32(state, 31))
 	                                               : first;
@@ -1205,7 +1222,7 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	    AndCondition(state,
 	                 state.lane_count == 2
 	                     ? Binary(state, OpINotEqual, TypeBool(state), count, ConstantU32(state, 0))
-	                     : exec,
+	                     : lane_guard,
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();

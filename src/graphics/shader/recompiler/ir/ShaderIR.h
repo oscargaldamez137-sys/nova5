@@ -509,6 +509,7 @@ struct SpirvRequirements {
 	bool function_lds                 = false;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
+	bool helper_invocation            = false;
 	bool buffer_int64_atomics         = false;
 };
 
@@ -733,6 +734,8 @@ struct Program: ResourcePlan {
 	bool                          bda_group_walks = false;
 	// Pixel shaders' DPP quad_perm moves read by quad operations (Frontend::TranslatorFeaturePixelQuadReads).
 	bool                          pixel_quad_reads = false;
+	bool                          ps_append_live_election = false;
+	bool                          ps_helper_atomics_skip = false;
 	// V_MAD/V_MAC/V_MADMK/V_MADAK_F32 (FPMad32) unfused (Frontend::TranslatorFeatureUnfusedMad).
 	bool                          unfused_mad = false;
 

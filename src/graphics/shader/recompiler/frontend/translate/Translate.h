@@ -81,9 +81,16 @@ constexpr uint32_t TranslatorFeaturePixelQuadReads = 32u;
 constexpr uint32_t TranslatorFeatureUnfusedMad = 64u;
 // Native vertex stages still execute the guest NGG launch prologue.
 constexpr uint32_t TranslatorFeatureNggVertexLaunch = 128u;
+// Pixel helper correctness switches (CodegenOptions); independent bits in prefetch/static cache stamps.
+constexpr uint32_t TranslatorFeaturePsAppendLiveElection = 256u;
+constexpr uint32_t TranslatorFeaturePsLiveExec = 512u;
+constexpr uint32_t TranslatorFeaturePsLiveExecAll = 1024u;
+constexpr uint32_t TranslatorFeaturePsHelperAtomicsSkip = 2048u;
 constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
                                         TranslatorFeatureNativeFloatMinMax | TranslatorFeatureExecSelects |
-                                        TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad | TranslatorFeatureNggVertexLaunch
+                                        TranslatorFeaturePixelQuadReads | TranslatorFeatureUnfusedMad | TranslatorFeatureNggVertexLaunch |
+                                        TranslatorFeaturePsAppendLiveElection | TranslatorFeaturePsLiveExec |
+                                        TranslatorFeaturePsHelperAtomicsSkip
 #if defined(KYTY_STEAM_DECK)
                                         | TranslatorFeatureBdaGroupWalks
 #endif
@@ -100,7 +107,7 @@ constexpr uint32_t TranslatorFeaturesBroad = TranslatorFeatureExecSelects | Tran
 // anything). KYTY_LANE_LOCAL_COOP=0/1 overrides the cooperative halves either way, KYTY_TABLE_SLOTS_AT_USE=0/1 the
 // table slots' loads, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max, KYTY_EXEC_SELECTS=0/1 the EXEC selects,
 // KYTY_BDA_GROUP_WALKS=0/1 the shared page walks, KYTY_PIXEL_QUAD_READS=0/1 the pixel shaders' quad reads,
-// KYTY_UNFUSED_MAD=0/1 the multiply-adds.
+// KYTY_UNFUSED_MAD=0/1 the multiply-adds. Pixel helper fixes follow CodegenOptions even with an older store.
 void                   SetTranslatorFeatures(uint32_t features);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
 // Those this GPU's translation may use (default: all) and those it uses whatever the store was made with (`required`,

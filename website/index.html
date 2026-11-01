@@ -224,10 +224,13 @@
   document.querySelectorAll('[data-download]').forEach(a => a.href = NOVA5.download || '#empezar');
   document.querySelectorAll('[data-source]').forEach(a => a.href = NOVA5.source || 'https://github.com/KytyPS5/KytyPS5');
   // Total downloads of every release asset, from GitHub's public API; hidden if it cannot be loaded.
+  // GitHub forgets the count of a file that is replaced or removed: the downloads before 01/11/2026 (when the
+  // old versions' files were removed and 0.7.1's replaced) are added here.
+  const earlierDownloads = 150;
   fetch('https://api.github.com/repos/nova5emu/nova5/releases?per_page=100')
     .then(r => r.ok ? r.json() : Promise.reject(r.status))
     .then(releases => {
-      const total = releases.flatMap(r => r.assets ?? []).reduce((sum, a) => sum + (a.download_count ?? 0), 0);
+      const total = earlierDownloads + releases.flatMap(r => r.assets ?? []).reduce((sum, a) => sum + (a.download_count ?? 0), 0);
       document.querySelectorAll('[data-download-count]').forEach(e => { e.dataset.countup = total; (window.nova5CountUp ?? (x => x.textContent = total.toLocaleString('es-ES')))(e); });
       document.querySelectorAll('[data-downloads]').forEach(e => e.hidden = false);
     })

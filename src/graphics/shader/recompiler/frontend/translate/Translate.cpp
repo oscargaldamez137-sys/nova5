@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 #include "local/shader-loop-guard.h"
@@ -68,6 +69,12 @@ uint32_t TranslatorFeatureSet() {
 	apply(quad_reads, TranslatorFeaturePixelQuadReads);
 	apply(unfused_mad, TranslatorFeatureUnfusedMad);
 	apply(ngg_launch, TranslatorFeatureNggVertexLaunch);
+	// Correctness fixes stay enabled with older static stores; stamp every override in the cache key.
+	const auto& codegen = GetCodegenOptions();
+	apply(codegen.ps_append_live_election, TranslatorFeaturePsAppendLiveElection);
+	apply(codegen.ps_live_exec != PsLiveExec::Off, TranslatorFeaturePsLiveExec);
+	apply(codegen.ps_live_exec == PsLiveExec::All, TranslatorFeaturePsLiveExecAll);
+	apply(codegen.ps_helper_atomics_skip, TranslatorFeaturePsHelperAtomicsSkip);
 	return features;
 }
 
@@ -1153,6 +1160,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
 			}
+		}
+		const auto live_exec = GetCodegenOptions().ps_live_exec;
+		if (options.stage == ShaderType::Pixel &&
+		    (live_exec == PsLiveExec::All ||
+		     (live_exec == PsLiveExec::AppendConsume &&
+		      std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+			      return inst.opcode == Decoder::Opcode::DS_APPEND || inst.opcode == Decoder::Opcode::DS_CONSUME;
+		      })))) {
+			initial_exec = entry_ir.LogicalNot(IR::U1(entry_ir.Emit(IR::ValueOpcode::IsHelperInvocation)));
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});

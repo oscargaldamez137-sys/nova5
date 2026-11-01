@@ -762,6 +762,9 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
 			return true;
 		case IR::ValueOpcode::Ballot: ctx.Define(inst, ctx.Ballot(inst.Arg(0))); return true;
+		case IR::ValueOpcode::IsHelperInvocation:
+			ctx.Define(inst, EmitIsHelperInvocation(state));
+			return true;
 		case IR::ValueOpcode::AnyLane: {
 			const auto ballot = ctx.Ballot(inst.Arg(0));
 			const auto low    = state.builder.AllocateId();

@@ -395,8 +395,9 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 
 void AllocateInputVariables(EmitterState& state) {
 	const auto& guard = ShaderLoopGuard::Settings();
-	if (state.lod_stats_subgroup || (state.stage == ShaderType::Pixel && guard.limit != 0 && guard.helper_exit &&
-	                                 guard.Matches(state.program.shader_hash))) {
+	if (state.requirements.helper_invocation || state.lod_stats_subgroup ||
+	    (state.stage == ShaderType::Pixel && guard.limit != 0 && guard.helper_exit &&
+	     guard.Matches(state.program.shader_hash))) {
 		state.lod_helper_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.lod_helper_variable);
 	}

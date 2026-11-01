@@ -54,10 +54,12 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
@@ -14524,6 +14526,211 @@ OpFunctionEnd
                       direct_offset, allocation_size) == 0,
               "depth mapping or allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Draws `vertices` (pos2/color4 triangles, pixel-space positions already in NDC) into a
+  // width x height RGBA32F target cleared to -1.0 with a fragment shader whose only descriptor,
+  // if any, is GDS, and returns the target's words. `gds` is read and written by the draw.
+  std::vector<u32> RenderFragmentWithGds(const char *name, const CompiledShader &fragment,
+                                         u32 width, u32 height,
+                                         const std::vector<u32> &vertices,
+                                         const Buffer &gds) {
+    using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
+    ValidateSpirv(name, vertex_spirv);
+    Require(name, "graphics GDS", !vertices.empty() && vertices.size() % 18u == 0u,
+            "vertex buffer must contain whole pos2/color4 triangles");
+    const auto &layout = fragment.program.bindings;
+    Require(name, "graphics GDS", !layout.UsesPushData(),
+            "the GDS fragment harness does not bind shader data");
+    std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+    for (const auto &binding : layout.descriptors) {
+      Require(name, "graphics GDS", binding.kind == Kind::Gds,
+              "the GDS fragment harness binds only GDS");
+      layout_bindings.push_back({ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, binding.kind),
+                                 NativeDescriptorType(binding.kind),
+                                 NativeDescriptorCount(binding),
+                                 vk::ShaderStageFlagBits::eFragment});
+    }
+    if (layout_bindings.empty()) {
+      // The shader does not use GDS; the buffer is still bound, unused.
+      layout_bindings.push_back({ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds),
+                                 NativeDescriptorType(Kind::Gds), 1u,
+                                 vk::ShaderStageFlagBits::eFragment});
+    }
+    Require(name, "graphics GDS", layout_bindings.size() == 1u,
+            "fragment shader requested more than the GDS binding");
+
+    Image target = CreateImageMips(name, width, height, vk::Format::eR32G32B32A32Sfloat,
+                                   vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                                   vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+                                   vk::ImageViewType::e2D, 1);
+    auto vertex_buffer = CreateHostBuffer(name, vertices.size() * sizeof(u32),
+                                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
+    vk::ShaderModule vertex_module = CreateShaderModule(name, vertex_spirv);
+    vk::ShaderModule fragment_module = CreateShaderModule(name, fragment.spirv);
+
+    vk::DescriptorSetLayoutCreateInfo set_layout_info{};
+    set_layout_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+    set_layout_info.bindingCount = static_cast<u32>(layout_bindings.size());
+    set_layout_info.pBindings = layout_bindings.data();
+    vk::DescriptorSetLayout set_layout = nullptr;
+    RequireVk(name, "graphics GDS",
+              m_device.createDescriptorSetLayout(&set_layout_info, nullptr, &set_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::DescriptorPoolSize pool_size{layout_bindings[0].descriptorType, 1};
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    vk::DescriptorPool pool = nullptr;
+    RequireVk(name, "graphics GDS", m_device.createDescriptorPool(&pool_info, nullptr, &pool),
+              "vkCreateDescriptorPool");
+    vk::DescriptorSetAllocateInfo set_info{};
+    set_info.sType = vk::StructureType::eDescriptorSetAllocateInfo;
+    set_info.descriptorPool = pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &set_layout;
+    vk::DescriptorSet set = nullptr;
+    RequireVk(name, "graphics GDS", m_device.allocateDescriptorSets(&set_info, &set),
+              "vkAllocateDescriptorSets");
+    const vk::DescriptorBufferInfo gds_info{gds.buffer, 0, gds.size};
+    vk::WriteDescriptorSet write{};
+    write.sType = vk::StructureType::eWriteDescriptorSet;
+    write.dstSet = set;
+    write.dstBinding = layout_bindings[0].binding;
+    write.descriptorCount = 1;
+    write.descriptorType = layout_bindings[0].descriptorType;
+    write.pBufferInfo = &gds_info;
+    m_device.updateDescriptorSets(1, &write, 0, nullptr);
+
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &set_layout;
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "graphics GDS",
+              m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+
+    vk::PipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[0].stage = vk::ShaderStageFlagBits::eVertex;
+    stages[0].module = vertex_module;
+    stages[0].pName = "main";
+    stages[1].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[1].stage = vk::ShaderStageFlagBits::eFragment;
+    stages[1].module = fragment_module;
+    stages[1].pName = "main";
+    vk::VertexInputBindingDescription vertex_binding{0, 6u * sizeof(float),
+                                                     vk::VertexInputRate::eVertex};
+    vk::VertexInputAttributeDescription attributes[2] = {};
+    attributes[0].location = 0;
+    attributes[0].format = vk::Format::eR32G32Sfloat;
+    attributes[0].offset = 0;
+    attributes[1].location = 1;
+    attributes[1].format = vk::Format::eR32G32B32A32Sfloat;
+    attributes[1].offset = 2u * sizeof(float);
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 2;
+    vertex_input.pVertexAttributeDescriptions = attributes;
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+    input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    vk::Viewport viewport{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
+                          0.0f, 1.0f};
+    vk::Rect2D scissor{{0, 0}, {width, height}};
+    vk::PipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+    raster.polygonMode = vk::PolygonMode::eFill;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    raster.frontFace = vk::FrontFace::eCounterClockwise;
+    raster.lineWidth = 1.0f;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
+    multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    vk::PipelineColorBlendAttachmentState color_attachment{};
+    color_attachment.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &color_attachment;
+    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    vk::PipelineRenderingCreateInfo rendering_pipeline{};
+    rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+    rendering_pipeline.colorAttachmentCount = 1;
+    rendering_pipeline.pColorAttachmentFormats = &color_format;
+    vk::GraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+    pipeline_info.pNext = &rendering_pipeline;
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &color_blend;
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "graphics GDS",
+              m_device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines");
+
+    vk::CommandBuffer cmd = BeginCommands(name, "graphics GDS");
+    vk::RenderingAttachmentInfo color{};
+    color.sType = vk::StructureType::eRenderingAttachmentInfo;
+    color.imageView = target.view;
+    color.imageLayout = vk::ImageLayout::eGeneral;
+    color.loadOp = vk::AttachmentLoadOp::eClear;
+    color.storeOp = vk::AttachmentStoreOp::eStore;
+    color.clearValue.color = vk::ClearColorValue(std::array<float, 4>{-1.0f, -1.0f, -1.0f, -1.0f});
+    vk::RenderingInfo rendering{};
+    rendering.sType = vk::StructureType::eRenderingInfo;
+    rendering.renderArea.extent = vk::Extent2D{width, height};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    cmd.beginRendering(rendering);
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1, &set, 0,
+                           nullptr);
+    vk::DeviceSize offset = 0;
+    cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+    cmd.draw(static_cast<u32>(vertices.size() / 6u), 1, 0, 0);
+    cmd.endRendering();
+    vk::MemoryBarrier barrier{};
+    barrier.sType = vk::StructureType::eMemoryBarrier;
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eTransferRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+                        vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer,
+                        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    EndSubmitAndFree(name, "graphics GDS", cmd);
+    target.layout = vk::ImageLayout::eGeneral;
+    auto pixels = ReadImage(name, &target);
+
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorPool(pool, nullptr);
+    m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+    m_device.destroyShaderModule(fragment_module, nullptr);
+    m_device.destroyShaderModule(vertex_module, nullptr);
+    DestroyBuffer(&vertex_buffer);
+    DestroyImage(&target);
+    return pixels;
   }
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
@@ -32336,6 +32543,7 @@ void CheckDrawRunArguments() {
 namespace Libs::Graphics {
 namespace {
 #include "SamplerPhiTests.inc"
+#include "ShaderGiProbeTests.inc"
 }
 }
 
@@ -32348,6 +32556,21 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && (std::strcmp(argv[1], "--gi-probe-codegen-only") == 0 ||
+                    std::strcmp(argv[1], "--gi-probe-only") == 0)) {
+    GiProbeTests::CheckPixelLiveExecCodegen();
+    GiProbeTests::CheckPixelAppendElectionCodegen();
+    GiProbeTests::CheckPixelHelperAtomicsCodegen();
+    GiProbeTests::CheckComputeCodegenUnchanged();
+    GiProbeTests::CheckCodegenFeatureKeys();
+    if (std::strcmp(argv[1], "--gi-probe-only") == 0) {
+      VulkanHarness vulkan;
+      GiProbeTests::CheckPixelAppendHelperElection(&vulkan);
+      GiProbeTests::CheckPixelAppendLiveExec(&vulkan);
+      GiProbeTests::CheckPixelWqmLiveExec(&vulkan);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-phi-only") == 0) {
     try {
       CheckSamplerPhiSpirv();

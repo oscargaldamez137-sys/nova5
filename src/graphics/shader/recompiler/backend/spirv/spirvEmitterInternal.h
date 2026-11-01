@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_
 
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -910,8 +911,15 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	                                     std::forward<Fn>(fn));
 }
 
+inline uint32_t EmitIsHelperInvocation(EmitterState& state) {
+	EXIT_IF(state.lod_helper_variable == 0);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeBool(state), value, state.lod_helper_variable});
+	return value;
+}
+
 template <typename Fn>
-uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+uint32_t AtomicUpdateLoop(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
@@ -949,6 +957,18 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
 	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
 	return observed;
+}
+
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	// A helper's atomic result is undefined; its CAS exit test need never succeed.
+	if (state.stage == ShaderType::Pixel && state.program.ps_helper_atomics_skip && state.lod_helper_variable != 0) {
+		const auto live = EmitLogicalNotBool(state, EmitIsHelperInvocation(state));
+		return EmitValueOrZeroIfCondition(state, live, [&]() {
+			return AtomicUpdateLoop(state, pointer, kind, std::forward<Fn>(desired));
+		});
+	}
+	return AtomicUpdateLoop(state, pointer, kind, std::forward<Fn>(desired));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
