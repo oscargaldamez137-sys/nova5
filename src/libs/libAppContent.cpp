@@ -1,51 +1,46 @@
-#include "common/hostPath.h"
-#define KYTY_STALL_HLE
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
-#include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
-#include "libs/systemService.h"
-#include "loader/additionalContent.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
+#include "loader/additionalContent.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <mutex>
+#include <fstream>
 #include <string>
 #include <system_error>
 #include <vector>
 
-namespace Libs {
+#include "kernel/fileSystem.h"
+#include "libs/addcont.h"
 
-namespace AprShared {
-void InvalidateFailedResolves();
-}
+namespace Libs {
 
 LIB_VERSION("AppContent", 1, "AppContentUtil", 1, 1);
 
 namespace AppContent {
 
-constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL = 3;
-constexpr int      APP_CONTENT_ERROR_PARAMETER        = -2133262334; /* 0x80D90002 */
-constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED      = -2133262332; /* 0x80D90004 */
-constexpr int      APP_CONTENT_ERROR_NOT_FOUND        = -2133262331; /* 0x80D90005 */
-constexpr int      APP_CONTENT_ERROR_MOUNT_FULL       = -2133262330; /* 0x80D90006 */
-constexpr size_t   APP_CONTENT_ADDCONT_MOUNT_MAXNUM   = 64;
-
-struct AddcontMount {
-	std::string label;
-	std::string point;
-};
-
-static std::mutex                g_addcont_mutex;
-static std::vector<AddcontMount> g_addcont_mounts;
+constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL   = 3;
+constexpr int      APP_CONTENT_ERROR_PARAMETER          = -2133262334; /* 0x80D90002 */
+constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED        = -2133262332; /* 0x80D90004 */
+constexpr int      APP_CONTENT_ERROR_MOUNT_FULL         = -2133262330; /* 0x80D90006 */
+constexpr int      APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT = -2133262329; /* 0x80D90007 */
 
 static std::string g_title_id;
 
@@ -74,17 +69,17 @@ static bool TryGetTitleIdFromContentId(std::string* title_id) {
 		return false;
 	}
 
-	const auto dash = content_id.find('-');
-	if (dash == std::string::npos) {
+	const uint32_t dash = Common::FindIndex(content_id, '-');
+	if (!Common::IndexValid(content_id, dash)) {
 		return false;
 	}
 
-	const auto underscore = content_id.find('_', dash + 1);
-	if (underscore == std::string::npos || underscore <= dash + 1) {
+	const uint32_t underscore = Common::FindIndex(content_id, '_', dash + 1);
+	if (!Common::IndexValid(content_id, underscore) || underscore <= dash + 1) {
 		return false;
 	}
 
-	*title_id = content_id.substr(dash + 1, underscore - dash - 1);
+	*title_id = Common::Mid(content_id, dash + 1, underscore - dash - 1);
 	return !title_id->empty();
 }
 
@@ -119,8 +114,12 @@ int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
 		LOGF("\t TITLE_ID missing\n");
 	}
 
-	SystemService::NotifyEntitlementUpdate();
-	return Common::StallDump::Result(__func__, OK);
+	// printf, not LOGF: this line is the canary that says a game uses AppContent at all. It comes
+	// after the title id is known, because that is what the add-on directory is named.
+	std::printf("AppContent: initialized; add-on content is looked for in %s\n",
+	            Addcont::Directory(g_title_id).string().c_str());
+
+	return OK;
 }
 
 int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
@@ -146,9 +145,8 @@ int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
 	}
 
 	LOGF("\t value    = %d [%s]\n", *value, found ? "found" : "not found");
-	Common::StallDump::Observe("AppContent.param", param_id, static_cast<uint32_t>(*value), found);
 
-	return Common::StallDump::Result(__func__, OK);
+	return OK;
 }
 
 static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
@@ -162,7 +160,7 @@ static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
 	}
 
 	std::error_code ec;
-	const auto      space = std::filesystem::space(Common::NativeHostPath(std::filesystem::current_path()), ec);
+	const auto      space = std::filesystem::space(std::filesystem::current_path(), ec);
 	if (ec) {
 		LOGF("\t filesystem::space failed: %s\n", ec.message().c_str());
 		*available_space_kb = 1024u * 1024u;
@@ -183,77 +181,291 @@ static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
 int KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point,
                                                             size_t* available_space_kb) {
 	PRINT_NAME();
-	return Common::StallDump::Result(__func__,
-	                                 GetAvailableSpaceKb(mount_point, available_space_kb));
+	return GetAvailableSpaceKb(mount_point, available_space_kb);
 }
+
+} // namespace AppContent
+
+// The add-on directory itself is shared with the entitlement side in libNet, so both answer from one
+// pairing: see libs/addcont.h. This is where it is read and implemented, in Libs::Addcont.
+namespace Addcont {
+
+std::filesystem::path Directory(const std::string& title_id) {
+	return std::filesystem::path("Content") / title_id;
+}
+
+// The console's own content id: UP0001-PPSA01341_00-XXXXXXXXXXXXXXXX.
+static bool IsContentId(const std::string& content_id, const std::string& title_id) {
+	static const std::regex pattern("^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_[0-9]{2}-[A-Z0-9]{16}$");
+	if (!std::regex_match(content_id, pattern)) {
+		return false;
+	}
+	return title_id.empty() || content_id.compare(7, title_id.size(), title_id) == 0;
+}
+
+static std::string ContentId(const std::filesystem::path& folder, const std::string& title_id) {
+	std::ifstream param(folder / "sce_sys" / "param.json");
+	if (!param) {
+		return {};
+	}
+	const auto param_json = nlohmann::json::parse(param, nullptr, false);
+	if (!param_json.is_object()) {
+		return {};
+	}
+	// applicationCategoryType marks an application's own param.json, never an add-on's.
+	if (param_json.contains("applicationCategoryType")) {
+		return {};
+	}
+	const auto content_id = param_json.value("contentId", std::string {});
+	return IsContentId(content_id, title_id) ? content_id : std::string {};
+}
+
+// The entitlement label a folder answers to: the last dash-separated part of its contentId, which is
+// what the guest asks about, or the folder's own name when there is no readable param.json, so a
+// dump can simply be renamed to the label it carries. Cut to the guest's label field, so the mount
+// and the entitlement list always speak of the same sixteen characters.
+static std::string FolderLabel(const std::filesystem::path& folder, const std::string& title_id) {
+	const auto content_id = ContentId(folder, title_id);
+	const auto dash       = content_id.rfind('-');
+
+	auto label = (dash != std::string::npos && dash + 1 < content_id.size())
+	                 ? content_id.substr(dash + 1)
+	                 : folder.filename().string();
+
+	const auto begin = label.find_first_not_of(" \t\r\n");
+	const auto end   = label.find_last_not_of(" \t\r\n");
+	label            = begin == std::string::npos ? std::string() : label.substr(begin, end - begin + 1);
+
+	if (label.size() > LABEL_SIZE) {
+		label.resize(LABEL_SIZE);
+	}
+	return label;
+}
+
+static std::vector<Folder> LegacyFolders(const std::string& title_id) {
+	std::vector<Folder> addons;
+
+	std::error_code error;
+	const auto      root = Directory(title_id);
+	if (!std::filesystem::is_directory(root, error)) {
+		return addons;
+	}
+	std::vector<std::filesystem::path> paths;
+	for (const auto& entry: std::filesystem::directory_iterator(root, error)) {
+		std::error_code entry_error;
+		// A link could stand for another add-on's folder, or lead back to this one.
+		if (entry.is_directory(entry_error) && !entry.is_symlink(entry_error) && !entry_error) {
+			paths.push_back(entry.path());
+		}
+	}
+	std::sort(paths.begin(), paths.end());
+
+	// One folder per label, the first in name order, so the mount and the list pick the same one.
+	std::set<std::string> labels;
+	for (const auto& path: paths) {
+		const auto label = FolderLabel(path, title_id);
+		if (!label.empty() && labels.insert(label).second) {
+			addons.push_back({label, path});
+		}
+	}
+	return addons;
+}
+
+static std::vector<LocalEntitlement> LegacyEntitlements(const std::string& title_id) {
+	std::vector<LocalEntitlement> result;
+	if (title_id.size() != 9) {
+		return result;
+	}
+	std::ifstream file("dlc_emu.ini", std::ios::binary);
+	if (!file) {
+		return result;
+	}
+	// A handful of keys at most; anything larger is not a file of ours to read.
+	std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	if (contents.size() > 64 * 1024) {
+		return result;
+	}
+
+	const auto trim = [](std::string value) {
+		const auto first = value.find_first_not_of(" \t\r\n");
+		if (first == std::string::npos) {
+			return std::string {};
+		}
+		const auto last = value.find_last_not_of(" \t\r\n");
+		return value.substr(first, last - first + 1);
+	};
+
+	std::set<std::string>              labels;
+	std::map<std::string, std::string> fields;
+	bool                               psal    = false;
+	bool                               invalid = false;
+	const auto                         flush   = [&] {
+        const auto id      = fields.find("content_id");
+        const auto status  = fields.find("download_status");
+        const auto service = fields.find("service_label");
+        if (!psal || invalid || id == fields.end() || status == fields.end() ||
+            status->second != "NO_EXTRA_DATA") {
+            return;
+        }
+        // Only the platform service carries add-ons here.
+        if (service != fields.end() && service->second != "0") {
+            return;
+        }
+        if (!IsContentId(id->second, title_id)) {
+            return;
+        }
+        const auto entitlement_label = id->second.substr(20);
+        if (labels.insert(entitlement_label).second) {
+            result.push_back({id->second, entitlement_label});
+        }
+	};
+
+	std::istringstream stream(contents);
+	std::string        line;
+	while (std::getline(stream, line)) {
+		line = trim(line);
+		if (line.empty() || line[0] == '#' || line[0] == ';') {
+			continue;
+		}
+		if (line[0] == '[') {
+			flush();
+			fields.clear();
+			invalid = false;
+			psal    = line == "[PSAL]";
+			continue;
+		}
+		if (!psal) {
+			continue;
+		}
+		const auto equals = line.find('=');
+		if (equals == std::string::npos) {
+			invalid = true;
+			continue;
+		}
+		const auto key   = trim(line.substr(0, equals));
+		const auto value = trim(line.substr(equals + 1));
+		// Unknown keys could change what ownership means here; they are not ignored silently.
+		if (key != "content_id" && key != "download_status" && key != "service_label" &&
+		    key != "entitlement_key") {
+			invalid = true;
+			continue;
+		}
+		if (!fields.emplace(key, value).second) {
+			invalid = true;
+		}
+	}
+	flush();
+	return result;
+}
+
+// CLI entries override a legacy declaration on both enumeration and mount paths.
+std::vector<Folder> Folders(const std::string& title_id) {
+	auto result = LegacyFolders(title_id);
+	for (const auto& entry: Loader::AddContentGetAll()) {
+		std::erase_if(result, [&](const auto& old) { return old.label == entry.entitlement_label; });
+		if (!entry.mount_dir.empty()) result.push_back({entry.entitlement_label, entry.mount_dir});
+	}
+	return result;
+}
+
+std::vector<LocalEntitlement> LocalEntitlements(const std::string& title_id) {
+	auto result = LegacyEntitlements(title_id);
+	for (const auto& entry: Loader::AddContentGetAll()) {
+		std::erase_if(result, [&](const auto& old) { return old.label == entry.entitlement_label; });
+		if (entry.mount_dir.empty()) result.push_back({entry.content_id, entry.entitlement_label});
+	}
+	return result;
+}
+
+} // namespace Addcont
+
+namespace AppContent {
+
+static std::string EntitlementText(const NpUnifiedEntitlementLabel* label) {
+	std::string text;
+	for (size_t i = 0; i < sizeof(label->data) && label->data[i] != '\0'; i++) {
+		text.push_back(label->data[i]);
+	}
+	return text;
+}
+
+// Mounts are remembered: the guest hands back the point it was given, and a mount of the same label
+// again is handed the same one, so the console's own limit is not spent by unmounting and mounting.
+static constexpr size_t ADDCONT_MOUNT_MAX = 64;
+
+struct AddcontMount {
+	std::string label;
+	std::string point;
+};
+
+static std::mutex                g_addcont_mutex;
+static std::vector<AddcontMount> g_addcont_mounts;
 
 int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         service_label,
                                          const NpUnifiedEntitlementLabel* entitlement_label,
                                          AppContentMountPoint*            mount_point) {
 	PRINT_NAME();
 
-	LOGF("\t service_label     = %" PRIu32 "\n"
-	     "\t entitlement_label = 0x%016" PRIx64 "\n"
-	     "\t mount_point       = 0x%016" PRIx64 "\n",
-	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
-	     reinterpret_cast<uint64_t>(mount_point));
-
-	if (service_label != 0 || entitlement_label == nullptr || mount_point == nullptr) {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_PARAMETER);
+	if (entitlement_label == nullptr || mount_point == nullptr) {
+		return APP_CONTENT_ERROR_PARAMETER;
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
 
-	const auto* entry =
-	    Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data));
-	if (entry == nullptr) {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_FOUND);
-	}
+	const auto label = EntitlementText(entitlement_label);
 
-	std::lock_guard lock(g_addcont_mutex);
+	// Only a folder that answers to this label mounts, which is the same pairing the entitlement list
+	// in libNet answers from: a mount never carries another add-on's files, and a label that matches
+	// nothing says which directory to rename instead.
+	const auto folders = Addcont::Folders(g_title_id);
 
-	for (const auto& m: g_addcont_mounts) {
-		if (m.label == entry->entitlement_label) {
-			const auto guest_point = m.point.substr(0, m.point.size() - 1);
-			std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
-			LOGF("\t already mounted %s\n", guest_point.c_str());
-			return Common::StallDump::Result(__func__, OK);
+	std::filesystem::path chosen;
+	for (const auto& folder: folders) {
+		if (folder.label == label) {
+			chosen = folder.path;
+			break;
 		}
 	}
 
-	if (g_addcont_mounts.size() == APP_CONTENT_ADDCONT_MOUNT_MAXNUM) {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_MOUNT_FULL);
-	}
-	std::error_code ec;
-	if (!std::filesystem::is_directory(Common::NativeHostPath(entry->mount_dir), ec)) {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_FOUND);
-	}
-
-	uint32_t index = 0;
-	while (
-	    std::any_of(g_addcont_mounts.begin(), g_addcont_mounts.end(), [&](const AddcontMount& m) {
-		    return m.point == "/addcont" + std::to_string(index) + "/";
-	    })) {
-		index++;
+	if (chosen.empty()) {
+		// printf, not LOGF: the console's LOGF is silent in the release configuration.
+		std::printf("AppContent: no add-on for '%s' under %s\n", label.c_str(),
+		            Addcont::Directory(g_title_id).string().c_str());
+		return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
 	}
 
-	AddcontMount mount {entry->entitlement_label, "/addcont" + std::to_string(index) + "/"};
-	LibKernel::FileSystem::Mount(entry->mount_dir, mount.point);
-	LOGF("\t mounted %s -> %s\n", mount.point.c_str(),
-	     Common::PathToString(entry->mount_dir).c_str());
-
-	AprShared::InvalidateFailedResolves();
-
-	// Titles scan /download0/pdlc for downloaded content; it must exist even when empty.
-	if (const auto pdlc = LibKernel::FileSystem::GetRealFilename("/download0/pdlc"); !pdlc.empty()) {
-		std::filesystem::create_directories(Common::NativeHostPath(pdlc), ec);
+	std::string point;
+	{
+		std::lock_guard lock(g_addcont_mutex);
+		for (const auto& mount: g_addcont_mounts) {
+			if (mount.label == label) {
+				point = mount.point;
+				break;
+			}
+		}
+		if (point.empty()) {
+			if (g_addcont_mounts.size() >= ADDCONT_MOUNT_MAX) {
+				std::printf("AppContent: %zu add-ons are mounted already\n", g_addcont_mounts.size());
+				return APP_CONTENT_ERROR_MOUNT_FULL;
+			}
+			// The lowest number no mount holds (after an unmount the count would name a point still in use).
+			for (uint32_t index = 0; point.empty(); index++) {
+				const auto name = "/addcont" + std::to_string(index);
+				if (std::none_of(g_addcont_mounts.begin(), g_addcont_mounts.end(),
+				                 [&](const AddcontMount& mount) { return mount.point == name; })) {
+					point = name;
+				}
+			}
+			LibKernel::FileSystem::Mount(chosen, point);
+			g_addcont_mounts.push_back({label, point});
+		}
 	}
 
-	const auto guest_point = mount.point.substr(0, mount.point.size() - 1);
-	std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
-	g_addcont_mounts.push_back(std::move(mount));
+	std::printf("AppContent: add-on '%s' -> %s (mounted at %s)\n", label.c_str(),
+	            chosen.string().c_str(), point.c_str());
 
-	return Common::StallDump::Result(__func__, OK);
+	std::snprintf(mount_point->data, sizeof(mount_point->data), "%s", point.c_str());
+	return OK;
 }
 
 int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
@@ -262,28 +474,23 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
 
 	if (mount_point == nullptr) {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_PARAMETER);
+		return APP_CONTENT_ERROR_PARAMETER;
 	}
 
 	if (mount_point->data[0] == '\0') {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_MOUNTED);
+		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
 
-	const std::string point = Common::FixDirectorySlash(
-	    std::string_view(mount_point->data, strnlen(mount_point->data, sizeof(mount_point->data))));
-
-	std::lock_guard lock(g_addcont_mutex);
-
-	const auto it = std::find_if(g_addcont_mounts.begin(), g_addcont_mounts.end(),
-	                             [&](const AddcontMount& m) { return m.point == point; });
-	if (it == g_addcont_mounts.end()) {
-		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_MOUNTED);
+	{
+		std::lock_guard lock(g_addcont_mutex);
+		std::erase_if(g_addcont_mounts,
+		              [mount_point](const auto& mount) { return mount.point == mount_point->data; });
 	}
-	LibKernel::FileSystem::Umount(point);
-	g_addcont_mounts.erase(it);
-	AprShared::InvalidateFailedResolves();
+	LibKernel::FileSystem::Umount(mount_point->data);
 
-	return Common::StallDump::Result(__func__, OK);
+	std::printf("AppContent: add-on unmounted (%s)\n", mount_point->data);
+
+	return OK;
 }
 
 } // namespace AppContent
@@ -303,7 +510,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              opt
 	     option, reinterpret_cast<uint64_t>(mount_point));
 
 	if (mount_point == nullptr) {
-		return Common::StallDump::Result(__func__, AppContent::APP_CONTENT_ERROR_PARAMETER);
+		return AppContent::APP_CONTENT_ERROR_PARAMETER;
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
@@ -311,7 +518,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              opt
 
 	LOGF("\t mount      = %s\n", mount_point->data);
 
-	return Common::StallDump::Result(__func__, OK);
+	return OK;
 }
 
 static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoint* mount_point) {
@@ -320,17 +527,16 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoin
 	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
 
 	if (mount_point == nullptr) {
-		return Common::StallDump::Result(__func__, AppContent::APP_CONTENT_ERROR_PARAMETER);
+		return AppContent::APP_CONTENT_ERROR_PARAMETER;
 	}
 
-	return Common::StallDump::Result(__func__, OK);
+	return OK;
 }
 
 static int KYTY_SYSV_ABI AppContentTemporaryDataGetAvailableSpaceKb(
     const AppContentMountPoint* mount_point, size_t* available_space_kb) {
 	PRINT_NAME();
-	return Common::StallDump::Result(
-	    __func__, AppContent::GetAvailableSpaceKb(mount_point, available_space_kb));
+	return AppContent::GetAvailableSpaceKb(mount_point, available_space_kb);
 }
 
 } // namespace AppContentTemporary

@@ -1,8 +1,5 @@
-#include "common/gpuThreadSampler.h"
-#include "common/frameTimeline.h"
 #include "graphics/host_gpu/renderer/guestClock.h"
 
-#include "common/submitProfile.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -10,13 +7,31 @@
 #include "kernel/memory.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 
 namespace Libs::Graphics {
-using Common::SubmitProfile::Extra;
+
+bool GuestClock::Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_TIMESTAMPS");
+		if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0)
+			EXIT("KYTY_GPU_TIMESTAMPS must be 0 or 1\n");
+		const bool result = !value || std::strcmp(value, "0") != 0;
+		std::fprintf(stderr, "[GPU_TIMESTAMPS] mode=%s\n", result ? "native" : "cpu");
+		return result;
+	}();
+	return enabled;
+}
+
 
 GuestClock::~GuestClock() {
+	if (m_recorded || m_fallback) std::fprintf(stderr,
+	    "[GPU_TIMESTAMPS] recorded=%llu published=%llu late=%llu conflicts=%llu failed=%llu fallback=%llu\n",
+	    (unsigned long long)m_recorded, (unsigned long long)m_published, (unsigned long long)m_late,
+	    (unsigned long long)m_conflicts, (unsigned long long)m_failed, (unsigned long long)m_fallback);
 	if (m_pool) m_context.GetGraphics().device.destroyQueryPool(m_pool);
 }
 
@@ -88,13 +103,11 @@ bool GuestClock::Initialize() {
 	return true;
 }
 
-void GuestClock::OnBegin(CommandScheduler& scheduler, const CommandBuffer& command) {
+void GuestClock::OnBegin(CommandScheduler& scheduler, CommandBuffer& command) {
 	if (&scheduler != &m_context.GetCommandScheduler()) return;
 	m_active = -1;
-	// Native clocks are the default. Keep the pool armed even while the
-	// no-gpu-timestamps gate is open: returning to native clocks mid-pass must
-	// not require a reset or drop the first packet just to initialize the pool.
-	if (!Initialize()) return;
+	// The A/B switch is fixed for the process: no pool/reset overhead in CPU mode.
+	if (!Enabled() || !Initialize()) return;
 	for (uint32_t i = 0; i < BlockCount; ++i) {
 		const auto index = (m_next + i) % BlockCount;
 		if (m_blocks[index].pending) continue;
@@ -102,8 +115,7 @@ void GuestClock::OnBegin(CommandScheduler& scheduler, const CommandBuffer& comma
 		m_blocks[index].samples.clear(); // Keep storage for the next use of this block.
 		m_active = static_cast<int32_t>(index);
 		m_next = (index + 1) % BlockCount;
-		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
-		command.ResetQueryPool(m_pool, index * QueriesPerBlock, QueriesPerBlock);
+		command.Handle().resetQueryPool(m_pool, index * QueriesPerBlock, QueriesPerBlock);
 		break;
 	}
 }
@@ -124,18 +136,17 @@ void GuestClock::Cancel(uint64_t address, uint64_t size) {
 }
 
 bool GuestClock::Record(uint64_t address) {
-	if (!Common::SubmitProfile::GpuTimestampsEnabled()) return false;
+	if (!Enabled()) return false;
 	if (m_active < 0 || m_blocks[m_active].used == QueriesPerBlock ||
-	    (address & 7u) != 0 || !m_context.IsMapped(address, 8)) {
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampsFallback);
+	    (address & 7u) != 0 || !m_context.GetGpuResources().IsMapped(address, 8)) {
+		++m_fallback;
 		return false;
 	}
 	uint64_t previous = 0;
 	// This address will be written through the backing alias by a completion,
 	// which cannot fault or synchronously ask the GPU thread to retire readers.
-	m_context.GetBufferCache().ExcludeHostImport(address, 8, Extra::HostImportFallbackGpu);
 	if (!LibKernel::Memory::TryReadBacking(address, &previous, sizeof(previous))) {
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampsFallback);
+		++m_fallback;
 		return false;
 	}
 	const auto block = static_cast<uint32_t>(m_active);
@@ -148,8 +159,7 @@ bool GuestClock::Record(uint64_t address) {
 	++state.pending;
 	++m_pending;
 	auto& scheduler = m_context.GetCommandScheduler();
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
-	scheduler.Current().WriteTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_pool, query);
+	scheduler.Current().Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_pool, query);
 	// Extend only consecutive clock completions in this tick. An intervening
 	// normal callback (e.g. fault processing) must retain its publication order.
 	// Metadata is filled on the command lane before this tick can be submitted.
@@ -167,7 +177,7 @@ bool GuestClock::Record(uint64_t address) {
 		// before GuestGpu is destroyed.
 		scheduler.DeferPriorityOperation([gpu = &m_context.GetGpu()] { gpu->WakeClockCompletions(); });
 	}
-	Common::SubmitProfile::AddExtra(Extra::GpuTimestampsRecorded);
+	++m_recorded;
 	return true;
 }
 
@@ -179,7 +189,6 @@ void GuestClock::Complete(uint32_t block, uint32_t first) {
 	const auto status = m_context.GetGraphics().device.getQueryPoolResults(m_pool,
 	    block * QueriesPerBlock + first, count, count * sizeof(Result), native.data(), sizeof(Result),
 	    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
-	Common::SubmitProfile::AddExtra(Extra::GpuTimestampBatches);
 	for (uint32_t i = 0; i < count; ++i) {
 		// Do not inspect undefined output if the non-waiting query failed.
 		const bool ready = status == vk::Result::eSuccess && native[i].available != 0;
@@ -195,17 +204,17 @@ void GuestClock::Publish(const Sample& sample, uint64_t native, bool ready) {
 	if (found == m_latest.end() || found->second != serial) {
 		// A later timestamp or immediate PM4 write superseded this slot. In
 		// particular, do not overwrite the CPU path after disabling native clocks.
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampsLate);
+		++m_late;
 		return;
 	}
 	m_latest.erase(found);
 	uint64_t value = 0;
 	if (!ready || !Convert(native, m_native_anchor, m_guest_anchor, m_mask, m_period_ns, value)) {
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampsFailed);
+		++m_failed;
 		return;
 	}
-	if (!m_context.IsMapped(address, 8)) {
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampsLate);
+	if (!m_context.GetGpuResources().IsMapped(address, 8)) {
+		++m_late;
 		return;
 	}
 	// Stage one does not arbitrate with a GPU writer to the same tracked page.
@@ -213,8 +222,8 @@ void GuestClock::Publish(const Sample& sample, uint64_t native, bool ready) {
 	// falsely clearing GPU ownership. Clean resident buffers ARE invalidated.
 	auto& cache = m_context.GetBufferCache();
 	if (cache.IsRegionGpuModified(address, 8) || cache.HasUnpublishedDownloads() ||
-	    m_context.GetTextureCache().IsRegionRegistered(address, 8)) {
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampsConflict);
+	    m_context.GetTextureCache().HasTrackedDataOverlap(address, 8)) {
+		++m_conflicts;
 		return;
 	}
 	// No resident buffer means no stale GPU copy/BDA upload to invalidate.
@@ -223,16 +232,11 @@ void GuestClock::Publish(const Sample& sample, uint64_t native, bool ready) {
 	// neither is implied by buffer residency. Unmapping is serialized on this lane.
 	if (cache.IsRegionRegistered(address, 8)) {
 		cache.InvalidateMemory(address, 8);
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampBufferInvalidations);
-	} else {
-		Common::SubmitProfile::AddExtra(Extra::GpuTimestampBuffersAbsent);
 	}
 	m_context.GetTextureCache().InvalidateMemory(address, 8);
-	m_context.GetImageHeap().InvalidateMemory(address, 8);
 	// The CAS checks the old slot value under the backing lock; a separate read
 	// would duplicate that lock and still need the CAS to prevent a racing write.
 	const bool published = LibKernel::Memory::TryCompareExchangeBacking64(address, previous, value);
-	if (published) Common::FrameTimeline::Current(Common::FrameTimeline::Kind::ClockPublish, 0, address, value);
-	Common::SubmitProfile::AddExtra(published ? Extra::GpuTimestampsPublished : Extra::GpuTimestampsLate);
+	if (published) ++m_published; else ++m_late;
 }
 } // namespace Libs::Graphics

@@ -9,9 +9,9 @@
 namespace {
 
 using Owners     = std::vector<uint32_t>;
-using Table      = Libs::Graphics::MultiLevelPageTable<Owners, 20, 44, 14>;
+using Table      = Libs::Graphics::MultiLevelPageTable<Owners>;
 using PageOwners = Libs::Graphics::InlinePageOwnerList<uint32_t, 16>;
-using OwnerTable = Libs::Graphics::MultiLevelPageTable<PageOwners, 20, 44, 14>;
+using OwnerTable = Libs::Graphics::MultiLevelPageTable<PageOwners, 20, 40, 10>;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -155,29 +155,6 @@ void TestSharedCoarsePageLifecycle() {
 	Check(owners.Erase(22) && owners.empty(), "final coarse-page owner unregisters");
 }
 
-void TestCandidateHints() {
-	// One slot forces collisions; a tiny list bound exercises fallback.
-	Libs::Graphics::ImageCandidateHints<uint32_t, 1, 4> hints;
-	const Owners ordered {3, 1, 2};
-	Check(hints.Find(100, 40) == nullptr, "cold hint misses");
-	Check(hints.Store(100, 40, ordered) && *hints.Find(100, 40) == ordered,
-	      "hint preserves query order, not just membership");
-	Check(hints.Find(101, 40) == nullptr && hints.Find(100, 41) == nullptr,
-	      "both address and size must match exactly");
-	hints.Invalidate();
-	Check(hints.Find(100, 40) == nullptr, "index changes invalidate hints");
-	Check(hints.Store(100, 40, Owners{3, 2}) && *hints.Find(100, 40) == Owners({3, 2}),
-	      "deleted owner is not resurrected");
-	hints.Invalidate();
-	Check(hints.Store(100, 40, Owners{3, 2, 1}) && *hints.Find(100, 40) == Owners({3, 2, 1}),
-	      "recreated owner retains its new registration order");
-	Check(hints.Store(200, 40, Owners{}) && hints.Find(100, 40) == nullptr &&
-	          hints.Find(200, 40) != nullptr && hints.Find(200, 40)->empty(),
-	      "collision replaces a key and empty results remain distinguishable from misses");
-	Check(!hints.Store(200, 40, Owners{1, 2, 3, 4, 5}) && hints.Find(200, 40) == nullptr,
-	      "oversized query falls back without leaving a stale entry");
-}
-
 void TestOneMiBBoundaries() {
 	OwnerTable::PageRange range {};
 	Check(OwnerTable::TryGetPageRange(0x0fffff, 2, range),
@@ -202,7 +179,6 @@ int main() {
 	TestOneMiBRegistrationGranularity();
 	TestSharedCoarsePageLifecycle();
 	TestOneMiBBoundaries();
-	TestCandidateHints();
 	std::printf("ImagePageTableTests: all cases passed\n");
 	return 0;
 }

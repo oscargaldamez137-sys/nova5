@@ -48,7 +48,6 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k11_11_10Float, vk::Format::eB10G11R11UfloatPack32},
     {Prospero::BufferFormat::k10_10_10_2UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k10_10_10_2SNorm, vk::Format::eA2B10G10R10SnormPack32},
-    {Prospero::BufferFormat::k10_10_10_2UScaled, vk::Format::eA2B10G10R10UscaledPack32},
     {Prospero::BufferFormat::k10_10_10_2UInt, vk::Format::eA2B10G10R10UintPack32},
     {Prospero::BufferFormat::k8_8_8_8UNorm, vk::Format::eR8G8B8A8Unorm},
     {Prospero::BufferFormat::k8_8_8_8SNorm, vk::Format::eR8G8B8A8Snorm},
@@ -122,16 +121,6 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}
-}
-
-vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
-	vk::ShaderModuleCreateInfo create_info {};
-	create_info.codeSize    = code.size_bytes();
-	create_info.pCode       = code.data();
-	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-	                     "create SPIR-V shader module");
-	return module;
 }
 
 } // namespace Libs::Graphics

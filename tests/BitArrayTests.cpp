@@ -246,6 +246,26 @@ void TestRandomizedDifferential() {
   }
 }
 
+void TestAnyInRange() {
+  Bits bits;
+  Check(!bits.AnyInRange(0, 0) && !bits.AnyInRange(128, 129) &&
+        !bits.AnyInRange(65, 64), "invalid/empty interval was not empty");
+  Check(!bits.AllInRange(0, 0) && !bits.AllInRange(128, 129) && !bits.AllInRange(65, 64),
+	    "invalid/empty interval reported full coverage");
+  for (size_t bit = 0; bit < 128; ++bit) {
+    bits.Clear();
+    bits.Set(bit);
+    for (size_t start = 0; start <= 128; ++start) {
+      for (size_t end = start; end <= 128; ++end) {
+        Check(bits.AnyInRange(start, end) == (start <= bit && bit < end),
+              "single set bit range query mishandled an endpoint");
+		Check((~bits).AllInRange(start, end) == (start < end && !(start <= bit && bit < end)),
+			  "single unset bit full-coverage query mishandled an endpoint");
+	  }
+	}
+  }
+}
+
 void TestTrackerSizedRandomizedDifferential() {
   using TrackerBits = Common::BitArray<1024>;
   TrackerBits bits;
@@ -278,8 +298,22 @@ void TestTrackerSizedRandomizedDifferential() {
             "tracker-sized randomized bit state diverged");
     }
 
-    size_t expected = 0;
-    for (const auto [begin, end] : bits) {
+    const auto query_begin = static_cast<size_t>(next_random() % reference.size());
+    const auto query_end = query_begin + 1 +
+        static_cast<size_t>(next_random() % (reference.size() - query_begin));
+    bool any = false;
+	bool all = true;
+	for (auto index = query_begin; index < query_end; ++index)
+		any |= reference[index];
+	for (auto index = query_begin; index < query_end; ++index)
+		all &= reference[index];
+	Check(bits.AnyInRange(query_begin, query_end) == any,
+		  "tracker-sized range query differed from reference bits");
+	Check(bits.AllInRange(query_begin, query_end) == all,
+		  "tracker-sized full-coverage query differed from reference bits");
+
+	size_t expected = 0;
+	for (const auto [begin, end] : bits) {
       while (expected < reference.size() && !reference[expected]) {
         expected++;
       }
@@ -301,6 +335,7 @@ void TestTrackerSizedRandomizedDifferential() {
 
 int main() {
   TestPointAndRangeOperations();
+  TestAnyInRange();
   TestMaskedConstructionAndBitwiseOperations();
   TestRangeDiscoveryAndIteration();
   TestRandomizedDifferential();

@@ -1,21 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void RemoveIdentities(Program& program) {
-	// Resolve metadata before deleting its identity nodes; retain only folded native constants.
-	for (auto& write: program.scalar_writes) {
-		const auto value = write.value.Resolve();
-		write.value = value.IsImmediate() && value.GetType() == Type::U32 ? value : Value {};
-	}
-	for (auto* block: program.blocks) {
-		block->condition       = block->condition.Resolve();
-		block->indirect_target = block->indirect_target.Resolve();
-	}
-	for (auto* block: program.blocks) {
+void RemoveIdentities(const BlockList& blocks) {
+	for (auto* block: blocks) {
 		auto& instructions = block->Instructions();
 		for (auto inst = instructions.begin(); inst != instructions.end();) {
 			if (inst->GetOpcode() != ValueOpcode::Identity) {
@@ -29,63 +21,82 @@ void RemoveIdentities(Program& program) {
 	}
 }
 
-void EliminateDeadCode(const BlockList& blocks) {
-	bool changed;
-	do {
-		std::vector<Inst*> pending;
-		for (auto* block: blocks) {
-			for (auto& inst: *block) {
-				// Retained resource-planning instructions live outside the block list.
-				inst.live = inst.MayHaveSideEffects() || std::ranges::any_of(inst.Uses(),
-				    [](const Use& use) { return use.user->Parent() == nullptr; });
-				if (inst.live) pending.push_back(&inst);
+static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+	std::vector<Inst*> dead;
+	std::vector<Inst*> web;
+	std::vector<Inst*> stack;
+	// Membership of `dead` (looked up per phi and, when erasing, per instruction).
+	std::unordered_set<const Inst*> dead_set;
+	for (auto* block: blocks) {
+		for (auto& inst: block->Instructions()) {
+			if (inst.GetOpcode() != ValueOpcode::Phi || dead_set.contains(&inst)) {
+				continue;
 			}
-		}
-		while (!pending.empty()) {
-			const auto* inst = pending.back();
-			pending.pop_back();
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				auto* input = inst->Arg(arg).TryInstruction();
-				if (input != nullptr && input->Parent() != nullptr && !input->live) {
-					input->live = true;
-					pending.push_back(input);
+			web.clear();
+			stack.clear();
+			stack.push_back(&inst);
+			bool external = false;
+			while (!stack.empty() && !external) {
+				auto* current = stack.back();
+				stack.pop_back();
+				if (std::ranges::find(web, current) != web.end()) {
+					continue;
+				}
+				web.push_back(current);
+				for (const auto& use: current->Uses()) {
+					if (use.user->GetOpcode() != ValueOpcode::Phi) {
+						external = true;
+						break;
+					}
+					stack.push_back(use.user);
 				}
 			}
+			if (external) {
+				continue;
+			}
+			dead.insert(dead.end(), web.begin(), web.end());
+			dead_set.insert(web.begin(), web.end());
 		}
-		// Unlink every dead operand before freeing nodes in a dead Phi cycle.
-		for (auto* block: blocks)
-			for (auto& inst: *block)
-				if (!inst.live) inst.Invalidate();
-		for (auto* block: blocks)
-			std::erase_if(block->Instructions(), [](const Inst& inst) { return !inst.live; });
+	}
+	if (dead.empty()) {
+		return false;
+	}
+	for (auto* inst: dead) {
+		inst->Invalidate();
+	}
+	for (auto* block: blocks) {
+		auto& instructions = block->Instructions();
+		for (auto inst = instructions.begin(); inst != instructions.end();) {
+			if (dead_set.contains(&*inst)) {
+				inst = instructions.erase(inst);
+			} else {
+				inst++;
+			}
+		}
+	}
+	return true;
+}
 
-		changed = false;
-		for (auto* block: blocks) {
-			const auto& term = block->terminator;
-			if (term.kind != CFG::TerminatorKind::ConditionalBranch || term.loop_header ||
-			    block->condition.IsImmediate()) continue;
-			for (const bool take_true: {false, true}) {
-				const auto* empty = take_true ? term.false_block : term.true_block;
-				const auto* merge = take_true ? term.true_block : term.false_block;
-				if (empty == nullptr || merge == nullptr || !empty->empty() ||
-				    empty->terminator.loop_header || merge->terminator.loop_header ||
-				    empty->terminator.kind != CFG::TerminatorKind::Branch ||
-				    empty->terminator.true_block != merge ||
-				    std::ranges::any_of(*merge, [](const Inst& inst) {
-					    return inst.GetOpcode() == ValueOpcode::Phi;
-				    })) continue;
-				// Keep the CFG and SSA edges intact; only the empty detour's predicate is dead.
-				for (auto& inst: *block) {
-					if (inst.GetOpcode() == ValueOpcode::Reference &&
-					    inst.Arg(0).Resolve() == block->condition.Resolve())
-						inst.SetArg(0, Value(take_true));
+void EliminateDeadCode(const BlockList& blocks) {
+	do {
+		bool changed;
+		do {
+			changed = false;
+			for (auto block = blocks.rbegin(); block != blocks.rend(); block++) {
+				auto& instructions = (*block)->Instructions();
+				auto  inst         = instructions.end();
+				while (inst != instructions.begin()) {
+					--inst;
+					if (inst->HasUses() || inst->MayHaveSideEffects()) {
+						continue;
+					}
+					inst->Invalidate();
+					inst    = instructions.erase(inst);
+					changed = true;
 				}
-				block->condition = Value(take_true);
-				changed = true;
-				break;
 			}
-		}
-	} while (changed);
+		} while (changed);
+	} while (RemoveDeadPhiWebs(blocks));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -2,18 +2,24 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
-                                    uint32_t lane_bits) {
-	// Each lane of a group takes its lane_bits-wide source index from control.
-	const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), subid,
-	                         ConstantU32(state, (1u << lane_bits) - 1u));
-	const auto selected = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
-	    state, ConstantU32(state, control),
-	    Binary(state, spv::OpIMul, TypeU32(state), lane, ConstantU32(state, lane_bits)),
-	    ConstantU32(state, lane_bits));
-	return {EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
-	            state, subid, selected, ConstantU32(state, 0), ConstantU32(state, lane_bits)),
-	        ConstantBool(state, true)};
+DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
+	const auto quad_base = state.builder.AllocateId();
+	const auto lane      = state.builder.AllocateId();
+	const auto shift     = state.builder.AllocateId();
+	const auto selected0 = state.builder.AllocateId();
+	const auto selected  = state.builder.AllocateId();
+	const auto target    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), quad_base, subid, ConstantU32(state, 0xfffffffcu)});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 3)});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, TypeU32(state), shift, lane, ConstantU32(state, 1)});
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU32(state), selected0, ConstantU32(state, control), shift});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), selected, selected0, ConstantU32(state, 3)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, quad_base, selected});
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
@@ -23,50 +29,67 @@ DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uin
 	const auto lane_shifted = state.builder.AllocateId();
 	const auto target       = state.builder.AllocateId();
 	const auto valid        = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), row, subid,
-	                          ConstantU32(state, 0xfffffff0u));
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane, subid,
-	                          ConstantU32(state, 15));
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), row, subid, ConstantU32(state, 0xfffffff0u)});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 15)});
 	if (left) {
-		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), lane_shifted, lane,
-		                          ConstantU32(state, amount));
-		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), valid, lane,
-		                          ConstantU32(state, 16u - amount));
+		state.builder.AddFunction(
+		    {OpIAdd, TypeU32(state), lane_shifted, lane, ConstantU32(state, amount)});
+		state.builder.AddFunction(
+		    {OpULessThan, TypeBool(state), valid, lane, ConstantU32(state, 16u - amount)});
 	} else {
-		state.builder.AddFunction(spv::OpISub, TypeU32(state), lane_shifted, lane,
-		                          ConstantU32(state, amount));
-		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), valid, lane,
-		                          ConstantU32(state, amount));
+		state.builder.AddFunction(
+		    {OpISub, TypeU32(state), lane_shifted, lane, ConstantU32(state, amount)});
+		state.builder.AddFunction(
+		    {OpUGreaterThanEqual, TypeBool(state), valid, lane, ConstantU32(state, amount)});
 	}
-	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row, lane_shifted);
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row, lane_shifted});
 	return {target, valid};
 }
 
 DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subid,
                                               uint32_t amount) {
-	// Rotation wraps within the row, so only the low four lane bits change.
-	const auto rotated = Binary(state, spv::OpISub, TypeU32(state), subid, ConstantU32(state, amount));
-	return {EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(state, subid, rotated,
-	                                                        ConstantU32(state, 0),
-	                                                        ConstantU32(state, 4)),
-	        ConstantBool(state, true)};
+	const auto row      = state.builder.AllocateId();
+	const auto lane     = state.builder.AllocateId();
+	const auto in_high  = state.builder.AllocateId();
+	const auto minus    = state.builder.AllocateId();
+	const auto plus     = state.builder.AllocateId();
+	const auto selected = state.builder.AllocateId();
+	const auto target   = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), row, subid, ConstantU32(state, 0xfffffff0u)});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 15)});
+	state.builder.AddFunction(
+	    {OpUGreaterThanEqual, TypeBool(state), in_high, lane, ConstantU32(state, amount)});
+	state.builder.AddFunction({OpISub, TypeU32(state), minus, lane, ConstantU32(state, amount)});
+	state.builder.AddFunction(
+	    {OpIAdd, TypeU32(state), plus, lane, ConstantU32(state, 16u - amount)});
+	state.builder.AddFunction({OpSelect, TypeU32(state), selected, in_high, minus, plus});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row, selected});
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row) {
-	// Mirroring lane i of a row or half row reads lane (size - 1 - i), which flips its low bits.
-	return {Binary(state, spv::OpBitwiseXor, TypeU32(state), subid,
-	               ConstantU32(state, half_row ? 7u : 15u)),
-	        ConstantBool(state, true)};
+	const auto base_mask = half_row ? 0xfffffff8u : 0xfffffff0u;
+	const auto lane_mask = half_row ? 7u : 15u;
+	const auto base      = state.builder.AllocateId();
+	const auto lane      = state.builder.AllocateId();
+	const auto mirrored  = state.builder.AllocateId();
+	const auto target    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), base, subid, ConstantU32(state, base_mask)});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, lane_mask)});
+	state.builder.AddFunction(
+	    {OpISub, TypeU32(state), mirrored, ConstantU32(state, lane_mask), lane});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, base, mirrored});
+	return {target, ConstantBool(state, true)};
 }
 
-DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
+DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);
-	const auto control = flags.control;
-	if (flags.dpp8) {
-		return EmitDppPermTargetLane(state, subid, control, 3u);
-	}
 	if (control <= 0xffu) {
-		return EmitDppPermTargetLane(state, subid, control, 2u);
+		return EmitDppQuadPermTargetLane(state, subid, control);
 	}
 	if (control >= 0x101u && control <= 0x10fu) {
 		return EmitDppRowShiftTargetLane(state, subid, control & 0xfu, true);
@@ -83,17 +106,10 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
-	// row_share:N reads lane N of the caller's row of 16.
-	if (control >= 0x150u && control <= 0x15fu) {
-		return {EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
-		            state, subid, ConstantU32(state, control & 0xfu), ConstantU32(state, 0),
-		            ConstantU32(state, 4)),
-		        ConstantBool(state, true)};
-	}
 	if (control >= 0x160u && control <= 0x16fu) {
 		const auto target = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), target, subid,
-		                          ConstantU32(state, control & 0xfu));
+		state.builder.AddFunction(
+		    {OpBitwiseXor, TypeU32(state), target, subid, ConstantU32(state, control & 0xfu)});
 		return {target, ConstantBool(state, true)};
 	}
 	return {subid, ConstantBool(state, true)};
@@ -104,8 +120,8 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
 	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
-	                          state.subgroup_local_invocation_id_variable);
+	state.builder.AddFunction(
+	    {OpLoad, TypeU32(state), value, state.subgroup_local_invocation_id_variable});
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
@@ -124,6 +140,16 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 			return &input;
 		}
 	}
+	if (state.stage != ShaderType::Pixel) {
+		return nullptr;
+	}
+	const auto mapped = ShaderPixelParameterMappedLocation(*state.input_info.pixel, location);
+	for (const auto& input: state.inputs) {
+		if (input.kind == IR::StageInputKind::Parameter &&
+		    ShaderPixelParameterMappedLocation(*state.input_info.pixel, input.location) == mapped) {
+			return &input;
+		}
+	}
 	return nullptr;
 }
 
@@ -134,10 +160,9 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 	}
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain,
-	                          TypePointer(state, spv::StorageClassInput, TypeU32(state)), pointer,
-	                          variable, ConstantU32(state, component));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
+	                           pointer, variable, ConstantU32(state, component)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
 	return value;
 }
 
@@ -147,10 +172,9 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 		return ConstantU32(state, 0);
 	}
 	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, variable});
 	if (state.lane_count == 2) {
-		const auto wave_base =
-		    EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, ~31u));
+		const auto wave_base = EmitBinaryU32(state, OpBitwiseAnd, value, ConstantU32(state, ~31u));
 		return EmitAddU32(state, EmitAddU32(state, value, wave_base),
 		                  ConstantU32(state, state.lane_half * 32));
 	}
@@ -164,13 +188,13 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {
-		state.builder.AddFunction(spv::OpLoad, scalar_type, raw, input.variable_id);
+		state.builder.AddFunction({OpLoad, scalar_type, raw, input.variable_id});
 	} else {
-		const auto pointer_type = TypePointer(state, spv::StorageClassInput, scalar_type);
+		const auto pointer_type = TypePointer(state, StorageClassInput, scalar_type);
 		const auto pointer      = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, input.variable_id,
-		                          ConstantU32(state, component));
-		state.builder.AddFunction(spv::OpLoad, scalar_type, raw, pointer);
+		state.builder.AddFunction({OpAccessChain, pointer_type, pointer, input.variable_id,
+		                           ConstantU32(state, component)});
+		state.builder.AddFunction({OpLoad, scalar_type, raw, pointer});
 	}
 
 	if (kind == VertexInputScalarKind::Uint) {
@@ -178,48 +202,47 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 	}
 
 	const auto bits = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, raw);
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, raw});
 	return bits;
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
+	                           ConstantU32(state, ScopeSubgroup), ConstantBool(state, true)});
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, active_ballot, 0);
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, active_ballot, 0});
 	uint32_t mask = low;
 	if (state.program.wave_size == 64u) {
 		const auto high     = state.builder.AllocateId();
 		const auto in_high  = state.builder.AllocateId();
 		const auto selected = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, active_ballot, 1);
-		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), in_high, lane,
-		                          ConstantU32(state, 32));
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, in_high, high, low);
+		state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, active_ballot, 1});
+		state.builder.AddFunction(
+		    {OpUGreaterThanEqual, TypeBool(state), in_high, lane, ConstantU32(state, 32)});
+		state.builder.AddFunction({OpSelect, TypeU32(state), selected, in_high, high, low});
 		mask = selected;
 	}
 
 	const auto lane_low = state.builder.AllocateId();
 	const auto bit      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane_low, lane,
-	                          ConstantU32(state, 31));
-	state.builder.AddFunction(spv::OpShiftLeftLogical, TypeU32(state), bit, ConstantU32(state, 1),
-	                          lane_low);
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), lane_low, lane, ConstantU32(state, 31)});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, TypeU32(state), bit, ConstantU32(state, 1), lane_low});
 
 	const auto hit      = state.builder.AllocateId();
 	const auto active   = state.builder.AllocateId();
 	const auto in_range = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), hit, mask, bit);
-	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, hit,
-	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_range, lane,
-	                          ConstantU32(state, state.program.wave_size));
-	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), ret, active, in_range);
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), hit, mask, bit});
+	state.builder.AddFunction({OpINotEqual, TypeBool(state), active, hit, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.program.wave_size)});
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), ret, active, in_range});
 	return ret;
 }
 

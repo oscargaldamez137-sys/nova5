@@ -14,6 +14,12 @@
 #include <utility>
 #include <vector>
 
+extern "C" {
+// 1: write protection of pages an upload marks clean runs on the upload worker, queued ahead
+// of their copies (needs KYTY_ASYNC_UPLOAD; otherwise it applies before the copies as before).
+extern volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode;
+}
+
 namespace Libs::Graphics {
 
 class MemoryTracker final {
@@ -23,92 +29,55 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// Zero means untracked, disabled, invalid, or spanning several regions: do not cache.
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
+		if (!GuestRange{vaddr, size}.Valid() ||
+		    vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE) return 0;
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
+	}
+	// A write protection of the region's pages is queued (KYTY_ASYNC_REPROTECT): their copies are taken
+	// after it lands, so a write before it is uploaded and one after it faults.
+	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr && manager->DeferredProtectionPending();
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	// Every page CPU-dirty (untracked memory is): none is write-protected for the tracker.
+	[[nodiscard]] bool IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
+	// `handoff` (a held caller lock) is released once the region lock is held, so the
+	// protection change does not extend the caller's critical section.
+	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
+	                                               std::unique_lock<TrackingSpinLock>* handoff = nullptr) noexcept;
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size,
-	    Common::BufferUploadProfile::Cause cause = Common::BufferUploadProfile::Cause::Invalidate);
+	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
+	// CPU-dirty, the write protection kept (RegionManager::MarkCpuDirtyKeepProtection): for a write through the
+	// backing view. False, with nothing changed, when a page is GPU-dirty.
+	[[nodiscard]] bool MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size);
+	// The emulator wrote CPU-dirty memory directly (RegionManager::NoteHostWrite): the regions' epochs move.
+	void               NoteHostWrite(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	void ConfigureFaultCoarsening(uint64_t vaddr, uint64_t size, uint64_t block_size, bool enabled, bool capture = true) {
-		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock); manager->ConfigureFaultCoarsening(offset, bytes, block_size, enabled, capture);
-		});
-	}
-	FaultCoarsenStats TakeCoarsenStats(uint64_t vaddr, uint64_t size, uint64_t epoch = 0) {
-		CheckNotInUploadCallback(); FaultCoarsenStats stats;
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
-			std::scoped_lock lock(manager->lock); stats += manager->TakeCoarsenStats(epoch);
-		});
-		return stats;
-	}
-	uint64_t TakeHotFaults(uint64_t vaddr, uint64_t size, bool observe) {
-		CheckNotInUploadCallback(); uint64_t count = 0;
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock); count += manager->TakeHotFaults(offset, bytes, observe);
-		});
-		return count;
-	}
-	bool CanUseHot(uint64_t vaddr, uint64_t size) {
-		CheckNotInUploadCallback();
-		return !Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock); return !manager->CanUseHot(offset, bytes);
-		});
-	}
-	void SetHot(uint64_t vaddr, uint64_t size, bool enabled) {
-		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock); manager->SetHot(offset, bytes, enabled);
-		});
-	}
-	void SetHostImport(uint64_t vaddr, uint64_t size, bool enabled) {
-		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
-			manager->SetHostImport(offset, bytes, enabled);
-		});
-	}
 	// Removes protection from a range and flushes GPU-owned data when required.
-	template <typename Flush, typename Imported = std::nullptr_t, typename Expanded = std::nullptr_t>
-	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
-	                      Common::BufferUploadProfile::Cause cause = Common::BufferUploadProfile::Cause::Invalidate,
-	                      Imported on_import = nullptr, Expanded on_expanded = nullptr, bool allow_coarsen = true) noexcept {
+	template <typename Flush>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			[[maybe_unused]] bool imported = false;
-			[[maybe_unused]] bool expanded = false;
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
 				std::scoped_lock lock(manager->lock);
-				if (cause == Common::BufferUploadProfile::Cause::CpuWriteFault) manager->ObserveHotFault(offset);
-				if constexpr (!std::is_same_v<Expanded, std::nullptr_t>) {
-					if (cause == Common::BufferUploadProfile::Cause::CpuWriteFault && size == 1)
-						expanded = manager->CoarsenFault(offset, bytes, allow_coarsen);
-				}
-				if constexpr (!std::is_same_v<Imported, std::nullptr_t>) {
-					if (manager->HasHostImport(offset, bytes)) { imported = true; return false; }
-				}
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes, cause);
+				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
-			// Publication must include EVERY newly unprotected page. Never acquire
-			// the BDA queue lock (or wait for the GPU) while holding the region lock.
-			if constexpr (!std::is_same_v<Expanded, std::nullptr_t>) {
-				if (expanded) on_expanded(manager->GetCpuAddr() + offset, bytes);
-			}
-			if constexpr (!std::is_same_v<Imported, std::nullptr_t>) {
-				// Never wait/send to GuestGpu under the region lock. Its guard route
-				// performs the CPU state change after readers have completed.
-				if (imported) on_import(manager->GetCpuAddr() + offset, bytes);
-			}
 			if (should_flush) {
 				on_flush();
 			}
@@ -124,37 +93,83 @@ public:
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
 
-	template <bool clear, typename Func>
-	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	template <bool clear, typename Preflight, typename Func>
+	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
+		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
-			const auto       address = manager->GetCpuAddr() + offset;
-			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes, func);
-			if constexpr (clear) {
-				manager->template ChangeState<DirtySource::Gpu, false>(address, bytes);
-			}
+		std::vector<RegionManager*> managers;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
+			managers.push_back(manager);
 		});
+		std::vector<std::unique_lock<TrackingSpinLock>> locks;
+		locks.reserve(managers.size());
+		for (auto* manager: managers) {
+			locks.emplace_back(manager->lock);
+		}
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const auto address = manager->GetCpuAddr() + offset;
+			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes,
+			                                                                preflight);
+		});
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(
+			    manager->GetCpuAddr() + offset, bytes, func);
+		});
+		if constexpr (clear) {
+			Iterate<false>(vaddr, size,
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               const auto address = manager->GetCpuAddr() + offset;
+				               manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
+				                   address, bytes, [](uint64_t, uint64_t) noexcept {});
+			               });
+		}
 	}
 
+	template <bool clear, typename Func>
+	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		ForEachDownloadRange<clear>(
+		    vaddr, size, [](uint64_t, uint64_t) noexcept {}, std::forward<Func>(func));
+	}
+
+	// `last_dirty`: the latest LastDirtyClock of the range's regions (g_cpu_dirty_clock), read with the pages it uploads.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
-	                        UploadFunc&& upload_func) {
-		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t> ||
-		              std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t, const Common::BufferUploadProfile::Causes&>);
+	                        UploadFunc&& upload_func, uint64_t* last_dirty = nullptr) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
+		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		// KYTY_ASYNC_REPROTECT: the pages this upload marks clean get their write protection
+		// from the upload worker, queued ahead of their copies (see TakeDeferredProtects).
+		const bool defer = !is_written && kyty_local_async_reprotect_mode.load(std::memory_order_relaxed) != 0;
+		// Reused per thread (no nested upload, see CheckNotInUploadCallback above).
+		thread_local std::vector<PageManager::DeferredRange> ranges;
+		ranges.clear();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
+			if (last_dirty != nullptr) *last_dirty = std::max(*last_dirty, manager->LastDirtyClock());
+			if (defer) PageManager::SetDeferredWriteProtectSink(&ranges);
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
+			if (defer) {
+				PageManager::SetDeferredWriteProtectSink(nullptr);
+				for (const auto& range: ranges) {
+					manager->BeginDeferredProtection();
+					s_deferred.push_back({manager, range.address, range.size});
+				}
+				ranges.clear();
+			}
 			if (!is_written) {
 				manager->lock.unlock();
 			}
 		});
 		upload_func();
+		// Protections the upload did not hand to the worker apply here, still before
+		// anything else can observe the pages as clean.
+		for (const auto& deferred: s_deferred) deferred.manager->ApplyDeferredProtection(deferred.address, deferred.size);
+		s_deferred.clear();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -166,9 +181,17 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
+	struct DeferredProtect {
+		RegionManager* manager = nullptr;
+		uint64_t       address = 0, size = 0;
+	};
+	// The upload callback takes the protections to queue ahead of its copies.
+	[[nodiscard]] static std::vector<DeferredProtect> TakeDeferredProtects() { return std::exchange(s_deferred, {}); }
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	inline static thread_local std::vector<DeferredProtect> s_deferred;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
@@ -185,13 +208,11 @@ private:
 		uint64_t       index        = vaddr / TRACKER_REGION_SIZE;
 		uint64_t       offset       = vaddr % TRACKER_REGION_SIZE;
 		while (remaining != 0) {
-			Common::GuestCpuProfile::Stage lookup(Common::GuestCpuProfile::Part::TrackerLookup);
 			const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
 			auto*      manager = m_regions[index].load(std::memory_order_acquire);
 			if (manager == nullptr && create) {
 				manager = GetOrCreateRegion(index);
 			}
-			lookup.End();
 			if (manager != nullptr) {
 				if constexpr (returns_bool) {
 					if (func(manager, offset, bytes)) {

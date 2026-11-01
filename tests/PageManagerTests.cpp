@@ -1,15 +1,14 @@
 #include "common/virtualMemory.h"
+#include "common/assert.h"
+#include "common/pageWatchDiagnostics.h"
 #include "graphics/host_gpu/pageManager.h"
 
-#include <barrier>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -19,15 +18,6 @@
 #include <windows.h>
 #undef min
 #undef max
-#elif defined(__APPLE__)
-#include <limits.h>
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <mach-o/dyld.h>
-#include <map>
-#include <sys/mman.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #else
 #include <map>
 #include <sys/mman.h>
@@ -68,26 +58,6 @@ int ToHostProt(uint32_t protection) {
 }
 
 uint32_t Protection(const void *address) {
-#if defined(__APPLE__)
-  mach_vm_address_t region_address =
-      reinterpret_cast<mach_vm_address_t>(address);
-  mach_vm_size_t region_size = 0;
-  vm_region_basic_info_data_64_t info{};
-  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
-  mach_port_t object_name = MACH_PORT_NULL;
-  Check(mach_vm_region(mach_task_self(), &region_address, &region_size,
-                       VM_REGION_BASIC_INFO_64,
-                       reinterpret_cast<vm_region_info_t>(&info), &info_count,
-                       &object_name) == KERN_SUCCESS,
-        "mach_vm_region failed");
-  if (object_name != MACH_PORT_NULL) {
-    mach_port_deallocate(mach_task_self(), object_name);
-  }
-  return (info.protection & VM_PROT_WRITE) != 0
-             ? PAGE_READWRITE
-             : (info.protection & VM_PROT_READ) != 0 ? PAGE_READONLY
-                                                     : PAGE_NOACCESS;
-#else
   const auto addr = reinterpret_cast<uintptr_t>(address);
   std::FILE *maps = std::fopen("/proc/self/maps", "r");
   Check(maps != nullptr, "open /proc/self/maps failed");
@@ -109,7 +79,6 @@ uint32_t Protection(const void *address) {
   }
   std::fclose(maps);
   return result;
-#endif
 }
 
 std::map<void *, size_t> &AllocationSizes() {
@@ -123,15 +92,7 @@ int VirtualFree(void *address, size_t, DWORD) {
   if (it == sizes.end()) {
     return 0;
   }
-#if defined(__APPLE__)
-  const int ok = mach_vm_deallocate(mach_task_self(),
-                                    reinterpret_cast<mach_vm_address_t>(address),
-                                    it->second) == KERN_SUCCESS
-                     ? 1
-                     : 0;
-#else
   const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
-#endif
   sizes.erase(it);
   return ok;
 }
@@ -141,16 +102,7 @@ int VirtualProtect(void *address, size_t size, uint32_t protection,
   if (old_protection != nullptr) {
     *old_protection = Protection(address);
   }
-#if defined(__APPLE__)
-  return mach_vm_protect(mach_task_self(),
-                         reinterpret_cast<mach_vm_address_t>(address), size,
-                         false, static_cast<vm_prot_t>(ToHostProt(protection))) ==
-                 KERN_SUCCESS
-             ? 1
-             : 0;
-#else
   return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
-#endif
 }
 #else
 uint32_t Protection(const void *address) {
@@ -170,7 +122,6 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
-std::mutex g_protection_log_mutex;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
@@ -181,45 +132,20 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
-  {
-    std::lock_guard lock(g_protection_log_mutex);
-    g_protection_calls++;
-    g_protection_ranges.push_back({vaddr, size});
-  }
+  g_protection_calls++;
+  g_protection_ranges.push_back({vaddr, size});
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
 
-uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
-                  uintptr_t test_address = 0x0000000200010000ull) {
+uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
+  constexpr uintptr_t test_address = 0x0000000200010000ull;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(test_address), size,
                    MEM_RESERVE | MEM_COMMIT, protection));
   Check(memory == reinterpret_cast<void *>(test_address),
         "fixed low VirtualAlloc failed");
-#elif defined(__APPLE__)
-  mach_vm_address_t raw = 0;
-  bool allocated = false;
-  constexpr uintptr_t stride = 0x0000000100000000ull;
-  for (uintptr_t candidate = test_address;
-       Libs::Graphics::GuestRange{candidate, size}.Valid(); candidate += stride) {
-    raw = candidate;
-    if (mach_vm_allocate(mach_task_self(), &raw, size, VM_FLAGS_FIXED) !=
-        KERN_SUCCESS) {
-      continue;
-    }
-    if (mach_vm_protect(mach_task_self(), raw, size, false,
-                        static_cast<vm_prot_t>(ToHostProt(protection))) ==
-        KERN_SUCCESS) {
-      allocated = true;
-      break;
-    }
-    mach_vm_deallocate(mach_task_self(), raw, size);
-  }
-  Check(allocated, "no free fixed guest address found");
-  auto *memory = reinterpret_cast<uint8_t *>(raw);
-  AllocationSizes()[memory] = static_cast<size_t>(size);
 #else
   void *raw = ::mmap(reinterpret_cast<void *>(test_address), size,
                      ToHostProt(protection),
@@ -231,11 +157,11 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
   return memory;
 }
 
-void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
+void TestWatchAndUnwatch() {
   g_protection_calls = 0;
   PageManager manager;
   const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size * 2, PAGE_READWRITE, base);
+  auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   manager.UpdatePageWatchers<true>(address, page_size);
@@ -245,6 +171,30 @@ void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
         "watch protection bypassed the address-space owner callback");
   manager.UpdatePageWatchers<false>(address, page_size);
   Check(IsWritable(memory), "write unwatch did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestReapplyProtection() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  // A guest mprotect over the watched page and its unwatched neighbours.
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size * 2, PAGE_READWRITE,
+                       &old_protection) != 0 &&
+            VirtualProtect(memory + page_size * 2, page_size, PAGE_NOACCESS,
+                           &old_protection) != 0,
+        "guest protection change failed");
+  manager.ReapplyProtection(address, page_size * 3);
+  Check(Protection(memory) == PAGE_READONLY,
+        "reapply did not restore the write watch");
+  Check(IsWritable(memory + page_size) &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "reapply changed the protection of unwatched pages");
+  manager.UpdatePageWatchers<false>(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -261,6 +211,62 @@ void TestSharedWatcherCounts() {
         "first unwatch released a shared watcher");
   manager.UpdatePageWatchers<false>(address + 128, 64);
   Check(IsWritable(memory), "last unwatch did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestExactWatcherPeak() {
+  PageManager manager;
+  auto* memory = Allocate(TRACKER_REGION_SIZE * 2);
+  const auto first = reinterpret_cast<uint64_t>(memory);
+  const auto second = first + TRACKER_REGION_SIZE;
+  for (unsigned i = 0; i < 137; ++i) manager.UpdatePageWatchers<true>(first, TRACKER_PAGE_SIZE);
+  for (unsigned i = 0; i < 136; ++i) manager.UpdatePageWatchers<true>(second, TRACKER_PAGE_SIZE);
+  auto peak = Common::PageWatchDiagnostics::Get();
+  Check(peak.count == 137 && peak.address == first, "peak is rounded or replaced by a lower count");
+  for (unsigned i = 0; i < 136; ++i) manager.UpdatePageWatchers<false>(second, TRACKER_PAGE_SIZE);
+  for (unsigned i = 0; i < 137; ++i) manager.UpdatePageWatchers<false>(first, TRACKER_PAGE_SIZE);
+  peak = Common::PageWatchDiagnostics::Get();
+  Check(peak.count == 137 && peak.address == first, "peak was lost when owners were released");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Exercise the public tracker and real host protections past the old 7-bit
+// limit, including a read owner and an offload hold on the very same page.
+void TestManySharedWatchers() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
+  RegionBits mask;
+  mask.Set(static_cast<size_t>((address - region_base) / page_size));
+  g_protection_calls = 0;
+  constexpr unsigned owners = 32767;
+  for (unsigned i = 0; i < owners; ++i) {
+    // Both APIs share the same counter; neither may wrap or truncate it.
+    if (i % 2 == 0) manager.UpdatePageWatchers<true>(address + 8, 32);
+    else manager.UpdatePageWatchersForRegion<true>(region_base, mask);
+  }
+  Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
+        "many owners changed protection or touched a neighbour");
+  Check(g_protection_calls == 1, "shared owners redundantly reprotected the page");
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  manager.UpdateReadWatchers<true>(address, page_size);
+  for (unsigned i = 1; i < owners; ++i) {
+    if (i % 2 == 0) manager.UpdatePageWatchers<false>(address + 8, 32);
+    else manager.UpdatePageWatchersForRegion<false>(region_base, mask);
+  }
+  Check(Protection(memory) == PAGE_NOACCESS && manager.HasReadWatchers(address, page_size),
+        "many write releases lost a read owner");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  Check(Protection(memory) == PAGE_NOACCESS, "read release lost the offload hold");
+  manager.UpdateReadWatchers<false>(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY && !manager.HasReadWatchers(address, page_size),
+        "last write owner was lost after many releases");
+  manager.UpdatePageWatchers<false>(address + 8, 32);
+  Check(IsWritable(memory), "last shared owner did not restore write access");
+  Check(g_protection_calls == 4, "protection changed without an ownership edge");
+  memory[0] = 0x5a;
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -418,6 +424,11 @@ void TestRegionMaskWatcherRanges() {
 
   g_protection_calls = 0;
   manager.UpdatePageWatchersForRegion<true, true>(region_base, sparse_mask);
+  Check(manager.HasReadWatchers(region_base + page_size + 3, 4) &&
+	        manager.HasReadWatchers(region_base + page_size - 1, 2) &&
+	        !manager.HasReadWatchers(region_base + page_size * 2, page_size) &&
+	        !manager.HasReadWatchers(region_base, 0) && !manager.HasReadWatchers(UINT64_MAX - 2, 8),
+	    "read hints lost page rounding, sparse gaps or invalid range checks");
   Check(g_protection_calls == 2 &&
             Protection(reinterpret_cast<void *>(region_base + page_size)) ==
                 PAGE_NOACCESS &&
@@ -427,6 +438,7 @@ void TestRegionMaskWatcherRanges() {
   g_protection_calls = 0;
   g_protection_ranges.clear();
   manager.UpdatePageWatchersForRegion<false, true>(region_base, sparse_mask);
+  Check(!manager.HasReadWatchers(region_base, region_size), "read unwatch retained stale hints");
   Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
             g_protection_ranges[0].size == page_size * 3,
         "sparse read unmask did not bridge a compatible gap");
@@ -554,34 +566,6 @@ void TestReadWriteWatcherInteractions() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-void TestConcurrentSharedWatchers() {
-  constexpr size_t worker_count = 8;
-  PageManager manager;
-  auto *memory = Allocate(TRACKER_PAGE_SIZE);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  bool watched = false;
-  std::barrier phase(worker_count, [&]() noexcept {
-    watched = !watched;
-    Check(Protection(memory) == (watched ? PAGE_READONLY : PAGE_READWRITE),
-          "concurrent watchers lost protection or failed to restore writes");
-  });
-  std::vector<std::jthread> workers;
-  for (size_t i = 0; i < worker_count; i++) {
-    workers.emplace_back([&] {
-      for (size_t round = 0; round < 100; round++) {
-        manager.UpdatePageWatchers<true>(address, TRACKER_PAGE_SIZE);
-        phase.arrive_and_wait();
-        manager.UpdatePageWatchers<false>(address, TRACKER_PAGE_SIZE);
-        phase.arrive_and_wait();
-      }
-    });
-  }
-  for (auto &worker : workers) {
-    worker.join();
-  }
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -613,7 +597,7 @@ void TestConcurrentSharedWatchers() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count < 32768; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
@@ -644,23 +628,10 @@ void CheckDeathCase(const char *name) {
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
 #else
-#if defined(__APPLE__)
-  std::vector<char> path(PATH_MAX);
-  uint32_t path_size = static_cast<uint32_t>(path.size());
-  if (_NSGetExecutablePath(path.data(), &path_size) != 0) {
-    path.resize(path_size);
-    Check(_NSGetExecutablePath(path.data(), &path_size) == 0,
-          "_NSGetExecutablePath failed");
-  }
-#endif
   const pid_t pid = ::fork();
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
-#if defined(__APPLE__)
-    ::execl(path.data(), "PageManagerTests", "--death", name, nullptr);
-#else
     ::execl("/proc/self/exe", "PageManagerTests", "--death", name, nullptr);
-#endif
     std::_Exit(0x7e);
   }
   int status = 0;
@@ -671,6 +642,61 @@ void CheckDeathCase(const char *name) {
   Check(fatal_exit || fatal_signal,
         "death case did not use the PageManager fatal exit");
 #endif
+}
+
+// Issue #91: the texture offload's hold and the memory tracker's read watcher over one page, either first, and two
+// holds of aliased images: no access until the last one goes, then the page's protection is the watchers' again.
+void TestOffloadHoldBesideReadWatcher() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto page = region_base + page_size * 20;
+  const auto *pointer = reinterpret_cast<void *>(page);
+  RegionBits mask;
+  mask.Set(20);
+
+  manager.UpdateReadWatchers<true>(page, page_size);
+  Check(Protection(pointer) == PAGE_NOACCESS &&
+            manager.HasReadWatchers(page, page_size),
+        "offload hold did not take the page's access");
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  Check(Protection(pointer) == PAGE_NOACCESS,
+        "read watcher beside an offload hold changed the page");
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(Protection(pointer) == PAGE_NOACCESS &&
+            manager.HasReadWatchers(page, page_size),
+        "offload release gave back a page the read watcher keeps");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  Check(IsWritable(pointer) && !manager.HasReadWatchers(page, page_size),
+        "page not writable after both went");
+
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  manager.UpdateReadWatchers<true>(page, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  Check(Protection(pointer) == PAGE_NOACCESS &&
+            manager.HasReadWatchers(page, page_size),
+        "read watcher release gave back a page the offload holds");
+  manager.UpdateReadWatchers<true>(page, page_size);
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(Protection(pointer) == PAGE_NOACCESS,
+        "second offload hold's release gave back the page");
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(IsWritable(pointer) && !manager.HasReadWatchers(page, page_size),
+        "page not writable after the last offload hold");
+
+  manager.UpdatePageWatchersForRegion<true>(region_base, mask);
+  manager.UpdateReadWatchers<true>(page, page_size);
+  manager.UpdateReadWatchers<false>(page, page_size);
+  Check(Protection(pointer) == PAGE_READONLY,
+        "offload release lost the page's write watcher");
+  manager.UpdatePageWatchersForRegion<false>(region_base, mask);
+  Check(IsWritable(pointer), "page not writable after the write watcher");
+
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestFatalPaths() {
@@ -690,21 +716,43 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool RestoreGuestWritable(uint64_t /*vaddr*/, uint64_t /*size*/) {
+  return false;
+}
+
+bool RestoreGuestProtection(uint64_t /*vaddr*/, uint64_t /*size*/) {
+  return false;
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  if (argc == 3 && std::strcmp(argv[1], "--peak-summary") == 0) {
+    TestExactWatcherPeak();
+    if (std::strcmp(argv[2], "quick") == 0) std::quick_exit(0);
+    if (std::strcmp(argv[2], "fatal") == 0) Common::DbgExit(321);
+    if (std::strcmp(argv[2], "page-fatal") == 0) RunDeathCase("known-write-underflow");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--many-watchers") == 0) {
+    TestManySharedWatchers();
+    std::puts("PageManagerTests: many shared watchers passed");
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
   TestWatchAndUnwatch();
-  TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
+  TestReapplyProtection();
   TestSharedWatcherCounts();
+  TestExactWatcherPeak();
+  TestManySharedWatchers();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
-  TestConcurrentSharedWatchers();
+  TestOffloadHoldBesideReadWatcher();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

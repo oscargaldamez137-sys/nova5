@@ -1,21 +1,28 @@
 #include "graphics/presentation/window/hostInput.h"
 
-#include <SDL3/SDL.h>
-
+#include "SDL_error.h"
+#include "SDL_events.h"
+#include "SDL_keyboard.h"
+#include "SDL_keycode.h"
+#include "SDL_mouse.h"
+#include "SDL_timer.h"
+#include "SDL_video.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
+#include "local/input-trace.h"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
-#include <mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -27,10 +34,6 @@ struct ControlInfo {
 	Controller::Axis axis     = Controller::Axis::AxisMax;
 	bool             positive = false;
 	float            touch_x  = 0.0f;
-
-	Controller::Setting setting {};
-	bool                gyro          = false;
-	bool                touchpad_mode = false;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -61,69 +64,9 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"RightStickRight", 0, Controller::Axis::RightX, true},
     ControlInfo {"RightStickUp", 0, Controller::Axis::RightY, false},
     ControlInfo {"RightStickDown", 0, Controller::Axis::RightY, true},
-    ControlInfo {.name = "SpeakerVolume", .setting = Controller::Setting::SpeakerVolume},
-    ControlInfo {.name = "VibrationIntensity", .setting = Controller::Setting::VibrationIntensity},
-    ControlInfo {.name    = "TriggerEffectIntensity",
-                 .setting = Controller::Setting::TriggerEffectIntensity},
-    ControlInfo {.name = "GyroToggle", .gyro = true},
-    ControlInfo {.name = "TouchPadMode", .touchpad_mode = true},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
-
-struct PadSource {
-	std::string_view name;
-	int              button; // SDL_GamepadButton, or -1 for an analog trigger
-};
-
-constexpr std::array PAD_SOURCES = {
-    PadSource {"South", SDL_GAMEPAD_BUTTON_SOUTH},
-    PadSource {"East", SDL_GAMEPAD_BUTTON_EAST},
-    PadSource {"West", SDL_GAMEPAD_BUTTON_WEST},
-    PadSource {"North", SDL_GAMEPAD_BUTTON_NORTH},
-    PadSource {"Back", SDL_GAMEPAD_BUTTON_BACK},
-    PadSource {"Guide", SDL_GAMEPAD_BUTTON_GUIDE},
-    PadSource {"Start", SDL_GAMEPAD_BUTTON_START},
-    PadSource {"LeftStick", SDL_GAMEPAD_BUTTON_LEFT_STICK},
-    PadSource {"RightStick", SDL_GAMEPAD_BUTTON_RIGHT_STICK},
-    PadSource {"LeftShoulder", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
-    PadSource {"RightShoulder", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
-    PadSource {"DpadUp", SDL_GAMEPAD_BUTTON_DPAD_UP},
-    PadSource {"DpadDown", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
-    PadSource {"DpadLeft", SDL_GAMEPAD_BUTTON_DPAD_LEFT},
-    PadSource {"DpadRight", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
-    PadSource {"Misc1", SDL_GAMEPAD_BUTTON_MISC1},
-    PadSource {"RightPaddle1", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
-    PadSource {"LeftPaddle1", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
-    PadSource {"RightPaddle2", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
-    PadSource {"LeftPaddle2", SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
-    PadSource {"Touchpad", SDL_GAMEPAD_BUTTON_TOUCHPAD},
-    PadSource {"LeftTrigger", -1},
-    PadSource {"RightTrigger", -1},
-};
-
-constexpr std::size_t LEFT_TRIGGER_SOURCE  = PAD_SOURCES.size() - 2;
-constexpr std::size_t RIGHT_TRIGGER_SOURCE = PAD_SOURCES.size() - 1;
-constexpr std::size_t INVALID_SOURCE       = PAD_SOURCES.size();
-
-struct PadDefault {
-	std::string_view control;
-	std::string_view source;
-};
-
-constexpr std::array PAD_DEFAULTS = {
-    PadDefault {"Cross", "South"},         PadDefault {"Circle", "East"},
-    PadDefault {"Square", "West"},         PadDefault {"Triangle", "North"},
-    PadDefault {"Options", "Start"},       PadDefault {"L3", "LeftStick"},
-    PadDefault {"R3", "RightStick"},       PadDefault {"L1", "LeftShoulder"},
-    PadDefault {"R1", "RightShoulder"},    PadDefault {"L2", "LeftTrigger"},
-    PadDefault {"R2", "RightTrigger"},     PadDefault {"Up", "DpadUp"},
-    PadDefault {"Down", "DpadDown"},       PadDefault {"Left", "DpadLeft"},
-    PadDefault {"Right", "DpadRight"},     PadDefault {"TouchPad", "Touchpad"},
-    PadDefault {"GyroToggle", "Back"},
-};
-
-constexpr std::string_view PAD_PREFIX = "Pad:";
 
 struct Binding {
 	SDL_Keycode key          = SDLK_UNKNOWN;
@@ -132,9 +75,10 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
-constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
-constexpr std::string_view TOUCH_PARTICLE_SKIN    = "TouchParticleSkin=";
+// The wheel's notches as mouse "buttons" (Mouse:WheelUp, Mouse:WheelDown; past SDL's buttons).
+constexpr uint8_t MOUSE_WHEEL_UP   = 0xf0;
+constexpr uint8_t MOUSE_WHEEL_DOWN = 0xf1;
 
 struct MouseJoystickState {
 	bool     enabled   = false;
@@ -143,43 +87,6 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
-bool               g_mouse_captured = false;
-bool               g_restore_touchpad = false;
-uint32_t           g_mouse_ignore_until_up = 0;
-SDL_Window*        g_mouse_window   = nullptr;
-uint64_t           g_cursor_hide_at = 0;
-
-struct MouseTouchPadState {
-	bool     enabled        = false;
-	bool     cursor_visible = true;
-	bool     drawing        = false;
-	bool     position_valid = false;
-	float    x              = 0.5f;
-	float    y              = 0.5f;
-	uint64_t revision       = 0;
-	uint64_t gesture        = 0;
-};
-
-struct GamepadTouchPadState {
-	bool     enabled   = false;
-	bool     drawing   = false;
-	int      id        = -1;
-	int      x_axis    = 128;
-	int      y_axis    = 128;
-	float    x         = 0.5f;
-	float    y         = 0.5f;
-	uint64_t next_poll = 0;
-	uint64_t last_poll = 0;
-};
-
-constexpr int   GAMEPAD_TOUCHPAD_POLL_MS = 8;
-constexpr int   GAMEPAD_TOUCHPAD_DEADZONE = 18;
-constexpr float GAMEPAD_TOUCHPAD_SPEED    = 0.8f;
-
-MouseTouchPadState   g_mouse_touchpad;
-GamepadTouchPadState g_gamepad_touchpad;
-std::mutex           g_touchpad_mutex;
-std::unordered_map<int, std::array<bool, 2>> g_pad_trigger_pressed;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -197,6 +104,36 @@ SDL_Keycode NormalizeKey(SDL_Keycode key) {
 	}
 }
 
+// A key by its SDL name ("Left Shift"; case does not matter), or by that name without its spaces ("LeftShift") or a
+// usual short one (Spacebar, Esc, Enter, Shift, Ctrl, Alt, LShift, RCtrl...): issue #91's list used those.
+SDL_Keycode KeyFromName(std::string_view name) {
+	if (const auto key = SDL_GetKeyFromName(std::string(name).c_str()); key != SDLK_UNKNOWN) {
+		return key;
+	}
+	std::string compact;
+	for (const char c: name) {
+		if (c != ' ' && c != '_' && c != '-') {
+			compact += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+	}
+	static constexpr std::array aliases = {
+	    std::pair {std::string_view("spacebar"), SDLK_SPACE},     std::pair {std::string_view("esc"), SDLK_ESCAPE},
+	    std::pair {std::string_view("enter"), SDLK_RETURN},       std::pair {std::string_view("shift"), SDLK_LSHIFT},
+	    std::pair {std::string_view("leftshift"), SDLK_LSHIFT},   std::pair {std::string_view("lshift"), SDLK_LSHIFT},
+	    std::pair {std::string_view("rightshift"), SDLK_RSHIFT},  std::pair {std::string_view("rshift"), SDLK_RSHIFT},
+	    std::pair {std::string_view("ctrl"), SDLK_LCTRL},         std::pair {std::string_view("control"), SDLK_LCTRL},
+	    std::pair {std::string_view("leftctrl"), SDLK_LCTRL},     std::pair {std::string_view("lctrl"), SDLK_LCTRL},
+	    std::pair {std::string_view("leftcontrol"), SDLK_LCTRL},  std::pair {std::string_view("rightctrl"), SDLK_RCTRL},
+	    std::pair {std::string_view("rctrl"), SDLK_RCTRL},        std::pair {std::string_view("rightcontrol"), SDLK_RCTRL},
+	    std::pair {std::string_view("alt"), SDLK_LALT},           std::pair {std::string_view("leftalt"), SDLK_LALT},
+	    std::pair {std::string_view("lalt"), SDLK_LALT},          std::pair {std::string_view("rightalt"), SDLK_RALT},
+	    std::pair {std::string_view("ralt"), SDLK_RALT},
+	};
+	const auto alias = std::find_if(aliases.begin(), aliases.end(),
+	                                [&compact](const auto& item) { return item.first == compact; });
+	return alias != aliases.end() ? alias->second : SDL_GetKeyFromName(compact.c_str());
+}
+
 uint8_t MouseButtonFromName(std::string_view name) {
 	static constexpr std::array buttons = {
 	    std::pair {std::string_view("Mouse:Left"), uint8_t {SDL_BUTTON_LEFT}},
@@ -204,6 +141,8 @@ uint8_t MouseButtonFromName(std::string_view name) {
 	    std::pair {std::string_view("Mouse:Right"), uint8_t {SDL_BUTTON_RIGHT}},
 	    std::pair {std::string_view("Mouse:X1"), uint8_t {SDL_BUTTON_X1}},
 	    std::pair {std::string_view("Mouse:X2"), uint8_t {SDL_BUTTON_X2}},
+	    std::pair {std::string_view("Mouse:WheelUp"), MOUSE_WHEEL_UP},
+	    std::pair {std::string_view("Mouse:WheelDown"), MOUSE_WHEEL_DOWN},
 	};
 
 	const auto button = std::find_if(buttons.begin(), buttons.end(),
@@ -211,8 +150,9 @@ uint8_t MouseButtonFromName(std::string_view name) {
 	return button != buttons.end() ? button->second : 0;
 }
 
+// A control takes one key and one mouse input (Up=Up with Up=Mouse:WheelUp: both), each input one control.
 bool Conflicts(const Binding& first, const Binding& second) {
-	return first.control == second.control ||
+	return (first.control == second.control && (first.key != SDLK_UNKNOWN) == (second.key != SDLK_UNKNOWN)) ||
 	       (first.key != SDLK_UNKNOWN && first.key == second.key) ||
 	       (first.mouse_button != 0 && first.mouse_button == second.mouse_button);
 }
@@ -222,26 +162,11 @@ public:
 	InputMap() {
 		for (const auto& value: Config::GetKeymap()) {
 			const std::string_view entry = value;
-			if (entry == "Keyboard=Disabled") {
-				m_custom = true;
-				continue;
-			}
-			if (entry == "Pad=Disabled") {
-				m_custom_pad = true;
-				continue;
-			}
 			if (entry.starts_with(MOUSE_SENSITIVITY)) {
 				const float sensitivity =
 				    std::strtof(value.c_str() + MOUSE_SENSITIVITY.size(), nullptr);
 				m_mouse_sensitivity =
 				    std::clamp(std::isfinite(sensitivity) ? sensitivity : 1.0f, 0.1f, 5.0f);
-				continue;
-			}
-			if (entry.starts_with(TOUCH_PARTICLE_SKIN) || entry.starts_with("TouchCursorImage=")) {
-				continue;
-			}
-			if (entry.starts_with(PAD_PREFIX)) {
-				AddPadEntry(entry.substr(PAD_PREFIX.size()), value);
 				continue;
 			}
 			const auto split = entry.find('=');
@@ -252,37 +177,27 @@ public:
 				const auto host_input = entry.substr(split + 1);
 				binding.mouse_button  = MouseButtonFromName(host_input);
 				if (binding.mouse_button == 0) {
-					binding.key = NormalizeKey(SDL_GetKeyFromName(std::string(host_input).c_str()));
+					binding.key = NormalizeKey(KeyFromName(host_input));
 				}
 			}
 
-			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F2 || binding.key == SDLK_F7 ||
-			                      binding.key == SDLK_F8 || binding.key == SDLK_F11;
+			// The emulator's own keys: F7 the mouse camera, F8 its overlay, F11 full screen. (Space pauses unless a
+			// mapping takes it, the Pause key then; the system's dialogs see Esc first.)
+			const bool reserved = binding.key == SDLK_F7 || binding.key == SDLK_F8 || binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
-				EXIT("Invalid input mapping: %s\n", value.c_str());
+				// (Skipped, not the end of the start-up: the other mappings still work.)
+				std::printf("Input mapping skipped: %s (%s)\n", value.c_str(),
+				            binding.control == INVALID_CONTROL ? "no such control"
+				            : reserved                         ? "one of the emulator's own keys"
+				                                               : "no such key or mouse button");
+				continue;
 			}
 			Add(binding);
 		}
-		if (!m_custom_pad) {
-			for (const auto& item: PAD_DEFAULTS) {
-				AssignPad(ControlFromName(item.control), SourceFromName(item.source));
-			}
-		}
 	}
-	[[nodiscard]] bool  Custom() const { return m_custom; }
+	[[nodiscard]] bool  Custom() const { return m_size != 0; }
 	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
-
-	[[nodiscard]] std::size_t PadControl(std::size_t source) const {
-		return source < m_pad_controls.size() ? m_pad_controls[source] : INVALID_CONTROL;
-	}
-
-	static std::size_t SourceFromButton(int button) {
-		const auto item = std::find_if(PAD_SOURCES.begin(), PAD_SOURCES.end(),
-		                               [button](const auto& s) { return s.button == button; });
-		return static_cast<std::size_t>(std::distance(PAD_SOURCES.begin(), item));
-	}
 
 	[[nodiscard]] std::size_t FindKey(int key_code) const {
 		key_code = NormalizeKey(static_cast<SDL_Keycode>(key_code));
@@ -300,39 +215,7 @@ public:
 	}
 
 private:
-	static std::size_t SourceFromName(std::string_view name) {
-		const auto item = std::find_if(PAD_SOURCES.begin(), PAD_SOURCES.end(),
-		                               [name](const auto& s) { return s.name == name; });
-		return static_cast<std::size_t>(std::distance(PAD_SOURCES.begin(), item));
-	}
-
-	void AssignPad(std::size_t control, std::size_t source) {
-		for (auto& existing: m_pad_controls) {
-			if (existing == control) {
-				existing = INVALID_CONTROL;
-			}
-		}
-		m_pad_controls[source] = control;
-	}
-
-	void AddPadEntry(std::string_view entry, const std::string& original) {
-		const auto split   = entry.find('=');
-		const auto control = split != std::string_view::npos ? ControlFromName(entry.substr(0, split))
-		                                                     : INVALID_CONTROL;
-		const auto source  = split != std::string_view::npos ? SourceFromName(entry.substr(split + 1))
-		                                                     : INVALID_SOURCE;
-		if (control == INVALID_CONTROL || source == INVALID_SOURCE) {
-			EXIT("Invalid input mapping: %s\n", original.c_str());
-		}
-		const auto& info = CONTROL_INFO[control];
-		if (info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) {
-			EXIT("Invalid input mapping: %s\n", original.c_str());
-		}
-		m_custom_pad = true;
-		AssignPad(control, source);
-	}
 	void Add(const Binding& binding) {
-		m_custom = true;
 		for (std::size_t index = 0; index < m_size;) {
 			if (Conflicts(m_bindings[index], binding)) {
 				m_bindings[index] = m_bindings[--m_size];
@@ -344,14 +227,7 @@ private:
 		m_bindings[m_size++] = binding;
 	}
 
-	std::array<Binding, CONTROL_INFO.size()> m_bindings {};
-	std::array<std::size_t, PAD_SOURCES.size()> m_pad_controls = [] {
-		std::array<std::size_t, PAD_SOURCES.size()> a {};
-		a.fill(INVALID_CONTROL);
-		return a;
-	}();
-	bool                                     m_custom = false;
-	bool                                     m_custom_pad = false;
+	std::array<Binding, CONTROL_INFO.size() * 2> m_bindings {};
 	std::size_t                              m_size              = 0;
 	float                                    m_mouse_sensitivity = 1.0f;
 };
@@ -377,53 +253,18 @@ void SetTouchPad(float x, bool down) {
 	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
 }
 
-void SetSwipeTouchPad(bool down, float x, float y) {
-	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down, x, y);
-}
-
-void RecordMouseTouchPadPosition(float x, float y) {
-	int width  = 0;
-	int height = 0;
-	if (g_mouse_window != nullptr) {
-		SDL_GetWindowSize(g_mouse_window, &width, &height);
-	}
-	if (width > 0 && height > 0) {
-		x = std::clamp(x / static_cast<float>(width), 0.0f, 1.0f);
-		y = std::clamp(y / static_cast<float>(height), 0.0f, 1.0f);
-	} else {
-		x = 0.5f;
-		y = 0.5f;
-	}
-
-	std::scoped_lock lock(g_touchpad_mutex);
-	if (!g_mouse_touchpad.enabled) {
-		return;
-	}
-	g_mouse_touchpad.x              = x;
-	g_mouse_touchpad.y              = y;
-	g_mouse_touchpad.position_valid = true;
-	g_mouse_touchpad.revision++;
-}
-
-bool TouchPadModeActive() {
-	std::scoped_lock lock(g_touchpad_mutex);
-	return g_mouse_touchpad.enabled || g_gamepad_touchpad.enabled;
-}
-
 uint32_t DefaultKeyboardButton(int key_code) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_UP: return Controller::PAD_BUTTON_UP;
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
-		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
-		case SDLK_L: return Controller::PAD_BUTTON_CIRCLE;
-		case SDLK_Q: return Controller::PAD_BUTTON_L1;
-		case SDLK_E: return Controller::PAD_BUTTON_R1;
-		case SDLK_Z: return Controller::PAD_BUTTON_L2;
-		case SDLK_C: return Controller::PAD_BUTTON_R2;
+		case SDLK_j: return Controller::PAD_BUTTON_CROSS;
+		case SDLK_i: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDLK_k: return Controller::PAD_BUTTON_SQUARE;
+		case SDLK_l: return Controller::PAD_BUTTON_CIRCLE;
+		case SDLK_q: return Controller::PAD_BUTTON_L1;
+		case SDLK_e: return Controller::PAD_BUTTON_R1;
 		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
 		case SDLK_RETURN:
@@ -449,16 +290,16 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
-void CycleSettingOnPress(Controller::Setting setting, bool down) {
-	if (down) {
-		Controller::CycleSetting(setting);
-	}
-}
+// Who holds a control: its key, its mouse input (a button or a wheel notch). It is up once neither does.
+constexpr uint8_t FROM_KEY = 1, FROM_MOUSE = 2;
 
-void SetControl(std::size_t control, bool down) {
+void SetControl(std::size_t control, bool down, uint8_t source) {
 	if (control == INVALID_CONTROL) {
 		return;
 	}
+	static std::array<uint8_t, CONTROL_INFO.size()> held {};
+	held[control] = static_cast<uint8_t>(down ? held[control] | source : held[control] & ~source);
+	down          = held[control] != 0;
 
 	const auto& info = CONTROL_INFO[control];
 	if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
@@ -467,22 +308,6 @@ void SetControl(std::size_t control, bool down) {
 	}
 	if (info.button != 0) {
 		SetButton(info.button, down);
-		return;
-	}
-	if (info.gyro) {
-		if (down) {
-			Controller::ToggleGyroEmulation(Controller::HOST_INPUT_CONTROLLER_ID);
-		}
-		return;
-	}
-	if (info.touchpad_mode) {
-		if (down) {
-			HostInputToggleTouchPadMode();
-		}
-		return;
-	}
-	if (info.axis == Controller::Axis::AxisMax) {
-		CycleSettingOnPress(info.setting, down);
 		return;
 	}
 
@@ -508,44 +333,36 @@ void DefaultKeyboardInput(int key_code, bool down) {
 
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
-		case SDLK_F6:
-			if (down) {
-				HostInputToggleTouchPadMode();
-			}
-			return;
 		case SDLK_TAB: SetTouchPad(0.75f, down); return;
-		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
-		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
-		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
-		case SDLK_A:
+		case SDLK_a:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
 			return;
-		case SDLK_D:
+		case SDLK_d:
 			left.right = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
 			return;
-		case SDLK_W:
+		case SDLK_w:
 			left.up = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_S:
+		case SDLK_s:
 			left.down = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_F:
+		case SDLK_f:
 			right.left = down;
 			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
 			return;
-		case SDLK_H:
+		case SDLK_h:
 			right.right = down;
 			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
 			return;
-		case SDLK_T:
+		case SDLK_t:
 			right.up = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
-		case SDLK_G:
+		case SDLK_g:
 			right.down = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
@@ -553,11 +370,11 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	}
 }
 
-void MouseToJoystick(float delta_x, float delta_y) {
+void MouseToJoystick(int delta_x, int delta_y) {
 	const double distance = std::hypot(delta_x, delta_y);
 	const double scale =
 	    std::clamp(distance * GetInputMap().MouseSensitivity() + 16.0, 64.0, 128.0) / distance;
-	const auto map_axis = [scale](float delta) {
+	const auto map_axis = [scale](int delta) {
 		return std::clamp(128 + static_cast<int>(std::lround(delta * scale)), 0, 255);
 	};
 	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(delta_x),
@@ -573,451 +390,115 @@ void CenterMouseStick() {
 }
 
 bool SetRelativeMouseMode(bool enabled) {
-	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
+	if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) == 0) {
 		return true;
 	}
 	LOGF("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
 	return false;
 }
-
-int PollMouse(uint64_t now_ms) {
-	if (now_ms < g_mouse.next_poll) {
-		return static_cast<int>(g_mouse.next_poll - now_ms);
-	}
-	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
-
-	float delta_x = 0;
-	float delta_y = 0;
-	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (delta_x == 0 && delta_y == 0) {
-		CenterMouseStick();
-	} else {
-		MouseToJoystick(delta_x, delta_y);
-		g_mouse.output = true;
-	}
-	return MOUSE_POLL_INTERVAL_MS;
-}
-
-bool IsCursorActivity(const SDL_Event& event) {
-	SDL_MouseID which;
-	switch (event.type) {
-		case SDL_EVENT_MOUSE_MOTION:
-			if (event.motion.xrel == 0.0f && event.motion.yrel == 0.0f) {
-				return false;
-			}
-			which = event.motion.which;
-			break;
-		case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		case SDL_EVENT_MOUSE_BUTTON_UP: which = event.button.which; break;
-		case SDL_EVENT_MOUSE_WHEEL: which = event.wheel.which; break;
-		default: return false;
-	}
-	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
-}
-
-std::array<int, 2> GamepadLeftStick(int id) {
-	auto* pad = SDL_GetGamepadFromID(id);
-	if (pad == nullptr) {
-		return {128, 128};
-	}
-	const auto value = [pad](SDL_GamepadAxis axis) {
-		return Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
-		                                       SDL_GetGamepadAxis(pad, axis));
-	};
-	return {value(SDL_GAMEPAD_AXIS_LEFTX), value(SDL_GAMEPAD_AXIS_LEFTY)};
-}
-
-void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down) {
-	if (control == INVALID_CONTROL) {
-		return;
-	}
-	const auto& info = CONTROL_INFO[control];
-	if (info.gyro) {
-		if (down) {
-			Controller::ToggleGyroEmulation(id);
-		}
-	} else if (info.touchpad_mode) {
-		if (down) {
-			HostInputToggleGamepadTouchPad(id);
-		}
-	} else if (info.button == Controller::PAD_BUTTON_CROSS && HostInputGamepadDrawButton(id, down)) {
-		return;
-	} else if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
-		// Real touchpads report their own finger position; other inputs emulate a click.
-		if (source != PAD_SOURCES.size() && PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
-		}
-		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
-	} else if (info.button == Controller::PAD_BUTTON_L2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
-	} else if (info.button == Controller::PAD_BUTTON_R2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
-	} else if (info.button != 0) {
-		Controller::SetButton(id, info.button, down);
-	} else if (info.axis == Controller::Axis::AxisMax) {
-		CycleSettingOnPress(info.setting, down);
-	}
-}
-
-int PollGamepadTouchPad(uint64_t now_ms) {
-	float x       = 0;
-	float y       = 0;
-	int   id      = -1;
-	bool  drawing = false;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		if (!g_gamepad_touchpad.enabled) {
-			return -1;
-		}
-		if (now_ms < g_gamepad_touchpad.next_poll) {
-			return static_cast<int>(g_gamepad_touchpad.next_poll - now_ms);
-		}
-
-		const float dt = g_gamepad_touchpad.last_poll == 0 || now_ms <= g_gamepad_touchpad.last_poll
-		                     ? 0.008f
-		                     : std::min(static_cast<float>(now_ms - g_gamepad_touchpad.last_poll) *
-		                                    0.001f,
-		                                0.05f);
-		g_gamepad_touchpad.last_poll = now_ms;
-		g_gamepad_touchpad.next_poll = now_ms + GAMEPAD_TOUCHPAD_POLL_MS;
-		const auto velocity          = [](int axis) {
-            const int offset = axis - 128;
-            if (std::abs(offset) <= GAMEPAD_TOUCHPAD_DEADZONE) {
-                return 0.0f;
-            }
-            const int adjusted =
-                offset > 0 ? offset - GAMEPAD_TOUCHPAD_DEADZONE : offset + GAMEPAD_TOUCHPAD_DEADZONE;
-            return static_cast<float>(adjusted) / static_cast<float>(127 - GAMEPAD_TOUCHPAD_DEADZONE);
-		};
-		const float old_x = g_gamepad_touchpad.x;
-		const float old_y = g_gamepad_touchpad.y;
-		g_gamepad_touchpad.x = std::clamp(
-		    old_x + velocity(g_gamepad_touchpad.x_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
-		g_gamepad_touchpad.y = std::clamp(
-		    old_y + velocity(g_gamepad_touchpad.y_axis) * GAMEPAD_TOUCHPAD_SPEED * dt, 0.0f, 1.0f);
-		if (old_x != g_gamepad_touchpad.x || old_y != g_gamepad_touchpad.y) {
-			g_mouse_touchpad.revision++;
-		}
-		id      = g_gamepad_touchpad.id;
-		x       = g_gamepad_touchpad.x;
-		y       = g_gamepad_touchpad.y;
-		drawing = g_gamepad_touchpad.drawing;
-	}
-	if (drawing) {
-		Controller::SetTouchPad(id, 1, true, x, y);
-	}
-	return GAMEPAD_TOUCHPAD_POLL_MS;
-}
-
 } // namespace
 
-void HostInputPadButton(int id, int button, bool down) {
-	const auto  source = InputMap::SourceFromButton(button);
-	const auto& map    = GetInputMap();
-	ApplyPadControl(id, map.PadControl(source), source, down);
-}
-
-void HostInputPadTrigger(int id, bool left, int value) {
-	const auto  source     = left ? LEFT_TRIGGER_SOURCE : RIGHT_TRIGGER_SOURCE;
-	const auto  control    = GetInputMap().PadControl(source);
-	if (control == INVALID_CONTROL) {
-		return;
-	}
-	const auto& info = CONTROL_INFO[control];
-	if (info.button == Controller::PAD_BUTTON_L2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerLeft, value);
-	} else if (info.button == Controller::PAD_BUTTON_R2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerRight, value);
-	} else {
-		auto& state = g_pad_trigger_pressed[id][left ? 0 : 1];
-		const bool down = state ? value > 32 : value > 96;
-		if (down != state) {
-			state = down;
-			ApplyPadControl(id, control, source, down);
-		}
-	}
-}
-
-void HostInputDisconnectGamepad(int id) {
-	g_pad_trigger_pressed.erase(id);
-	HostInputDisconnectGamepadTouchPad(id);
-}
-
-void HostInputInit(SDL_Window* window) {
+void HostInputInit() {
 	GetInputMap();
-	g_mouse_window = window;
-	if (Config::HideCursorEnabled()) {
-		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
-	}
 }
 
-void HostInputShutdown() {
-	g_mouse_captured = false;
-	g_restore_touchpad = false;
-	g_mouse_ignore_until_up = 0;
-	g_pad_trigger_pressed.clear();
-	HostInputSetTouchPadMode(false);
-	int gamepad_touch_id = -1;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		gamepad_touch_id = g_gamepad_touchpad.enabled ? g_gamepad_touchpad.id : -1;
-	}
-	if (gamepad_touch_id >= 0) {
-		HostInputDisconnectGamepadTouchPad(gamepad_touch_id);
-	}
-	if (g_mouse.enabled) {
-		SetRelativeMouseMode(false);
-		CenterMouseStick();
-		g_mouse = {};
-	}
-	g_mouse_window   = nullptr;
-	g_cursor_hide_at = 0;
-	if (Config::HideCursorEnabled()) {
-		SDL_ShowCursor();
-	}
+// The Steam Deck build leaves the keyboard's default pad keys out (KYTY_DECK_KEYBOARD=1 keeps them): started outside
+// Steam, Steam's desktop layout sends keys for the Deck's sticks and buttons on top of the controller itself (the arrow
+// keys pressed the D-pad: the equipment changed while walking). A keymap's keys still count.
+static bool DefaultKeysUsed() {
+#if defined(KYTY_STEAM_DECK)
+	static const bool used = [] {
+		const char* value = std::getenv("KYTY_DECK_KEYBOARD");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return used;
+#else
+	return true;
+#endif
 }
 
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
+	if (InputTrace::Enabled()) {
+		const auto control = map.Custom() ? map.FindKey(key_code) : INVALID_CONTROL;
+		std::printf("[INPUT] host-key key=%d down=%d map=%s control=%s default-buttons=0x%x focus=%d\n",
+		            key_code, down, map.Custom() ? "custom" : (DefaultKeysUsed() ? "default" : "disabled"),
+		            control != INVALID_CONTROL ? CONTROL_INFO[control].name.data() : "-",
+		            !map.Custom() && DefaultKeysUsed() ? DefaultKeyboardButton(key_code) : 0,
+		            SDL_GetKeyboardFocus() != nullptr);
+		std::fflush(stdout);
+	}
 	if (map.Custom()) {
-		SetControl(map.FindKey(key_code), down);
-	} else {
+		SetControl(map.FindKey(key_code), down, FROM_KEY);
+	} else if (DefaultKeysUsed()) {
 		DefaultKeyboardInput(key_code, down);
 	}
 }
 
+bool HostInputMapsKey(int key_code) {
+	const auto& map = GetInputMap();
+	return map.Custom() && map.FindKey(key_code) != INVALID_CONTROL;
+}
+
+bool HostInputDefaultKeysUsed() {
+	return DefaultKeysUsed();
+}
+
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
-	if (g_mouse_captured || mouse_button == 0) return;
-	const auto mask = SDL_BUTTON_MASK(mouse_button);
-	if ((g_mouse_ignore_until_up & mask) != 0) {
-		if (!down) g_mouse_ignore_until_up &= ~mask;
-		return;
-	}
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
-		SetControl(map.FindMouseButton(mouse_button), down);
+		SetControl(map.FindMouseButton(mouse_button), down, FROM_MOUSE);
 	}
 }
 
-void HostInputMouseTouchPad(bool down, float x, float y) {
-	if (g_mouse_captured || (down && (g_mouse_ignore_until_up & SDL_BUTTON_LMASK) != 0)) return;
-	RecordMouseTouchPadPosition(x, y);
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		if (!g_mouse_touchpad.enabled) {
-			return;
-		}
-		if (down && !g_mouse_touchpad.drawing) {
-			g_mouse_touchpad.gesture++;
-		}
-		g_mouse_touchpad.drawing = down;
-		g_mouse_touchpad.revision++;
-		x = g_mouse_touchpad.x;
-		y = g_mouse_touchpad.y;
-	}
-	SetSwipeTouchPad(down, x, y);
-}
+// The control a wheel notch presses (Mouse:WheelUp / Mouse:WheelDown): the wheel has no release, so each notch is a
+// press of WHEEL_PRESS_MS, then WHEEL_GAP_MS up before the next (the game reads its pad once a frame: a shorter press
+// could fall between two reads, and back to back two notches would be one press).
+constexpr uint64_t WHEEL_PRESS_MS = 80, WHEEL_GAP_MS = 50;
+constexpr int      WHEEL_QUEUED   = 3; // notches kept at most
 
-void HostInputMouseMotion(float x, float y) {
-	if (g_mouse_captured) return;
-	RecordMouseTouchPadPosition(x, y);
-	std::scoped_lock lock(g_touchpad_mutex);
-	if (g_mouse_touchpad.enabled && g_mouse_touchpad.drawing) {
-		SetSwipeTouchPad(true, g_mouse_touchpad.x, g_mouse_touchpad.y);
-	}
-}
+struct WheelPulse {
+	std::size_t control = INVALID_CONTROL;
+	int         pending = 0;     // notches not pressed yet
+	bool        down    = false; // pressed now
+	uint64_t    until   = 0;     // the next change
+};
+static WheelPulse g_wheel;
 
-void HostInputSetTouchPadMode(bool enabled) {
-	if (enabled && g_mouse_captured) return;
-	if (enabled) {
-		int gamepad_id = -1;
-		{
-			std::scoped_lock lock(g_touchpad_mutex);
-			if (g_gamepad_touchpad.enabled) {
-				gamepad_id = g_gamepad_touchpad.id;
-			}
-		}
-		if (gamepad_id >= 0) {
-			HostInputDisconnectGamepadTouchPad(gamepad_id);
-		}
-	}
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		if (g_mouse_touchpad.enabled == enabled) {
-			return;
-		}
-	}
-	if (!enabled) {
-		float x = 0;
-		float y = 0;
-		(void) SDL_GetMouseState(&x, &y);
-		HostInputMouseTouchPad(false, x, y);
-	}
-	bool show_system_cursor = false;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		g_mouse_touchpad.enabled        = enabled;
-		g_mouse_touchpad.cursor_visible = true;
-		g_mouse_touchpad.drawing        = false;
-		g_mouse_touchpad.position_valid = false;
-		g_mouse_touchpad.gesture++;
-		g_mouse_touchpad.revision++;
-		show_system_cursor = !enabled && !g_gamepad_touchpad.enabled;
-	}
-	if (enabled) {
-		if (!SDL_HideCursor()) {
-			LOGF("Failed to hide mouse cursor for touchpad mode: %s\n", SDL_GetError());
-		}
-	} else if (show_system_cursor && !Config::HideCursorEnabled() && !SDL_ShowCursor()) {
-		LOGF("Failed to restore mouse cursor after touchpad mode: %s\n", SDL_GetError());
-	}
-	LOGF("Mouse touchpad mode: %s\n", enabled ? "enabled" : "disabled");
-}
-
-void HostInputToggleTouchPadMode() {
-	if (g_mouse_captured) return;
-	bool enabled = false;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		enabled = !g_mouse_touchpad.enabled;
-	}
-	HostInputSetTouchPadMode(enabled);
-}
-
-void HostInputToggleGamepadTouchPad(int id) {
-	bool mouse_mode = false;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		mouse_mode = g_mouse_touchpad.enabled;
-	}
-	if (mouse_mode) {
-		HostInputSetTouchPadMode(false);
-	}
-
-	const auto stick = GamepadLeftStick(id);
-	bool  enabled = false;
-	float x       = 0.5f;
-	float y       = 0.5f;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		if (g_gamepad_touchpad.enabled && g_gamepad_touchpad.id != id) {
-			return;
-		}
-		enabled = !g_gamepad_touchpad.enabled;
-		if (enabled) {
-			g_gamepad_touchpad           = {};
-			g_gamepad_touchpad.enabled   = true;
-			g_gamepad_touchpad.id        = id;
-			g_gamepad_touchpad.x_axis    = stick[0];
-			g_gamepad_touchpad.y_axis    = stick[1];
-			g_gamepad_touchpad.last_poll = SDL_GetTicks();
-			g_gamepad_touchpad.next_poll = g_gamepad_touchpad.last_poll + GAMEPAD_TOUCHPAD_POLL_MS;
-			g_mouse_touchpad.gesture++;
+// The wheel's control pressed or released when due; the ms until its next change (-1: none).
+static int UpdateWheel(uint64_t now) {
+	for (;;) {
+		if (g_wheel.control == INVALID_CONTROL) return -1;
+		if (now < g_wheel.until) return static_cast<int>(g_wheel.until - now);
+		if (g_wheel.down) {
+			SetControl(g_wheel.control, false, FROM_MOUSE);
+			g_wheel.down  = false;
+			g_wheel.until = now + WHEEL_GAP_MS;
+		} else if (g_wheel.pending > 0) {
+			SetControl(g_wheel.control, true, FROM_MOUSE);
+			g_wheel.pending--;
+			g_wheel.down  = true;
+			g_wheel.until = now + WHEEL_PRESS_MS;
 		} else {
-			x                          = g_gamepad_touchpad.x;
-			y                          = g_gamepad_touchpad.y;
-			g_gamepad_touchpad         = {};
+			g_wheel = {};
 		}
-		g_mouse_touchpad.revision++;
-	}
-	Controller::SetAxis(id, Controller::Axis::LeftX, enabled ? 128 : stick[0]);
-	Controller::SetAxis(id, Controller::Axis::LeftY, enabled ? 128 : stick[1]);
-	if (enabled) {
-		if (!SDL_HideCursor()) {
-			LOGF("Failed to hide mouse cursor for gamepad touchpad mode: %s\n", SDL_GetError());
-		}
-	} else {
-		Controller::SetTouchPad(id, 1, false, x, y);
-		if (!Config::HideCursorEnabled() && !SDL_ShowCursor()) {
-			LOGF("Failed to restore mouse cursor after gamepad touchpad mode: %s\n",
-			     SDL_GetError());
-		}
-	}
-	LOGF("Gamepad touchpad mode: %s\n", enabled ? "enabled" : "disabled");
-}
-
-bool HostInputGamepadDrawButton(int id, bool down) {
-	float x = 0;
-	float y = 0;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		if (!g_gamepad_touchpad.enabled || g_gamepad_touchpad.id != id) {
-			return false;
-		}
-		if (!down && !g_gamepad_touchpad.drawing) {
-			return false;
-		}
-		if (down && !g_gamepad_touchpad.drawing) {
-			g_mouse_touchpad.gesture++;
-		}
-		g_gamepad_touchpad.drawing = down;
-		x                          = g_gamepad_touchpad.x;
-		y                          = g_gamepad_touchpad.y;
-		g_mouse_touchpad.revision++;
-	}
-	Controller::SetTouchPad(id, 1, down, x, y);
-	return true;
-}
-
-bool HostInputGamepadAxis(int id, bool horizontal, int value) {
-	std::scoped_lock lock(g_touchpad_mutex);
-	if (!g_gamepad_touchpad.enabled || g_gamepad_touchpad.id != id) {
-		return false;
-	}
-	(horizontal ? g_gamepad_touchpad.x_axis : g_gamepad_touchpad.y_axis) = std::clamp(value, 0, 255);
-	g_gamepad_touchpad.next_poll = SDL_GetTicks();
-	return true;
-}
-
-void HostInputDisconnectGamepadTouchPad(int id) {
-	float x = 0;
-	float y = 0;
-	{
-		std::scoped_lock lock(g_touchpad_mutex);
-		if (!g_gamepad_touchpad.enabled || g_gamepad_touchpad.id != id) {
-			return;
-		}
-		x                  = g_gamepad_touchpad.x;
-		y                  = g_gamepad_touchpad.y;
-		g_gamepad_touchpad = {};
-		g_mouse_touchpad.revision++;
-	}
-	Controller::SetTouchPad(id, 1, false, x, y);
-	const auto stick = GamepadLeftStick(id);
-	Controller::SetAxis(id, Controller::Axis::LeftX, stick[0]);
-	Controller::SetAxis(id, Controller::Axis::LeftY, stick[1]);
-	if (!TouchPadModeActive() && !Config::HideCursorEnabled() && !SDL_ShowCursor()) {
-		LOGF("Failed to restore mouse cursor after gamepad disconnect: %s\n", SDL_GetError());
 	}
 }
 
-HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
-	std::scoped_lock             lock(g_touchpad_mutex);
-	HostInputTouchPadVisualState state {};
-	if (g_gamepad_touchpad.enabled) {
-		state.enabled        = true;
-		state.cursor_visible = true;
-		state.drawing        = g_gamepad_touchpad.drawing;
-		state.x              = g_gamepad_touchpad.x;
-		state.y              = g_gamepad_touchpad.y;
-		state.revision       = g_mouse_touchpad.revision;
-		state.gesture        = g_mouse_touchpad.gesture;
-		state.position_valid = true;
-		return state;
+void HostInputMouseWheel(int notches) {
+	const auto& map = GetInputMap();
+	if (!map.Custom() || notches == 0) return;
+	const auto control = map.FindMouseButton(notches > 0 ? MOUSE_WHEEL_UP : MOUSE_WHEEL_DOWN);
+	if (control == INVALID_CONTROL) return;
+	if (g_wheel.control != control) {
+		if (g_wheel.down) SetControl(g_wheel.control, false, FROM_MOUSE);
+		g_wheel = {control, 0, false, 0};
 	}
-	state.enabled        = g_mouse_touchpad.enabled;
-	state.cursor_visible = g_mouse_touchpad.cursor_visible;
-	state.drawing        = g_mouse_touchpad.drawing;
-	state.x              = g_mouse_touchpad.x;
-	state.y              = g_mouse_touchpad.y;
-	state.revision       = g_mouse_touchpad.revision;
-	state.gesture        = g_mouse_touchpad.gesture;
-	state.position_valid = g_mouse_touchpad.position_valid;
-	return state;
+	g_wheel.pending = std::min(WHEEL_QUEUED, g_wheel.pending + std::abs(notches));
+	(void)UpdateWheel(SDL_GetTicks64());
 }
 
 void HostInputToggleMouseToJoystick() {
-	if (g_mouse_captured) return;
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
@@ -1029,81 +510,116 @@ void HostInputToggleMouseToJoystick() {
 	if (!SetRelativeMouseMode(true)) {
 		return;
 	}
-	g_mouse.enabled = true;
+	int ignored_x = 0;
+	int ignored_y = 0;
+	SDL_GetRelativeMouseState(&ignored_x, &ignored_y);
+	g_mouse.enabled   = true;
+	g_mouse.next_poll = SDL_GetTicks64() + MOUSE_POLL_INTERVAL_MS;
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
-void HostInputCaptureMouse(bool captured) {
-	if (g_mouse_captured == captured) return;
-	if (captured) {
-		{
-			std::scoped_lock lock(g_touchpad_mutex);
-			g_restore_touchpad = g_mouse_touchpad.enabled;
-		}
-		HostInputSetTouchPadMode(false);
-		// Release mappings before capture, including a button held on entry.
-		for (uint8_t button = SDL_BUTTON_LEFT; button <= SDL_BUTTON_X2; ++button)
-			HostInputMouseButton(button, false);
-		if (g_mouse.enabled) SetRelativeMouseMode(false);
+int PollMouse(uint64_t now_ms) {
+	if (now_ms < g_mouse.next_poll) {
+		return static_cast<int>(g_mouse.next_poll - now_ms);
+	}
+	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
+
+	int delta_x = 0;
+	int delta_y = 0;
+	SDL_GetRelativeMouseState(&delta_x, &delta_y);
+	if (delta_x == 0 && delta_y == 0) {
 		CenterMouseStick();
-		g_mouse_captured = true;
-		g_cursor_hide_at = 0;
-		SDL_ShowCursor();
-	} else {
-		g_mouse_captured = false;
-		g_mouse_ignore_until_up = SDL_GetMouseState(nullptr, nullptr);
-		if (g_restore_touchpad) HostInputSetTouchPadMode(true);
-		g_restore_touchpad = false;
-		if (TouchPadModeActive()) SDL_HideCursor();
-		if (g_mouse.enabled && !SetRelativeMouseMode(true)) g_mouse.enabled = false;
-		g_mouse.next_poll = 0;
-		if (Config::HideCursorEnabled()) g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
+		return MOUSE_POLL_INTERVAL_MS;
+	}
+
+	MouseToJoystick(delta_x, delta_y);
+	g_mouse.output = true;
+	return MOUSE_POLL_INTERVAL_MS;
+}
+
+// The cursor over the window hides 3 s after the mouse last moved and shows again when it moves (issue #129). (The mouse
+// as a stick hides it anyway: relative mode.)
+constexpr uint64_t CURSOR_HIDE_MS  = 3000;
+constexpr int      CURSOR_MIN_MOVE = 4; // pixels
+static uint64_t    g_cursor_moved  = 0;
+static bool        g_cursor_hidden = false;
+static bool        g_cursor_known  = false;
+static int         g_cursor_x = 0, g_cursor_y = 0; // where the mouse last counted as moved
+
+// KYTY_HIDE_CURSOR=1: the cursor never shows over the window; 0: as above. The Steam Deck build's default is 1: Steam
+// Input's own mouse (the gyro, the trackpads) moved it into view while the right stick turned the camera.
+static bool CursorAlwaysHidden() {
+	if (Config::HideCursorEnabled()) return true;
+	static const bool hidden = [] {
+		const char* value = std::getenv("KYTY_HIDE_CURSOR");
+#if defined(KYTY_STEAM_DECK)
+		return value == nullptr || std::string_view(value) != "0";
+#else
+		return value != nullptr && std::string_view(value) == "1";
+#endif
+	}();
+	return hidden;
+}
+
+static void NoteCursorEvent(const SDL_Event& event) {
+	if (event.type != SDL_MOUSEMOTION) return;
+	// (Motion of a few pixels is not counted: a mouse resting on the desk, or its software, can report tiny moves on its
+	// own, which kept the cursor shown for good, issue #188.)
+	const int dx = event.motion.x - g_cursor_x, dy = event.motion.y - g_cursor_y;
+	if (g_cursor_known && dx * dx + dy * dy < CURSOR_MIN_MOVE * CURSOR_MIN_MOVE) return;
+	g_cursor_known = true;
+	g_cursor_x     = event.motion.x;
+	g_cursor_y     = event.motion.y;
+	g_cursor_moved = SDL_GetTicks64();
+	if (g_cursor_hidden && !CursorAlwaysHidden()) {
+		SDL_ShowCursor(SDL_ENABLE);
+		g_cursor_hidden = false;
 	}
 }
 
-bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
-	int timeout = -1;
-	if (g_mouse_captured || !g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
-		g_mouse.next_poll = 0;
+bool HostInputWaitEvent(SDL_Event* event) {
+	// (A wheel notch's press or release due within the wait: the wait ends then.)
+	const int  wheel_ms = UpdateWheel(SDL_GetTicks64());
+	const auto capped   = [wheel_ms](int timeout_ms) {
+		if (InputTrace::Enabled()) timeout_ms = timeout_ms < 0 ? 1000 : std::min(timeout_ms, 1000);
+		return wheel_ms >= 0 ? std::min(timeout_ms, wheel_ms) : timeout_ms;
+	};
+	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
-	} else {
-		if (g_mouse.next_poll == 0) {
-			SDL_GetRelativeMouseState(nullptr, nullptr);
-			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
+		const uint64_t now = SDL_GetTicks64();
+		if (g_cursor_moved == 0) g_cursor_moved = now;
+		if (!g_cursor_hidden && (CursorAlwaysHidden() || now >= g_cursor_moved + CURSOR_HIDE_MS)) {
+			SDL_ShowCursor(SDL_DISABLE);
+			g_cursor_hidden = true;
 		}
-		timeout = PollMouse(SDL_GetTicks());
-	}
-
-	if (g_cursor_hide_at != 0 && !TouchPadModeActive()) {
-		const auto now_ms = SDL_GetTicks();
-		const int  cursor_timeout =
-		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
-		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
-	}
-	if (const int touch_timeout = PollGamepadTouchPad(SDL_GetTicks()); touch_timeout >= 0) {
-		timeout = timeout < 0 ? touch_timeout : std::min(timeout, touch_timeout);
-	}
-	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
-	const bool has_event = SDL_WaitEventTimeout(event, timeout);
-
-	if (!g_mouse_captured && Config::HideCursorEnabled() && !TouchPadModeActive()) {
-		const auto now_ms = SDL_GetTicks();
-		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
-		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
-			SDL_ShowCursor();
-			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
-		} else if (g_cursor_hide_at != 0 && now_ms >= g_cursor_hide_at) {
-			SDL_HideCursor();
-			g_cursor_hide_at = 0;
+		if (g_cursor_hidden && wheel_ms < 0 && !InputTrace::Enabled()) {
+			if (SDL_WaitEvent(event) == 0) {
+				EXIT("%s\n", SDL_GetError());
+			}
+			NoteCursorEvent(*event);
+			return true;
 		}
+		SDL_ClearError();
+		const int cursor_ms = g_cursor_hidden ? wheel_ms : static_cast<int>(g_cursor_moved + CURSOR_HIDE_MS - now);
+		if (SDL_WaitEventTimeout(event, capped(cursor_ms)) != 0) {
+			NoteCursorEvent(*event);
+			return true;
+		}
+		if (SDL_GetError()[0] != '\0') {
+			EXIT("%s\n", SDL_GetError());
+		}
+		return false;
 	}
 
-	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
-	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
-		g_mouse.next_poll = 0;
-		CenterMouseStick();
+	const int timeout_ms = capped(PollMouse(SDL_GetTicks64()));
+	SDL_ClearError();
+	if (SDL_WaitEventTimeout(event, timeout_ms) != 0) {
+		return true;
 	}
-	return has_event;
+	if (SDL_GetError()[0] != '\0') {
+		EXIT("%s\n", SDL_GetError());
+	}
+	return false;
 }
 
 } // namespace Libs::Graphics

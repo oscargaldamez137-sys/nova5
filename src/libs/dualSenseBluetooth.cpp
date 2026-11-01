@@ -1,15 +1,16 @@
 #include "libs/dualSenseBluetooth.h"
 
-#include "common/logging/log.h"
+#include "SDL.h"
+#include "SDL_hidapi.h"
 
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_hidapi.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -23,17 +24,19 @@ namespace {
 // Report 0x39 and its sub-packets are described by awalol/DS5Dongle (MIT):
 // https://github.com/awalol/DS5Dongle
 // Each report plays two 32-frame stereo haptic blocks at 3 kHz (21.333 ms).
-constexpr uint64_t PERIOD_NS   = 64000000000ULL / 3000;
-constexpr int      HAPTIC_RATE = 3000;
+constexpr uint64_t PERIOD_NS            = 64000000000ULL / 3000;
+constexpr int      HAPTIC_RATE          = 3000;
 constexpr int      HAPTIC_REPORT_FLOATS = 2 * 32 * 2;
-// Two 480-frame Opus packets occupy the same 21.333 ms slot. Resampling
-// 48 kHz input to 45 kHz before encoding at 48 kHz compensates for playback.
-constexpr int    SPEAKER_RATE = 45000;
-constexpr int    OPUS_FRAMES  = 480;
-constexpr int    OPUS_BYTES   = 200;
-constexpr size_t REPORT_BYTES = 547;
-constexpr int    MAX_QUEUE_MS = 80;
-constexpr uint64_t COALESCE_NS = 1000000;
+// Two 480-frame Opus packets occupy the same 21.333 ms slot. Resampling 48 kHz input to 45 kHz
+// before encoding at 48 kHz compensates for playback.
+constexpr int      SPEAKER_RATE = 45000;
+constexpr int      OPUS_FRAMES  = 480;
+constexpr int      OPUS_BYTES   = 200;
+constexpr size_t   REPORT_BYTES = 547;
+// 40 ms: the same report carries the actuators, so a shorter queue trades a little tolerance for a
+// noticeably smaller delay before a hit is felt.
+constexpr int      MAX_QUEUE_MS = 40;
+constexpr uint64_t COALESCE_NS  = 1000000;
 
 struct Session;
 std::mutex                              g_mutex;
@@ -41,7 +44,7 @@ std::condition_variable                 g_wake;
 std::map<int, std::shared_ptr<Session>> g_sessions;
 SDL_Thread*                             g_thread   = nullptr;
 bool                                    g_stopping = false;
-void (*g_tick)()                                   = nullptr;
+void (*g_tick)()                                  = nullptr;
 
 template <typename Char>
 std::string Address(const Char* serial) {
@@ -63,34 +66,53 @@ std::string Address(const Char* serial) {
 	return address.size() == 12 ? address : std::string {};
 }
 
-SDL_hid_device* OpenDevice(int controller) {
-	SDL_LockJoysticks();
-	auto*      pad      = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
-	const bool wireless = pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5 &&
-	                      SDL_GetGamepadConnectionState(pad) == SDL_JOYSTICK_CONNECTION_WIRELESS;
-	const auto vendor  = wireless ? SDL_GetGamepadVendor(pad) : 0;
-	const auto product = wireless ? SDL_GetGamepadProduct(pad) : 0;
-	const auto address = wireless ? Address(SDL_GetGamepadSerial(pad)) : std::string {};
-	SDL_UnlockJoysticks();
-	if (vendor != 0x054c || (product != 0x0ce6 && product != 0x0df2) || address.empty()) {
-		return nullptr;
+// SDL2's hidapi says nothing about the bus a device sits on (bus_type is an SDL3 field). On Windows a
+// Bluetooth HID device's path carries the HID-over-Bluetooth service's GUID, and a wired one's does
+// not, so the path is what tells them apart here.
+static bool IsBluetoothPath(const char* path) {
+	if (path == nullptr) {
+		return false;
 	}
-	auto*       devices = SDL_hid_enumerate(vendor, product);
-	std::string path;
-	bool        ambiguous = false;
-	for (auto* device = devices; device != nullptr; device = device->next) {
-		if (device->bus_type == SDL_HID_API_BUS_BLUETOOTH && device->path != nullptr &&
-		    Address(device->serial_number) == address &&
-		    (device->usage_page == 0 || (device->usage_page == 1 && device->usage == 5))) {
+	std::string lower;
+	for (const char* c = path; *c != 0; ++c) {
+		lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*c))));
+	}
+	return lower.find("00001124-0000-1000-8000-00805f9b34fb") != std::string::npos;
+}
+
+// The DualSense on the Bluetooth bus whose serial is the joystick's own. A wired one has no
+// Bluetooth-bus HID device, so this answers nullptr for it and the USB audio path stays in use.
+SDL_hid_device* OpenDevice(int controller) {
+	std::string serial;
+	if (auto* joystick = SDL_JoystickFromInstanceID(static_cast<SDL_JoystickID>(controller))) {
+		serial = Address(SDL_JoystickGetSerial(joystick));
+	}
+	for (const uint16_t product: {static_cast<uint16_t>(0x0ce6), static_cast<uint16_t>(0x0df2)}) {
+		auto*       devices = SDL_hid_enumerate(0x054c, product);
+		std::string path;
+		bool        ambiguous = false;
+		for (auto* device = devices; device != nullptr; device = device->next) {
+			if (!IsBluetoothPath(device->path)) {
+				continue;
+			}
+			if (!serial.empty() && Address(device->serial_number) != serial) {
+				continue;
+			}
+			if (device->usage_page != 0 && !(device->usage_page == 1 && device->usage == 5)) {
+				continue;
+			}
 			if (!path.empty()) {
 				ambiguous = true;
 				break;
 			}
 			path = device->path;
 		}
+		SDL_hid_free_enumeration(devices);
+		if (!ambiguous && !path.empty()) {
+			return SDL_hid_open_path(path.c_str(), 0);
+		}
 	}
-	SDL_hid_free_enumeration(devices);
-	return !ambiguous && !path.empty() ? SDL_hid_open_path(path.c_str()) : nullptr;
+	return nullptr;
 }
 
 void FinishReport(std::array<uint8_t, REPORT_BYTES>& report) {
@@ -100,6 +122,10 @@ void FinishReport(std::array<uint8_t, REPORT_BYTES>& report) {
 	for (size_t i = 0; i < 4; i++) {
 		report[report.size() - 4 + i] = static_cast<uint8_t>(crc >> (8 * i));
 	}
+}
+
+uint64_t NowNs() {
+	return SDL_GetTicks64() * 1000000ULL;
 }
 
 struct Session {
@@ -112,8 +138,8 @@ struct Session {
 	std::atomic<uint64_t> generation {0};
 	uint64_t              next_send        = 0;
 	uint64_t              pending_deadline = 0;
-	uint8_t               sequence  = 0;
-	uint8_t               counter   = 0;
+	uint8_t               sequence         = 0;
+	uint8_t               counter          = 0;
 
 	~Session() {
 		if (encoder != nullptr) {
@@ -153,21 +179,25 @@ struct Stream {
 };
 
 namespace {
+// The large buffers of the sender and of Queue live on the heap, not the stack. With LTO, inlining SDL's
+// functions (built with /Gs1048576) gives their callers SDL's stack probe size, so a frame of more than a
+// page skipped the thread's guard page: the sender thread crashed at its first call (0xC0000005).
 template <size_t N>
 void Mix(SDL_AudioStream* stream, std::array<float, N>& mixed) {
-	std::array<float, N> pcm {};
-	const int            bytes = SDL_GetAudioStreamData(stream, pcm.data(), sizeof(pcm));
+	static thread_local std::vector<float> pcm;
+	pcm.assign(N, 0.0f);
+	const int bytes = SDL_AudioStreamGet(stream, pcm.data(), static_cast<int>(N * sizeof(float)));
 	for (int i = 0; i < std::max(0, bytes) / static_cast<int>(sizeof(float)); i++) {
 		mixed[i] += pcm[i];
 	}
 }
 
 struct PendingReport {
-	std::shared_ptr<Session>          session;
-	uint64_t                          generation;
-	std::array<uint8_t, REPORT_BYTES> data {};
+	std::shared_ptr<Session>               session;
+	uint64_t                               generation;
+	std::array<uint8_t, REPORT_BYTES>      data {};
 	std::array<float, 2 * OPUS_FRAMES * 2> audio {};
-	bool                              speaker = false;
+	bool                                   speaker = false;
 };
 
 bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
@@ -175,14 +205,15 @@ bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
 	bool ready         = false;
 	bool speaker_ready = false;
 	for (const auto* stream: session.streams) {
-		const bool available = SDL_GetAudioStreamAvailable(stream->audio) > 0;
-		// Both payloads cover 64 / 3000 seconds. Measure input duration so SDL's
-		// resampler lookahead does not make a complete block appear partial.
-		const auto frames =
-		    (static_cast<uint64_t>(stream->freq) * (HAPTIC_REPORT_FLOATS / 2) + HAPTIC_RATE - 1) /
-		    HAPTIC_RATE;
-		const bool full = available && SDL_GetAudioStreamQueued(stream->audio) >=
-		                                   static_cast<int>(frames * 2 * sizeof(float));
+		const bool available = SDL_AudioStreamAvailable(stream->audio) > 0;
+		// One report carries HAPTIC_REPORT_FLOATS floats, or two Opus packets for the speaker. SDL2's
+		// SDL_AudioStreamAvailable answers the converted (output) side where SDL3's
+		// SDL_GetAudioStreamQueued answers the input side, so a full block is measured in output
+		// frames here: measuring it in input frames made a complete block look partial, and every
+		// report then waited for the deadline path before it was sent.
+		const int needed = (stream->speaker ? 2 * OPUS_FRAMES : HAPTIC_REPORT_FLOATS / 2) * 2 *
+		                   static_cast<int>(sizeof(float));
+		const bool full = available && SDL_AudioStreamAvailable(stream->audio) >= needed;
 		has_data |= available;
 		ready |= full;
 		speaker_ready |= stream->speaker && full;
@@ -193,9 +224,8 @@ bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
 		return false;
 	}
 	if (!ready || (!speaker_ready && (pending.speaker || session.next_send == 0))) {
-		// Accumulate short blocks for at most one report period. A full stream
-		// must not wait on a partial peer; only briefly coalesce haptics with
-		// speaker audio arriving in the same emulated batch.
+		// Accumulate short blocks for at most one report period. A full stream must not wait on a
+		// partial peer; only briefly coalesce haptics with speaker audio in the same emulated batch.
 		const auto deadline = now + (ready ? COALESCE_NS : PERIOD_NS);
 		session.pending_deadline =
 		    session.pending_deadline == 0 ? deadline : std::min(session.pending_deadline, deadline);
@@ -266,11 +296,14 @@ std::vector<PendingReport> Prepare(uint64_t now) {
 			if (session->failed || now < session->next_send) {
 				continue;
 			}
-			PendingReport report {session, session->generation.load()};
-			if (PrepareReport(*session, report, now)) {
-				pending.push_back(std::move(report));
-				// Regain timing after a late HID write without sending reports in a
-				// burst. Reset the cadence only on the first report.
+			auto& report      = pending.emplace_back();
+			report.session    = session;
+			report.generation = session->generation.load();
+			if (!PrepareReport(*session, report, now)) {
+				pending.pop_back();
+			} else {
+				// Regain timing after a late HID write without sending reports in a burst. Reset the
+				// cadence only on the first report.
 				session->next_send = session->next_send == 0
 				                         ? now + PERIOD_NS
 				                         : std::max(session->next_send + PERIOD_NS,
@@ -278,8 +311,8 @@ std::vector<PendingReport> Prepare(uint64_t now) {
 			}
 		}
 	}
-	// Opus encoding can take milliseconds; the emulation audio thread must be able
-	// to queue its next block while this work runs.
+	// Opus encoding can take milliseconds; the emulation audio thread must be able to queue its
+	// next block while this work runs.
 	pending.erase(std::remove_if(pending.begin(), pending.end(),
 	                             [](PendingReport& report) { return !EncodeReport(report); }),
 	              pending.end());
@@ -296,7 +329,7 @@ void Send(const std::vector<PendingReport>& pending) {
 		if (SDL_hid_write(session.hid, report.data.data(), report.data.size()) !=
 		    static_cast<int>(report.data.size())) {
 			session.failed = true;
-			LOGF("DualSenseBluetooth: audio HID write failed: %s\n", SDL_GetError());
+			std::printf("DualSenseBluetooth: audio HID write failed: %s\n", SDL_GetError());
 		}
 	}
 }
@@ -306,7 +339,7 @@ int SDLCALL Sender(void*) {
 	while (!g_stopping) {
 		auto tick = g_tick;
 		lock.unlock();
-		auto pending = Prepare(SDL_GetTicksNS());
+		auto pending = Prepare(NowNs());
 		Send(pending);
 		if (tick != nullptr) {
 			tick();
@@ -315,7 +348,7 @@ int SDLCALL Sender(void*) {
 		if (g_sessions.empty()) {
 			g_wake.wait(lock, [] { return g_stopping || !g_sessions.empty(); });
 		} else {
-			const auto now = SDL_GetTicksNS();
+			const auto now     = NowNs();
 			uint64_t   wait_ns = 10000000; // Check rumble expiry at most 10 ms late.
 			for (const auto& [id, session]: g_sessions) {
 				if (session->next_send > now) {
@@ -354,16 +387,15 @@ Stream* Open(uint32_t freq, bool speaker, int controller, void (*tick)()) {
 	if (speaker && !session->CreateEncoder()) {
 		return nullptr;
 	}
-	const SDL_AudioSpec source {SDL_AUDIO_F32, 2, static_cast<int>(freq)};
-	const SDL_AudioSpec target {SDL_AUDIO_F32, 2, speaker ? SPEAKER_RATE : HAPTIC_RATE};
-	auto*               audio = SDL_CreateAudioStream(&source, &target);
+	auto* audio = SDL_NewAudioStream(AUDIO_F32SYS, 2, static_cast<int>(freq), AUDIO_F32SYS, 2,
+	                                 speaker ? SPEAKER_RATE : HAPTIC_RATE);
 	if (audio == nullptr) {
 		return nullptr;
 	}
 	if (g_thread == nullptr) {
 		g_thread = SDL_CreateThread(Sender, "DualSense Bluetooth audio", nullptr);
 		if (g_thread == nullptr) {
-			SDL_DestroyAudioStream(audio);
+			SDL_FreeAudioStream(audio);
 			return nullptr;
 		}
 	}
@@ -371,7 +403,7 @@ Stream* Open(uint32_t freq, bool speaker, int controller, void (*tick)()) {
 	auto* stream = new Stream {session, audio, freq, speaker};
 	session->streams.push_back(stream);
 	session->pending_deadline = 0;
-	g_sessions[controller] = session;
+	g_sessions[controller]    = session;
 	g_wake.notify_one();
 	return stream;
 }
@@ -389,31 +421,37 @@ uint64_t Queue(Stream* stream, const float* stereo, uint32_t frames) {
 		stereo += static_cast<size_t>(frames - max_frames) * 2;
 		frames = max_frames;
 	}
-	int       queued = std::max(0, SDL_GetAudioStreamQueued(stream->audio));
+	// The budget is a duration, so it is counted in output frames: that is the side SDL2 answers.
+	const auto out_rate  = stream->speaker ? SPEAKER_RATE : HAPTIC_RATE;
+	const int  max_out   = static_cast<int>(static_cast<uint64_t>(out_rate) * MAX_QUEUE_MS / 1000) * 2 *
+	                       static_cast<int>(sizeof(float));
+	const int  converted = static_cast<int>(static_cast<uint64_t>(frames) * out_rate / stream->freq) * 2 *
+	                       static_cast<int>(sizeof(float));
+	int       queued = std::max(0, SDL_AudioStreamAvailable(stream->audio));
 	const int bytes  = static_cast<int>(frames * 2 * sizeof(float));
-	if (queued + bytes > static_cast<int>(max_frames * 2 * sizeof(float))) {
-		// Discard complete old report slots, preserving the newest queued audio.
-		// Clearing the entire stream here creates an audible gap after a brief
-		// Windows Bluetooth write stall.
-		std::array<float, 2 * OPUS_FRAMES * 2> discarded {};
+	if (queued + converted > max_out) {
+		// Discard complete old report slots, preserving the newest queued audio. Clearing the whole
+		// stream here creates an audible gap after a brief Windows Bluetooth write stall.
+		std::vector<float> discarded(2 * OPUS_FRAMES * 2);
 		const int discard_bytes = stream->speaker
-		                              ? static_cast<int>(sizeof(discarded))
+		                              ? static_cast<int>(discarded.size() * sizeof(float))
 		                              : static_cast<int>(HAPTIC_REPORT_FLOATS * sizeof(float));
-		const int target = static_cast<int>(max_frames * 2 * sizeof(float)) - bytes;
+		const int target        = max_out - converted;
 		while (queued > target) {
-			if (SDL_GetAudioStreamData(stream->audio, discarded.data(), discard_bytes) <= 0) {
-				SDL_ClearAudioStream(stream->audio);
+			if (SDL_AudioStreamGet(stream->audio, discarded.data(), discard_bytes) <= 0) {
+				SDL_AudioStreamClear(stream->audio);
 				break;
 			}
-			queued = std::max(0, SDL_GetAudioStreamQueued(stream->audio));
+			queued = std::max(0, SDL_AudioStreamAvailable(stream->audio));
 		}
 	}
-	queued = std::max(0, SDL_GetAudioStreamQueued(stream->audio));
-	if (!SDL_PutAudioStreamData(stream->audio, stereo, bytes)) {
+	queued = std::max(0, SDL_AudioStreamAvailable(stream->audio));
+	if (SDL_AudioStreamPut(stream->audio, stereo, bytes) != 0) {
 		return 0;
 	}
 	g_wake.notify_one();
-	return static_cast<uint64_t>(queued + bytes) * 1000000 / (stream->freq * 2 * sizeof(float));
+	return static_cast<uint64_t>(queued + bytes) * 1000000 /
+	       (static_cast<uint64_t>(stream->freq) * 2 * sizeof(float));
 }
 
 void Close(Stream* stream) {
@@ -436,7 +474,7 @@ void Close(Stream* stream) {
 				}
 			}
 		}
-		SDL_DestroyAudioStream(stream->audio);
+		SDL_FreeAudioStream(stream->audio);
 		delete stream;
 	}
 	// Drain a write already in flight before the caller changes speaker routing.

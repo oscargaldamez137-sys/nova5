@@ -35,10 +35,10 @@ La emulación de PS5 es experimental. Juegos comprobados por nosotros:
 
 | Juego | Estado | Notas |
 |---|---|---|
-| God of War Sons of Sparta | Jugable | Completo a 60 FPS. |
-| Astro Bot | En juego | Casi siempre 55–60 FPS en el inicio y el primer nivel (i9-14900KF y RTX 4070 SUPER). |
-| Demon's Souls | En juego | Unos 6–7 FPS en el túnel del tutorial; a veces se cierra al cargarlo. |
-| Marvel's Wolverine | Arranca | Ya no se cierra al iniciar (análisis de shaders sin recursión). |
+| God of War Sons of Sparta | Jugable | 60 FPS. |
+| Astro Bot | En juego | 50–60 FPS en el inicio y el mapa de la galaxia; Sky Garden se juega con el cielo correcto a unos 19 FPS (i9-14900KF y RTX 4070 SUPER). Guarda y carga partidas. |
+| Demon's Souls | En juego | 60 FPS a velocidad normal en el tutorial. |
+| Marvel's Wolverine | Sin comprobar | Aún no probado con el motor de la versión 0.7.0. |
 
 Vídeos de gameplay real en la [web](https://nova5emu.github.io/nova5/gameplay.html).
 
@@ -50,7 +50,7 @@ Vídeos de gameplay real en la [web](https://nova5emu.github.io/nova5/gameplay.h
 
 ## Compilar
 
-- Emulador: igual que KytyPS5 (CMake, clang-cl y Ninja en Windows). Consulta [README-KytyPS5.md](README-KytyPS5.md).
+- Emulador: `build-windows.cmd` (CMake, clang-cl y Ninja en Windows; requisitos en el propio archivo).
 - Lanzador: `src/nova5` (Avalonia, .NET 10). `dotnet publish src/nova5 -c Release -o <carpeta del emulador>`.
 - Instalador: `src/nova5/package/build-package.ps1` genera `_Build/package/Nova5-Setup.exe` con Inno Setup 6.
 - Web: carpeta `website/`, publicada con GitHub Pages.

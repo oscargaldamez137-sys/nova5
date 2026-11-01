@@ -1,5 +1,3 @@
-// Adapted from chenxiao07/KytyPS5 (GPL-2.0), src/loader/demonsSoulsGpuPages.h at 807a1c0
-// (original commit 7dfd79f, "perf(loader): Demon's Souls GPU page path hook", chenxiao <chenxiao07@gmail.com>).
 #pragma once
 
 #include <algorithm>

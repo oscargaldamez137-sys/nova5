@@ -24,4 +24,8 @@ std::string Debug::GetLinker() {
 #endif
 }
 
+std::string Debug::GetBitness() {
+	return "64";
+}
+
 } // namespace Common

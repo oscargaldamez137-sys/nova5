@@ -23,10 +23,13 @@ constexpr auto MakeRegisterNames() {
 	names[R_DISPATCH_RESET] = "R_DISPATCH_RESET";
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
+	names[R_ACQUIRE_MEM]    = "R_ACQUIRE_MEM";
 	names[R_WRITE_DATA]     = "R_WRITE_DATA";
 	names[R_FLIP]           = "R_FLIP";
+	names[R_RELEASE_MEM]    = "R_RELEASE_MEM";
 	names[R_DMA_DATA]       = "R_DMA_DATA";
 	names[R_CONTEXT_STATE]  = "R_CONTEXT_STATE";
+	names[R_SUPER_RESOLUTION] = "R_SUPER_RESOLUTION";
 	return names;
 }
 
@@ -53,6 +56,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_DRAW_INDIRECT_MULTI]       = "IT_DRAW_INDIRECT_MULTI";
 	names[IT_DRAW_INDEX_AUTO]           = "IT_DRAW_INDEX_AUTO";
 	names[IT_NUM_INSTANCES]             = "IT_NUM_INSTANCES";
+	names[IT_INDIRECT_BUFFER_CNST]      = "IT_INDIRECT_BUFFER_CNST";
 	names[IT_DRAW_INDEX_OFFSET_2]       = "IT_DRAW_INDEX_OFFSET_2";
 	names[IT_WRITE_DATA]                = "IT_WRITE_DATA";
 	names[IT_MEM_SEMAPHORE]             = "IT_MEM_SEMAPHORE";
@@ -64,6 +68,8 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_PFP_SYNC_ME]               = "IT_PFP_SYNC_ME";
 	names[IT_SURFACE_SYNC]              = "IT_SURFACE_SYNC";
 	names[IT_EVENT_WRITE]               = "IT_EVENT_WRITE";
+	names[IT_EVENT_WRITE_EOP]           = "IT_EVENT_WRITE_EOP";
+	names[IT_EVENT_WRITE_EOS]           = "IT_EVENT_WRITE_EOS";
 	names[IT_RELEASE_MEM]               = "IT_RELEASE_MEM";
 	names[IT_DMA_DATA]                  = "IT_DMA_DATA";
 	names[IT_ACQUIRE_MEM]               = "IT_ACQUIRE_MEM";
@@ -76,6 +82,12 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_SET_QUEUE_REG]             = "IT_SET_QUEUE_REG";
 	names[IT_SET_UCONFIG_REG]           = "IT_SET_UCONFIG_REG";
 	names[IT_SET_UCONFIG_REG_INDEX]     = "IT_SET_UCONFIG_REG_INDEX";
+	names[IT_WRITE_CONST_RAM]           = "IT_WRITE_CONST_RAM";
+	names[IT_DUMP_CONST_RAM]            = "IT_DUMP_CONST_RAM";
+	names[IT_INCREMENT_CE_COUNTER]      = "IT_INCREMENT_CE_COUNTER";
+	names[IT_INCREMENT_DE_COUNTER]      = "IT_INCREMENT_DE_COUNTER";
+	names[IT_WAIT_ON_CE_COUNTER]        = "IT_WAIT_ON_CE_COUNTER";
+	names[IT_WAIT_ON_DE_COUNTER_DIFF]   = "IT_WAIT_ON_DE_COUNTER_DIFF";
 	names[IT_DISPATCH_DRAW_PREAMBLE]    = "IT_DISPATCH_DRAW_PREAMBLE";
 	names[IT_DISPATCH_DRAW]             = "IT_DISPATCH_DRAW";
 	names[IT_GET_LOD_STATS]             = "IT_GET_LOD_STATS";
@@ -109,15 +121,15 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 		uint32_t len = 0;
 
 		const auto packet_type = static_cast<PacketType>(cmd_id >> 30u);
-		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2 &&
-		                     PacketSizeDw(cmd_id) != 1u);
+		// Type-2 packets are header-only padding; every other packet type requires a body.
+		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2);
 
 		switch (packet_type) {
 			case PacketType::Type3: {
 				const bool    sh_gx = (cmd_id & 0x2u) == 0;
 				const uint8_t op    = ((cmd_id >> 8u) & 0xffu);
 				const auto    r     = KYTY_PM4_R(cmd_id);
-				len                 = PacketSizeDw(cmd_id) - 1u;
+				len                 = ((cmd_id >> 16u) & 0x3fffu) + 1;
 
 				EXIT_NOT_IMPLEMENTED(len >= dw);
 

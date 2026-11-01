@@ -1,9 +1,9 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
-#include "common/debugCounters.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 
 namespace Config {
@@ -17,7 +17,6 @@ void Initialize() {
 }
 
 void Shutdown() {
-	Common::DebugCounters::SetEnabled(false);
 	g_config.reset();
 }
 
@@ -26,10 +25,9 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
-	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
+	EXIT_IF(cfg.keyboard_player != 0); // Dedicated players need the multiplayer subsystem.
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -48,43 +46,6 @@ int32_t GetUserId() {
 	return g_config->user_id;
 }
 
-const std::string& GetAudioInputDevice() {
-	return g_config->audio_input_device;
-}
-
-const std::optional<ControllerColor>& GetControllerColor() {
-	return g_config->controller_color;
-}
-
-uint32_t GetControllerSpeakerVolume() {
-	return g_config->controller_speaker_volume;
-}
-
-uint32_t GetControllerVibrationIntensity() {
-	return g_config->controller_vibration_intensity;
-}
-
-uint32_t GetKeyboardPlayer() {
-	return g_config->keyboard_player;
-}
-
-int32_t GetPlayerUserId(int player) {
-	return g_config->user_id + player * PLAYER_USER_ID_STEP;
-}
-
-int GetPlayerFromUserId(int32_t user_id) {
-	for (int player = 0; player < MAX_PLAYERS; player++) {
-		if (user_id == GetPlayerUserId(player)) {
-			return player;
-		}
-	}
-	return -1;
-}
-
-bool IsGuestUserId(int32_t user_id) {
-	return GetPlayerFromUserId(user_id) > 0;
-}
-
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
@@ -101,18 +62,6 @@ bool HdrEnabled() {
 	return g_config->hdr_enabled;
 }
 
-bool HideCursorEnabled() {
-	return g_config->hide_cursor_enabled;
-}
-
-bool VrEnabled() {
-	return g_config->vr_enabled;
-}
-
-bool AmdCpuEnabled() {
-	return g_config->amd_cpu_enabled;
-}
-
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
@@ -125,23 +74,15 @@ bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
 }
 
-bool IsNetworkConnected() {
-	return g_config->network_connected;
-}
-
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
-}
-
-bool ShaderCacheEnabled() {
-	return g_config->shader_cache_enabled;
 }
 
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }
 
-LogDirection GetShaderLogDirection() {
+ShaderLogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
 
@@ -161,7 +102,23 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
-LogDirection GetPrintfDirection() {
+// KYTY_VULKAN_SYNCVAL=1 (diagnostic): the validation layer with only its synchronization checks, errors logged, not
+// fatal (a missing barrier between commands of one queue: hazards on the buffers and images the layer sees, not on
+// device-address accesses).
+bool SyncValidationEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VULKAN_SYNCVAL");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Vulkan object names (guest ranges of buffers, shader hashes): for a graphics dump and for synchronization validation.
+bool VulkanObjectNamesEnabled() {
+	return g_config->graphics_debug_dump_enabled || SyncValidationEnabled();
+}
+
+OutputDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }
 
@@ -169,8 +126,8 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
-bool ProfilerEnabled() {
-	return g_config->profiler_enabled;
+ProfilerDirection GetProfilerDirection() {
+	return g_config->profiler_direction;
 }
 
 bool SpirvDebugPrintfEnabled() {
@@ -189,36 +146,8 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
-bool ReadbackTiledImagesEnabled() {
-	return g_config->readback_tiled_images;
-}
-
-bool SyncRawImageBuffersEnabled() {
-	return g_config->sync_raw_image_buffers;
-}
-
-bool TessellationEnabled() {
-	return g_config->tessellation_enabled;
-}
-
-bool OcclusionQueriesEnabled() {
-	return g_config->occlusion_queries_enabled;
-}
-
-bool TrophyEnabled() {
-	return g_config->trophy_enabled;
-}
-
-uint32_t GetTrophyDurationSeconds() {
-	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
-}
-
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
-}
-
-bool SkipNoticeScreen() {
-	return g_config->skip_notice_screen;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -227,12 +156,27 @@ bool RedZoneProtectionEnabled() {
 }
 #endif
 
+GuestCpuMode GetGuestCpuMode() { return g_config->guest_cpu_mode; }
+
 const Keymap& GetKeymap() {
 	return g_config->keymap;
 }
 
-const std::vector<std::string>& GetGuestArguments() {
-	return g_config->guest_arguments;
-}
+const std::string& GetAudioInputDevice() { return g_config->audio_input_device; }
+const std::optional<ControllerColor>& GetControllerColor() { return g_config->controller_color; }
+uint32_t GetControllerSpeakerVolume() { return g_config->controller_speaker_volume; }
+uint32_t GetControllerVibrationIntensity() { return g_config->controller_vibration_intensity; }
+uint32_t GetKeyboardPlayer() { return g_config->keyboard_player; }
+bool HideCursorEnabled() { return g_config->hide_cursor_enabled; }
+bool SplashEnabled() { return g_config->splash_enabled; }
+bool IsNetworkConnected() { return g_config->network_connected; }
+bool PerfOverlayEnabled() { return g_config->perf_overlay_enabled; }
+bool SkipNoticeScreen() { return g_config->skip_notice_screen; }
+bool ShaderCacheEnabled() { return g_config->shader_cache_enabled; }
+bool ReadbackTiledImagesEnabled() { return g_config->readback_tiled_images; }
+bool SyncRawImageBuffersEnabled() { return g_config->sync_raw_image_buffers; }
+bool TrophyEnabled() { return g_config->trophy_enabled; }
+uint32_t GetTrophyDurationSeconds() { return std::clamp(g_config->trophy_duration_seconds, 5u, 10u); }
+const std::vector<std::string>& GetGuestArguments() { return g_config->guest_arguments; }
 
 } // namespace Config

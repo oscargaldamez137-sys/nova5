@@ -1,7 +1,13 @@
 # Builds _Build/package/Nova5-Setup.exe from the compiled emulator in _Build/nova5 and the Nova5 launcher.
 # Run after compiling _Build/nova5 (Nova5Emulator and atrac9). The setup is replaced on every run.
+# -Build: the compiled emulator (_Build\nova5, else the unified engine's _Build\windows). -Tools: the folder that holds
+# pkg-extractor (the repository's ..\herramientas by default).
 param(
-	[string]$Build = (Join-Path $PSScriptRoot '..\..\..\_Build\nova5')
+	[string]$Build = $(foreach ($dir in '_Build\nova5', '_Build\windows') {
+		$path = Join-Path $PSScriptRoot "..\..\..\$dir"
+		if (Test-Path (Join-Path $path 'Nova5Emulator.exe')) { $path; break }
+	}),
+	[string]$Tools = ''
 )
 $ErrorActionPreference = 'Stop'
 $repo    = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
@@ -20,12 +26,16 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed ($LASTEXITCODE)" }
 $version = $csproj.Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
 
 # Emulator runtime, as installed by the CMake install rules.
-foreach ($file in 'Nova5Emulator.exe', 'libwinpthread-1.dll', 'atrac9.dll') {
-	Copy-Item (Join-Path $build $file) $stage
+Copy-Item (Join-Path $build 'Nova5Emulator.exe') $stage
+# atrac9.dll: the ATRAC9 decoder the launcher's menu music loads (the atrac9 CMake target).
+foreach ($file in 'libwinpthread-1.dll', 'atrac9.dll') {
+	if (Test-Path (Join-Path $build $file)) { Copy-Item (Join-Path $build $file) $stage }
 }
 Copy-Item (Join-Path $repo 'assets\cursors') (Join-Path $stage 'assets\cursors') -Recurse
 New-Item -ItemType Directory -Force (Join-Path $stage 'assets\sounds') | Out-Null
-Copy-Item (Join-Path $build 'assets\sounds\trophy-unlock.wav') (Join-Path $stage 'assets\sounds')
+$sound = @((Join-Path $build 'assets\sounds\trophy-unlock.wav'), (Join-Path $repo 'assets\sounds\trophy-unlock.wav')) |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+Copy-Item $sound (Join-Path $stage 'assets\sounds')
 
 # Visual C++ runtime, app-local (redistributable), so no separate installer or admin rights are needed.
 $redist = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT' -Directory |
@@ -39,7 +49,7 @@ $licenses = Join-Path $stage 'licenses'
 New-Item -ItemType Directory -Force $licenses | Out-Null
 Copy-Item (Join-Path $repo 'LICENSES\*') $licenses
 # Notices of the prebuilt FFmpeg, Opus and OpenXR libraries the emulator links (LGPL/BSD/Apache).
-Copy-Item (Join-Path $build 'licenses\*') $licenses -Recurse
+if (Test-Path (Join-Path $build 'licenses')) { Copy-Item (Join-Path $build 'licenses\*') $licenses -Recurse }
 foreach ($dir in Get-ChildItem (Join-Path $repo '3rdparty') -Directory) {
 	Get-ChildItem $dir.FullName -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING|NOTICE)' } | ForEach-Object {
 		Copy-Item $_.FullName (Join-Path $licenses "$($dir.Name)-$($_.BaseName).txt")
@@ -49,7 +59,7 @@ Copy-Item (Join-Path $PSScriptRoot 'LEEME.txt') $stage
 
 # PKG installer: pkg-to-anyps5 (GPL-3.0, https://github.com/awake-devel/pkg-to-anyps5), run by the launcher.
 # v0.2.5 source with pkg-to-anyps5.patch applied, built with cargo build --release.
-$extractor = Join-Path $repo '..\herramientas\pkg-extractor\pkg-to-anyps5-src'
+$extractor = Join-Path $(if ($Tools) { $Tools } else { Join-Path $repo '..\herramientas' }) 'pkg-extractor\pkg-to-anyps5-src'
 New-Item -ItemType Directory -Force (Join-Path $stage 'tools') | Out-Null
 Copy-Item (Join-Path $extractor 'target\release\pkg-to-anyps5.exe') (Join-Path $stage 'tools')
 Copy-Item (Join-Path $extractor 'LICENSE') (Join-Path $licenses 'pkg-to-anyps5-LICENSE.txt')

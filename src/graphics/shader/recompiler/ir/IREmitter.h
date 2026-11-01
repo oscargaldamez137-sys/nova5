@@ -12,6 +12,8 @@ class IREmitter {
 public:
 	explicit IREmitter(Block* block);
 
+	void SetBlock(Block* block);
+
 	Value Emit(ValueOpcode opcode, std::initializer_list<Value> args = {}, uint64_t flags = 0);
 
 	template <typename T>
@@ -52,6 +54,8 @@ public:
 
 	F32 BitCastF32(U32 value);
 	U32 BitCastU32(F32 value);
+	F16 BitCastF16(U32 value);
+	U32 BitCastU32(F16 value);
 	U64 ConstructU64(U32 low, U32 high);
 	U32 CompositeExtract(Value composite, uint32_t index);
 
@@ -73,6 +77,7 @@ public:
 	U1  LogicalAnd(U1 lhs, U1 rhs);
 	U1  LogicalOr(U1 lhs, U1 rhs);
 	U1  LogicalNot(U1 value);
+	U1  AnyLane(U1 value);
 
 private:
 	Block* block = nullptr;

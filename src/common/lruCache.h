@@ -3,8 +3,10 @@
 
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace Common {
 
@@ -20,7 +22,7 @@ class LeastRecentlyUsedCache {
 public:
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
 		const auto id   = Build();
-		auto&      item = m_items[id];
+		auto&      item = At(id);
 		item.object     = std::move(object);
 		item.tick       = tick;
 		Attach(item);
@@ -28,7 +30,7 @@ public:
 	}
 
 	void Touch(size_t id, Tick tick) {
-		auto& item = m_items[id];
+		auto& item = At(id);
 		if (item.tick >= tick) {
 			return;
 		}
@@ -39,8 +41,10 @@ public:
 		}
 	}
 
+	[[nodiscard]] Tick TickOf(size_t id) { return At(id).tick; }
+
 	void Free(size_t id) {
-		auto& item = m_items[id];
+		auto& item = At(id);
 		Detach(item);
 		item.next = nullptr;
 		item.prev = nullptr;
@@ -67,10 +71,16 @@ public:
 	}
 
 private:
+	// Items in fixed chunks, which never move (the list links point into them). A std::deque of these 32-byte items
+	// keeps one per block on MSVC: every index was a map lookup and another heap line (~1.4% of the render thread).
+	static constexpr size_t ChunkItems = 1024;
+
+	[[nodiscard]] Item& At(size_t id) { return m_chunks[id / ChunkItems][id % ChunkItems]; }
+
 	[[nodiscard]] size_t Build() {
 		if (m_free.empty()) {
-			const auto id = m_items.size();
-			m_items.emplace_back();
+			const auto id = m_size++;
+			if (id % ChunkItems == 0) m_chunks.push_back(std::make_unique<Item[]>(ChunkItems));
 			return id;
 		}
 		const auto id = m_free.front();
@@ -107,8 +117,9 @@ private:
 		}
 	}
 
-	std::deque<Item>   m_items;
-	std::deque<size_t> m_free;
+	std::vector<std::unique_ptr<Item[]>> m_chunks;
+	size_t                               m_size = 0;
+	std::deque<size_t>                   m_free;
 	Item*              m_first = nullptr;
 	Item*              m_last  = nullptr;
 };

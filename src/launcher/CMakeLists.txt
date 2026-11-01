@@ -1,6 +1,5 @@
 
-find_package(Qt6 6.8 COMPONENTS Concurrent Network Widgets REQUIRED)
-add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
+find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -21,12 +20,7 @@ add_executable(launcher WIN32
 )
 
 
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
-	LibAtrac9 kyty_git_version common)
-if(LINUX)
-	find_package(Qt6 COMPONENTS DBus REQUIRED)
-	target_link_libraries(launcher Qt6::DBus)
-endif()
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers kyty_git_version)
 if(WIN32)
 target_link_libraries(launcher setupapi)
 endif()
@@ -37,16 +31,6 @@ endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
-add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
-	src/gameContent.cpp
-	src/launcherTheme.cpp
-	resources.qrc
-)
-target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
-target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
-
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)
@@ -54,13 +38,7 @@ elseif(LINUX)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 endif()
 
-add_custom_target(stage_updater
-	COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:launcher>
-	COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:kyty_updater>
-		$<TARGET_FILE_DIR:launcher>/$<TARGET_FILE_NAME:kyty_updater>
-	DEPENDS kyty_updater
-	VERBATIM)
-add_dependencies(launcher kyty_emulator stage_updater)
+add_dependencies(launcher kyty_emulator)
 
 if(KYTY_CLANG_CL)
 	add_custom_command(TARGET launcher POST_BUILD
@@ -87,7 +65,7 @@ if(WIN32)
 	)
 endif()
 
-set(launcher_name "kyty_launcher")
+set(launcher_name "launcher")
 if(APPLE)
 	set(launcher_name "KytyPS5")
 endif()
@@ -112,20 +90,8 @@ install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
 
-if(NOT APPLE)
-	# Older releases require the previous executable name when validating updates.
-	install(CODE "
-		file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
-			TYPE PROGRAM RENAME \"launcher${CMAKE_EXECUTABLE_SUFFIX}\"
-			FILES \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}${CMAKE_EXECUTABLE_SUFFIX}\")
-	")
-endif()
-
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
-	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
-	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
-	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
 	if(NOT KYTY_MACDEPLOYQT)
@@ -139,10 +105,6 @@ if(APPLE)
 			message(FATAL_ERROR \"macdeployqt failed with \${_kyty_deploy_result}\")
 		endif()
 	")
-endif()
-
-if(NOT APPLE)
-	install(TARGETS kyty_updater RUNTIME DESTINATION .)
 endif()
 
 if(WIN32)

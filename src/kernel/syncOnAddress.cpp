@@ -1,4 +1,3 @@
-#include "common/stallDump.h"
 #include "kernel/syncOnAddress.h"
 
 #include "common/threads.h"
@@ -257,19 +256,6 @@ int WakePortable(volatile void* address, int32_t count) {
 template <typename T>
 int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
-	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(address), true);
-	if (Common::StallDump::Enabled()) {
-		const auto remaining =
-		    deadline.finite
-		        ? std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(
-		                                   deadline.end - Clock::now())
-		                                   .count())
-		        : -1;
-		Common::StallDump::Note(sizeof(T) == 4 ? "SyncWait32.expected" : "SyncWait64.expected",
-		                        reinterpret_cast<uintptr_t>(address), expected);
-		Common::StallDump::Note("SyncWait.remaining_us", reinterpret_cast<uintptr_t>(address),
-		                        remaining);
-	}
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -281,8 +267,6 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif
 	PollSignals(signal_poll);
-	Common::StallDump::Note("SyncWait.result", reinterpret_cast<uintptr_t>(address),
-	                        static_cast<uint32_t>(result));
 	return result;
 }
 
@@ -304,7 +288,6 @@ int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanosecon
 }
 
 int Wake(volatile void* address, int32_t count) {
-	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(address));
 	if (!IsValidWakeAddress(address) || count < 0) {
 		return KERNEL_ERROR_EINVAL;
 	}

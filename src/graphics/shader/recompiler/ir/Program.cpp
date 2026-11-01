@@ -1,9 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/BufferFormat.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
-#include <xbyak/xbyak.h>
 #include <map>
 #include <new>
 #include <unordered_map>
@@ -83,8 +82,7 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 		    program.memory_info[li] != program.memory_info[ri]) {
 			return false;
 		}
-	} else if (lhs->GetOpcode() != ValueOpcode::ReadConst &&
-	           lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
+	} else if (lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
 		return false;
 	}
 	for (size_t index = 0; index < lhs->NumArgs(); index++) {
@@ -100,12 +98,10 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 
 } // namespace
 
-ResourcePlan::ResourcePlan() = default;
-ResourcePlan::ResourcePlan(ResourcePlan&&) noexcept = default;
-
 ResourcePlan::~ResourcePlan() {
+	// Plan values only refer to each other (CompileResult clones them), so they die together.
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		inst.DropLinks();
 	}
 }
 
@@ -118,16 +114,15 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
-	// Planning expressions can refer to block values but outlive block storage in the base class.
-	for (auto& inst: value_storage) {
-		inst.Invalidate();
-	}
-	// Values may cross block boundaries. Detach all arguments before any block starts destroying
-	// its instruction storage so reverse-use links always point to live definitions.
-	for (auto* block: blocks) {
+	// Values cross block boundaries and the plan values: drop every link before any storage is destroyed,
+	// all at once rather than unlinking edge by edge.
+	for (auto& block: block_storage) {
 		for (auto& inst: *block) {
-			inst.Invalidate();
+			inst.DropLinks();
 		}
+	}
+	for (auto& inst: value_storage) {
+		inst.DropLinks();
 	}
 }
 
@@ -141,13 +136,15 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
+	    .bda_read_plan = BuildBdaReadPlan(*this),
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
 	    .wave_size       = wave_size,
 	    .user_data_base  = user_data_base,
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
-	    .has_address_writes = has_address_writes,
+	    .table_mode      = table_mode,
+	    .table_plan      = std::move(table_plan),
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};
@@ -160,18 +157,10 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 }
 
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
-	std::vector<std::pair<const Inst*, const Inst*>> visited;
+	// Called per candidate pair while planning: one allocation per thread, not per call.
+	thread_local std::vector<std::pair<const Inst*, const Inst*>> visited;
+	visited.clear();
 	return EquivalentValue(program, left, right, visited);
-}
-
-bool EquivalentSelectorDomain(const ResourcePlan& program,
-                              const DescriptorSource::IndirectDescriptor& left,
-                              const DescriptorSource::IndirectDescriptor& right) {
-	return left.selector == right.selector && left.signed_count == right.signed_count &&
-	       left.workgroup_axis == right.workgroup_axis &&
-	       EquivalentValue(program, left.key_count, right.key_count) &&
-	       EquivalentValue(program, left.selector_first, right.selector_first) &&
-	       EquivalentValue(program, left.selector_mask, right.selector_mask);
 }
 
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
@@ -205,50 +194,18 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
-Value ResolveActiveU32(Value value, Value active) {
-	for (uint32_t depth = 0; depth <= 32; ++depth) {
-		value = value.Resolve();
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
-		    inst->Arg(0).Resolve() != active)
-			return value;
-		value = inst->Arg(1);
-	}
-	return {};
-}
-
-uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory) {
-	if (!memory.formatted) return memory.data_bits;
-	const auto format = memory.typed
-	                        ? Format::DecodeTBufferFormat(memory.data_format, memory.number_format)
-	                        : program.info.buffers[memory.resource].descriptor_format;
-	const auto info = Format::GetFormatInfo(format);
-	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
-	           ? 32u : info.component_bits[0];
-}
-
-bool HasShaderMemoryWrites(const Program& program) {
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			const auto op     = inst.GetOpcode();
-			const auto buffer = BufferAccessOf(op);
-			const auto image  = ImageOpcodeInfoOf(op).access;
-			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
-			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
-				return true;
-			}
-		}
-	}
-	return false;
+bool ValidationEnabled() {
+	static const bool enabled = KYTY_BUILD != KYTY_BUILD_RELEASE || std::getenv("KYTY_IR_VALIDATE") != nullptr;
+	return enabled;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
-	if (program.blocks.size() != program.block_storage.size()) {
+	if (program.blocks.size() != program.block_info.size() ||
+	    program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");
 	}
 	std::unordered_map<const Block*, size_t>   block_indices;
-	std::unordered_set<uint32_t>               block_ids;
+	std::unordered_map<uint32_t, const Block*> blocks_by_id;
 	std::unordered_map<const Inst*, size_t>    instruction_positions;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto* block = program.blocks[block_index];
@@ -259,10 +216,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		if (!block_indices.emplace(block, block_index).second) {
 			return Fail("value IR block pointer is duplicated");
 		}
-		if (block->id == UINT32_MAX) {
+		if (program.block_info[block_index].id == UINT32_MAX) {
 			return Fail("value IR block uses the reserved exit id");
 		}
-		if (!block_ids.insert(block->id).second) {
+		if (!blocks_by_id.emplace(program.block_info[block_index].id, block).second) {
 			return Fail("value IR block id is duplicated");
 		}
 		size_t position = 0;
@@ -307,14 +264,15 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		}
 
 		std::unordered_set<const Block*> expected_successors;
-		const auto                       add_target = [&](const Block* target) {
-			if (!block_indices.contains(target)) {
+		const auto                       add_target = [&](uint32_t id) {
+			const auto found = blocks_by_id.find(id);
+			if (found == blocks_by_id.end()) {
 				return false;
 			}
-			expected_successors.insert(target);
+			expected_successors.insert(found->second);
 			return true;
 		};
-		const auto& terminator             = block->terminator;
+		const auto& terminator             = program.block_info[block_index].terminator;
 		const auto  validate_control_value = [&](Value value, Type type) {
 			if (value.IsEmpty() || value.GetType() != type) {
 				return false;
@@ -332,21 +290,33 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				if (!add_target(terminator.true_block) || !add_target(terminator.false_block)) {
 					return Fail("value IR conditional branch target is missing");
 				}
-				if (!validate_control_value(block->condition, Type::U1)) {
+				if (!validate_control_value(program.block_info[block_index].condition, Type::U1)) {
 					return Fail("value IR conditional branch condition is invalid");
 				}
 				break;
 			case CFG::TerminatorKind::IndirectBranch: {
-				if (!validate_control_value(block->indirect_target, Type::U32)) {
+				if (!validate_control_value(program.block_info[block_index].indirect_target,
+				                            Type::U32)) {
 					return Fail("value IR indirect branch selector is invalid");
 				}
-				std::unordered_set<uint32_t> values;
-				for (const auto& branch: terminator.cases) {
-					if (!values.insert(branch.value).second) {
-						return Fail("value IR indirect selector value is duplicated");
+				std::unordered_set<uint32_t> indirect_targets;
+				for (const auto target: terminator.indirect_targets) {
+					if (!indirect_targets.insert(target).second) {
+						return Fail("value IR indirect branch target is duplicated");
 					}
-					if (!add_target(branch.target)) {
+					if (!add_target(target)) {
 						return Fail("value IR indirect branch target is missing");
+					}
+				}
+				if (terminator.indirect_selector_values.size() !=
+				    terminator.indirect_selector_targets.size()) {
+					return Fail("value IR indirect selector table is inconsistent");
+				}
+				for (const auto target: terminator.indirect_selector_targets) {
+					const auto found = blocks_by_id.find(target);
+					if (found == blocks_by_id.end() ||
+					    !expected_successors.contains(found->second)) {
+						return Fail("value IR indirect selector target is not a CFG successor");
 					}
 				}
 				break;
@@ -354,10 +324,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 			case CFG::TerminatorKind::Return:
 			case CFG::TerminatorKind::Unsupported: break;
 		}
-		if ((terminator.merge_block != nullptr &&
-		     !block_indices.contains(terminator.merge_block)) ||
-		    (terminator.continue_block != nullptr &&
-		     !block_indices.contains(terminator.continue_block))) {
+		if ((terminator.merge_block != UINT32_MAX &&
+		     !blocks_by_id.contains(terminator.merge_block)) ||
+		    (terminator.continue_block != UINT32_MAX &&
+		     !blocks_by_id.contains(terminator.continue_block))) {
 			return Fail("value IR structured control target is missing");
 		}
 		if (successors != expected_successors) {
@@ -422,8 +392,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind != ResourceKind::ScalarBuffer &&
-				    memory.kind != ResourceKind::IndirectBuffer) {
+				if (memory.kind != ResourceKind::ScalarBuffer) {
 					return Fail(fmt::format("{} has an invalid scalar-memory resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
@@ -473,23 +442,13 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				const bool  vector_buffer = memory.kind == ResourceKind::Buffer ||
-				                            memory.kind == ResourceKind::IndirectBuffer;
-				if (!vector_buffer && memory.kind != ResourceKind::ScalarBuffer) {
+				if (memory.kind != ResourceKind::Buffer &&
+				    memory.kind != ResourceKind::ScalarBuffer) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
-				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
-					            "or formatted X load");
-				}
-				const auto access = BufferAccessOf(inst.GetOpcode());
-				const bool packed_formatted =
-				    (access == BufferAccess::Read || access == BufferAccess::Write) && memory.formatted &&
-				    memory.data_bits == 16u && (memory.component_count + 1u) / 2u == buffer_components;
 				if (buffer_components > 1u &&
-				    (!vector_buffer || (memory.data_bits != 32u && !packed_formatted) ||
+				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));
@@ -669,13 +628,20 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 			}
 		}
-		const auto& info = *program.blocks[block_index];
+		const auto& info = program.block_info[block_index];
 		if (!info.condition.IsEmpty() && !control_dominates(info.condition, block)) {
 			return Fail("value IR branch condition definition does not dominate its use");
 		}
 		if (!info.indirect_target.IsEmpty() && !control_dominates(info.indirect_target, block)) {
 			return Fail("value IR indirect selector definition does not dominate its use");
 		}
+	}
+}
+
+void ResolveControlFlowIdentities(Program& program) {
+	for (auto& info: program.block_info) {
+		info.condition       = info.condition.Resolve();
+		info.indirect_target = info.indirect_target.Resolve();
 	}
 }
 
@@ -710,9 +676,9 @@ std::string ProgramToString(const Program& program) {
 
 	std::string text;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
-		text +=
-		    fmt::format("Block ${} pc=0x{:08x}..0x{:08x}\n", block_index,
-		                program.blocks[block_index]->start_pc, program.blocks[block_index]->end_pc);
+		text += fmt::format("Block ${} pc=0x{:08x}..0x{:08x}\n", block_index,
+		                    program.block_info[block_index].start_pc,
+		                    program.block_info[block_index].end_pc);
 		for (const auto& inst: *program.blocks[block_index]) {
 			const auto type = inst.GetType();
 			if (type != Type::Void) {

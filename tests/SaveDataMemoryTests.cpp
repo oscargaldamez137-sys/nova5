@@ -1,5 +1,17 @@
 // Exercise the guest ABI without linking unrelated emulator subsystems.
+#include "common/emulatorConfig.h"
+#ifdef NOVA5_REFERENCE_SAVE_DATA
+namespace Config {
+// The reference SaveData implementation uses the multiplayer mapping; no controller is needed here.
+inline bool IsGuestUserId(int32_t user) {
+	const int64_t delta = static_cast<int64_t>(user) - GetUserId();
+	return delta > 0 && delta <= 0x300 && delta % 0x100 == 0;
+}
+}
+#include NOVA5_REFERENCE_SAVE_DATA
+#else
 #include "libs/libSaveData.cpp"
+#endif
 
 #include <array>
 #include <cerrno>
@@ -10,6 +22,7 @@
 
 #ifdef _WIN32
 #include <process.h>
+#include <windows.h>
 #else
 #include <sys/wait.h>
 #include <unistd.h>
@@ -276,6 +289,76 @@ void WriteRestartFixture() {
 	// No Sync or Terminate: Set must survive process exit on its own.
 }
 
+// Independent fixture of Nova5's on-disk format, not produced by save_memory.
+// memory.dat is headerless; param.bin is the 1328-byte guest SaveDataParam ABI.
+void TestNova5FormatAndLimits() {
+	Reset("PPSA21564");
+	const fs::path directory = "_SaveData/PPSA21564/sce_sdmemory/1000";
+	CHECK(fs::create_directories(directory));
+	std::array<uint8_t, 64> raw {};
+	for (size_t i = 0; i < raw.size(); ++i) raw[i] = static_cast<uint8_t>(i * 3 + 1);
+	std::ofstream(directory / "memory.dat", std::ios::binary)
+	    .write(reinterpret_cast<const char*>(raw.data()), raw.size());
+	std::array<char, 1328> metadata {};
+	std::memcpy(metadata.data(), "Nova5 fixture", 14);
+	metadata[1280] = 42; // user_param, little endian
+	std::ofstream(directory / "param.bin", std::ios::binary).write(metadata.data(), metadata.size());
+	static_assert(sizeof(SaveDataParam) == 1328 && offsetof(SaveDataParam, user_param) == 1280);
+	CHECK(Setup(1000, 0, raw.size(), 3) == raw.size());
+	CHECK(Get(raw.size(), 1000) == std::vector<uint8_t>(raw.begin(), raw.end()));
+	SaveDataParam param {};
+	SaveDataMemoryGet2 get {};
+	get.user_id = 1000;
+	get.param = &param;
+	CHECK(SaveDataGetSaveDataMemory2(&get) == OK);
+	CHECK(std::string(param.title) == "Nova5 fixture" && param.user_param == 42);
+	raw[17] = 0xde;
+	CHECK(Set(&raw[17], 1, 17, 1000) == OK);
+	SaveDataMemorySync sync {};
+	sync.user_id = 1000;
+	sync.option = 1;
+	CHECK(SaveDataSyncSaveDataMemory(&sync) == OK);
+	CHECK(SaveDataTerminate() == OK);
+	CHECK(Setup(1000, 0, raw.size(), 3) == raw.size());
+	CHECK(Get(raw.size(), 1000) == std::vector<uint8_t>(raw.begin(), raw.end()));
+	CHECK(fs::file_size(directory / "memory.dat") == raw.size());
+	SceSaveDataDirName name {};
+	std::strcpy(name.data, "sce_sdmemory");
+	struct SaveDataMount3 mount {};
+	mount.user_id = 1000;
+	mount.dir_name = &name;
+	mount.mount_mode = 1;
+	SaveDataMountResult mounted {};
+	CHECK(SaveDataMount3(&mount, &mounted) == OK);
+	CHECK(g_mounted_directory == directory);
+	CHECK(SaveDataSyncSaveDataMemory(&sync) == SAVE_DATA_ERROR_BUSY);
+	CHECK(SaveDataTerminate() == SAVE_DATA_ERROR_BUSY);
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(SaveDataSyncSaveDataMemory(&sync) == OK);
+	std::array<uint8_t, 64> disk {};
+	CHECK(std::ifstream(directory / "memory.dat", std::ios::binary)
+	          .read(reinterpret_cast<char*>(disk.data()), disk.size()).good());
+	CHECK(disk == raw);
+	CHECK(!fs::exists(directory / "memory.dat.tmp"));
+	CHECK(SaveDataTerminate() == OK);
+	// Metadata may be absent on an older raw export; never turn progress into NEW GAME.
+	CHECK(fs::remove(directory / "param.bin"));
+	CHECK(Setup(1000, 0, raw.size()) == raw.size());
+	CHECK(Get(raw.size(), 1000) == std::vector<uint8_t>(raw.begin(), raw.end()));
+	CHECK(SaveDataTerminate() == OK);
+	std::ofstream(directory / "param.bin", std::ios::binary) << "truncated";
+	auto setup = SetupParam(1000, 0, raw.size());
+	CHECK(SaveDataSetupSaveDataMemory2(&setup, nullptr) == SAVE_DATA_ERROR_BROKEN);
+	CHECK(g_save_data_memory.empty());
+	Reset("LIMITS");
+	setup = SetupParam(1000, 0, 17 * 1024 * 1024);
+	setup.option = 2; // Both buffers count towards the 32 MiB budget.
+	CHECK(SaveDataSetupSaveDataMemory2(&setup, nullptr) == SAVE_DATA_ERROR_LIMITATION_OVER);
+	for (uint32_t slot = 0; slot < 4; ++slot) CHECK(Setup(1000, slot) == 0);
+	setup = SetupParam(1001);
+	CHECK(SaveDataSetupSaveDataMemory2(&setup, nullptr) == SAVE_DATA_ERROR_LIMITATION_OVER);
+}
+
 void ReadRestartFixture() {
 	CHECK(Setup(7, 3, 24, 1) == 16);
 	auto expected = std::vector<uint8_t>(24);
@@ -400,8 +483,8 @@ void TestClassicSavePaths() {
 void TestGuestSaveIsolation() {
 	Reset("MULTIUSER");
 	const auto name = DirName("slot");
-	const std::array<int32_t, 3> users {Config::GetUserId(), Config::GetPlayerUserId(1),
-	                                  Config::GetPlayerUserId(2)};
+	const std::array<int32_t, 3> users {Config::GetUserId(), (Config::GetUserId() + 0x100),
+	                                  (Config::GetUserId() + 0x200)};
 	std::array<fs::path, users.size()> paths;
 	for (size_t i = 0; i < users.size(); ++i) {
 		CHECK(Search(users[i]).empty());
@@ -629,6 +712,168 @@ void TestClassicSaveParams() {
 	CHECK(params[0].mtime == nested_mtime);
 }
 
+void ClassicInterop(const char* mode) {
+	Reset("PPSA01341");
+	const bool create = std::string_view(mode) == "classic-write";
+	const bool update = std::string_view(mode) == "classic-update";
+	for (const int32_t user : {Config::GetUserId(), Config::GetUserId() + 0x100}) {
+		const auto name = DirName("PlayerProfile0");
+		struct SaveDataMount3 mount {};
+		mount.user_id = user;
+		mount.dir_name = &name;
+		mount.blocks = 96;
+		mount.mount_mode = create ? 4 : 2;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		SaveDataParam param {};
+		if (!create) {
+			CHECK(SaveDataGetParam(&result.mount_point, 0, &param, sizeof(param), nullptr) == OK);
+			CHECK(param.user_param == (update ? 17u : 29u));
+			CHECK(std::string(param.title) == (update ? "Nova5 reference" : "Unified update"));
+			std::string data;
+			std::ifstream(g_mounted_directory / "USR-DATA") >> data;
+			CHECK(data == (update ? "reference-payload" : "unified-payload"));
+			SaveDataMountInfo info {};
+			CHECK(SaveDataGetMountInfo(&result.mount_point, &info) == OK);
+			CHECK(info.blocks == 96 && info.free_blocks == 96);
+		}
+		if (create || update) {
+			std::strcpy(param.title, create ? "Nova5 reference" : "Unified update");
+			param.user_param = create ? 17 : 29;
+			CHECK(SaveDataSetParam(&result.mount_point, 0, &param, sizeof(param)) == OK);
+			std::ofstream(g_mounted_directory / "USR-DATA") << (create ? "reference-payload" : "unified-payload");
+		}
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+		CHECK(Search(user) == std::vector<std::string>{"PlayerProfile0"});
+	}
+}
+
+#ifndef NOVA5_REFERENCE_SAVE_DATA
+void BackupOption(const char* value) {
+#ifdef _WIN32
+	CHECK(_putenv_s("KYTY_SAVE_BACKUPS", value) == 0);
+#else
+	CHECK(setenv("KYTY_SAVE_BACKUPS", value, 1) == 0);
+#endif
+}
+
+void TestLegacyMigrationAndNoRestore() {
+	Reset("LEGACY");
+	BackupOption("0");
+	const fs::path slot = "_SaveData/LEGACY/PlayerProfile0";
+	CHECK(fs::create_directories(slot));
+	std::ofstream(slot / "USR-DATA", std::ios::binary) << "original-progress";
+	const auto old_time = fs::file_time_type::clock::now() - std::chrono::hours(48);
+	fs::last_write_time(slot / "USR-DATA", old_time);
+	CHECK(fs::create_directories("_SaveData/.kyty-param/LEGACY"));
+	CHECK(fs::create_directories("_SaveData/.kyty-capacity/LEGACY"));
+	SaveDataParam legacy {};
+	std::strcpy(legacy.title, "Legacy character");
+	legacy.user_param = 71;
+	std::ofstream("_SaveData/.kyty-param/LEGACY/PlayerProfile0.param", std::ios::binary)
+	    .write(reinterpret_cast<const char*>(&legacy), 1284);
+	std::ofstream("_SaveData/.kyty-capacity/LEGACY/PlayerProfile0.blocks") << "96\n";
+	CHECK(Search(Config::GetUserId()) == std::vector<std::string>{"PlayerProfile0"});
+	CHECK(!fs::exists(slot / "sce_sys")); // Searching does not modify a save.
+	const auto name = DirName("PlayerProfile0");
+	struct SaveDataMount3 mount {};
+	mount.user_id = Config::GetUserId();
+	mount.dir_name = &name;
+	mount.mount_mode = 2;
+	SaveDataMountResult result {};
+	CHECK(SaveDataMount3(&mount, &result) == OK);
+	CHECK(fs::file_size(slot / "sce_sys/param.bin") == 1328);
+	CHECK(fs::file_size(slot / "sce_sys/blocks.bin") == 8);
+	CHECK(fs::last_write_time(slot / "sce_sys/param.bin") == fs::last_write_time(slot / "USR-DATA"));
+	SaveDataParam loaded {};
+	CHECK(SaveDataGetParam(&result.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == "Legacy character" && loaded.user_param == 71);
+	SaveDataMountInfo info {};
+	CHECK(SaveDataGetMountInfo(&result.mount_point, &info) == OK && info.blocks == 96);
+	const char title[] = "Canonical character";
+	CHECK(SaveDataSetParam(&result.mount_point, 1, title, sizeof(title)) == OK);
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(!fs::exists("_SaveData/.kyty-backup/LEGACY"));
+	CHECK(GetSaveSlotInfo("PlayerProfile0", Config::GetUserId()).title == title);
+	CHECK(SaveDataMount3(&mount, &result) == OK);
+	CHECK(SaveDataGetParam(&result.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == title); // Stale .kyty-param must not win.
+	BackupOption("1");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(fs::exists("_SaveData/.kyty-backup/LEGACY/PlayerProfile0"));
+	std::array<char, 16> zeros {};
+	std::ofstream(slot / "USR-DATA", std::ios::binary).write(zeros.data(), zeros.size());
+	// There is a valid nonzero backup, but zero bytes are not proof of corruption.
+	CHECK(SaveDataMount3(&mount, &result) == OK);
+	CHECK(Backup::AllZeros(slot / "USR-DATA"));
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(Backup::AllZeros(slot / "USR-DATA"));
+	BackupOption("0");
+	fs::resize_file(slot / "sce_sys/param.bin", 7);
+	CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_BROKEN);
+	CHECK(fs::file_size(slot / "sce_sys/param.bin") == 7); // Never roll back from .kyty-param or backup.
+	CHECK(Backup::AllZeros(slot / "USR-DATA"));
+	CHECK(SaveDataTerminate() == OK);
+}
+
+void TestConcurrentUsersAndSorting() {
+	Reset("USERS");
+	const auto name = DirName("slot");
+	std::array<SaveDataMountResult, 2> mounted {};
+	for (size_t i = 0; i < mounted.size(); ++i) {
+		struct SaveDataMount3 mount {};
+		mount.user_id = Config::GetUserId() + static_cast<int32_t>(i) * 0x100;
+		mount.dir_name = &name;
+		mount.mount_mode = 4;
+		mount.blocks = 48;
+		CHECK(SaveDataMount3(&mount, &mounted[i]) == OK);
+		SaveDataParam param {};
+		std::strcpy(param.title, i == 0 ? "Primary" : "Guest");
+		CHECK(SaveDataSetParam(&mounted[i].mount_point, 0, &param, sizeof(param)) == OK);
+		mount.mount_mode = 2;
+		SaveDataMountResult duplicate {};
+		CHECK(SaveDataMount3(&mount, &duplicate) == SAVE_DATA_ERROR_BUSY);
+	}
+	CHECK(std::string(mounted[0].mount_point.data) != mounted[1].mount_point.data);
+	CHECK(GetSaveSlotInfo("slot", Config::GetUserId() + 0x100, "USERS").title == "Guest");
+	CHECK(GetSaveSlotInfo("slot", Config::GetUserId(), "USERS").title == "Primary");
+	for (const auto& mount : mounted) CHECK(SaveDataUmount2(0, &mount.mount_point) == OK);
+	Reset("SORT");
+	const auto earlier = fs::file_time_type::clock::now() - std::chrono::hours(12);
+	for (int i = 0; i < 2; ++i) {
+		const auto slot_name = DirName(i == 0 ? "PlayerProfile0" : "PlayerProfile1");
+		struct SaveDataMount3 mount {};
+		mount.user_id = Config::GetUserId();
+		mount.dir_name = &slot_name;
+		mount.mount_mode = 4;
+		mount.blocks = 48;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		SaveDataParam param {};
+		param.user_param = i == 0 ? 99 : 5;
+		CHECK(SaveDataSetParam(&result.mount_point, 0, &param, sizeof(param)) == OK);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+		const auto directory = fs::path("_SaveData/SORT") / slot_name.data;
+		for (const auto& entry : fs::recursive_directory_iterator(directory)) {
+			if (entry.is_regular_file()) fs::last_write_time(entry.path(), earlier + std::chrono::hours(i));
+		}
+	}
+	std::array<SceSaveDataDirName, 2> names {};
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id = Config::GetUserId();
+	cond.key = SaveDataSortKey::Mtime;
+	cond.order = SaveDataSortOrder::Descent;
+	SaveDataDirNameSearchResult result {};
+	result.dir_names = names.data();
+	result.dir_names_num = names.size();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 2);
+	CHECK(std::string(names[0].data) == "PlayerProfile1");
+	cond.key = SaveDataSortKey::UserParam;
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK);
+	CHECK(std::string(names[0].data) == "PlayerProfile0");
+}
+#endif
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	const auto path = executable.string();
@@ -659,9 +904,17 @@ void RunChild(const fs::path& executable, const char* mode) {
 } // namespace
 
 int main(int argc, char** argv) {
+	#ifdef _WIN32
+	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	Common::InitializeThreads();
 	Config::Initialize();
+	Log::Initialize();
 	if (argc == 2) {
-		if (std::string_view(argv[1]) == "write") {
+		if (std::string_view(argv[1]).starts_with("classic-")) {
+			ClassicInterop(argv[1]);
+		} else if (std::string_view(argv[1]) == "write") {
 			WriteRestartFixture();
 		} else {
 			CHECK(std::string_view(argv[1]) == "read");
@@ -671,20 +924,37 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 	const auto executable = fs::absolute(argv[0]);
+	const auto reference_executable = argc == 3 ? fs::absolute(argv[2]) : fs::path();
 	const auto previous   = fs::current_path();
 	const auto unique     = std::chrono::steady_clock::now().time_since_epoch().count();
-	const auto temp = fs::temp_directory_path() / ("kyty_save_memory_" + std::to_string(unique));
+	const auto temp = previous / ("kyty_save_memory_" + std::to_string(unique));
 	CHECK(fs::create_directories(temp));
 	fs::current_path(temp);
+	if (argc == 3) {
+		CHECK(std::string_view(argv[1]) == "--interop");
+		RunChild(reference_executable, "classic-write");
+		RunChild(executable, "classic-update");
+		RunChild(reference_executable, "classic-read");
+		fs::current_path(previous);
+		fs::remove_all(temp);
+		std::puts("Nova5 -> unified -> Nova5 save interoperability PASSED");
+		Config::Shutdown();
+		return 0;
+	}
 	RunChild(executable, "write");
 	RunChild(executable, "read");
 	TestValidationAndScatter();
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
+	TestNova5FormatAndLimits();
 	TestClassicSavePaths();
 	TestGuestSaveIsolation();
 	TestSaveAllocations();
 	TestClassicSaveParams();
+#ifndef NOVA5_REFERENCE_SAVE_DATA
+	TestLegacyMigrationAndNoRestore();
+	TestConcurrentUsersAndSorting();
+#endif
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

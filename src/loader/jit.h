@@ -7,6 +7,53 @@ namespace Loader::Jit {
 
 #pragma pack(1)
 
+struct JmpWithIndex {
+	void SetIndex(uint32_t index) { *reinterpret_cast<uint32_t*>(&code[1]) = index; }
+
+	void SetFunc(void* handler) {
+		auto func_addr = reinterpret_cast<int64_t>(handler);
+		auto rip_addr  = reinterpret_cast<int64_t>(&code[10]);
+		auto offset64  = func_addr - rip_addr;
+		auto offset32  = static_cast<uint32_t>(static_cast<uint64_t>(offset64) & 0xffffffffu);
+
+		*reinterpret_cast<uint32_t*>(&code[6]) = offset32;
+	}
+
+	static uint64_t GetSize() { return 16; }
+
+	// 68 00 00 00 00          push     <index>
+	// E9 E0 FF FF FF          jmp      <handler>
+	uint8_t code[16] = {0x68, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00,
+	                    0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+};
+
+struct CallPlt {
+	explicit CallPlt(uint32_t table_size) {
+		for (uint32_t index = 0; index < table_size; index++) {
+			auto* c = new (&code[32] + JmpWithIndex::GetSize() * index) JmpWithIndex;
+			c->SetIndex(index);
+			c->SetFunc(this);
+		}
+	}
+
+	void SetPltGot(uint64_t vaddr) { *reinterpret_cast<uint64_t*>(&code[2]) = vaddr; }
+
+	uint64_t GetAddr(uint32_t index) {
+		return reinterpret_cast<uint64_t>(&code[32] + JmpWithIndex::GetSize() * index);
+	}
+
+	static uint64_t GetSize(uint32_t table_size) {
+		return 32 + JmpWithIndex::GetSize() * table_size;
+	}
+
+	// 0:  49 bb 88 77 66 55 44    movabs r11,0x1122334455667788
+	// 7:  33 22 11
+	// a:  41 ff 73 08             push   QWORD PTR [r11+0x8]
+	// e:  41 ff 63 10             jmp    QWORD PTR [r11+0x10]
+	uint8_t code[32] = {0x49, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x41, 0xFF,
+	                    0x73, 0x08, 0x41, 0xFF, 0x63, 0x10, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+};
+
 struct JmpRax {
 	template <class Handler>
 	void SetFunc(Handler func) {
@@ -58,17 +105,16 @@ struct TlsRegStub {
 	}
 	static uint64_t GetSize() { return 32; }
 
-	// lea rsp,[rsp-0x80]
-	// nop
+	// sub rsp,0x80
 	// push rax
 	// call safe_call
 	// mov <reg>,rax
 	// pop rax
-	// lea rsp,[rsp+0x80]
+	// add rsp,0x80
 	// ret
-	uint8_t code[32] = {0x48, 0x8D, 0x64, 0x24, 0x80, 0x66, 0x90, 0x50, 0xE8, 0x00, 0x00,
-	                    0x00, 0x00, 0x48, 0x89, 0xC0, 0x58, 0x48, 0x8D, 0xA4, 0x24, 0x80,
-	                    0x00, 0x00, 0x00, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+	uint8_t code[32] = {0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00, 0x50, 0xE8, 0x00, 0x00,
+	                    0x00, 0x00, 0x48, 0x89, 0xC0, 0x58, 0x48, 0x81, 0xC4, 0x80, 0x00,
+	                    0x00, 0x00, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 };
 
 struct SafeCall {
@@ -79,8 +125,7 @@ struct SafeCall {
 	static uint64_t GetSize() { return 0x1000; }
 
 	uint8_t code[0x90] = {
-	    /*00*/ 0x48, 0x8d, 0x64, 0x24, 0x80,             // lea    rsp,[rsp-0x80]
-	    /*05*/ 0x66, 0x90,                               // nop
+	    /*00*/ 0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00, // sub    rsp,0x80
 	    /*07*/ 0x9c,                                     // pushfq
 	    /*08*/ 0x51,                                     // push   rcx
 	    /*09*/ 0x52,                                     // push   rdx
@@ -110,9 +155,9 @@ struct SafeCall {
 	    /*40*/ 0x5a,             // pop    rdx
 	    /*41*/ 0x59,             // pop    rcx
 	    /*42*/ 0x9d,             // popfq
-	    /*43*/ 0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00,
-	    0x00,        // lea    rsp,[rsp+0x80]
-	    /*4b*/ 0xc3, // ret
+	    /*43*/ 0x48, 0x81, 0xc4, 0x80, 0x00, 0x00,
+	    0x00,        // add    rsp,0x80
+	    /*4a*/ 0xc3, // ret
 	};
 };
 

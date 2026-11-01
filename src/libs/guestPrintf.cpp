@@ -1,4 +1,3 @@
-#include "common/stallDump.h"
 //
 // Original algorithm is from:
 // 	https://github.com/mpaland/printf
@@ -15,13 +14,8 @@
 #include "common/stringUtils.h"
 #include "libs/vaContext.h"
 
-#include <algorithm>
-#include <atomic>
 #include <cfloat>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <string>
 #include <vector>
 
 namespace Libs {
@@ -533,12 +527,7 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			} else if (*format == '*') {
 				// const int prec = (int)va_arg(va, int);
 				const int prec = VaArg_int(va_list);
-				if (prec < 0) {
-					// A negative dynamic precision is treated as omitted.
-					flags &= ~FLAGS_PRECISION;
-				} else {
-					precision = static_cast<unsigned int>(prec);
-				}
+				precision      = prec > 0 ? static_cast<unsigned int>(prec) : 0U;
 				format++;
 			}
 		}
@@ -782,27 +771,6 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
 		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
 	} else {
-		// Keep guest warnings available without enabling the high-volume HLE log.
-		if (buffer[0] != '\0') { Common::StallDump::Progress(Common::StallDump::Milestone::GuestPrintf); }
-		// Opt-in and bounded per process; snprintf never writes to this channel.
-		static const bool guest_log = [] {
-			const auto* value = std::getenv("KYTY_GUEST_LOG");
-			return value != nullptr && value[0] == '1' && value[1] == '\0';
-		}();
-		if (guest_log && buffer[0] != '\0') {
-			static std::atomic<uint64_t> captured {0};
-			constexpr uint64_t limit = 8 * 1024 * 1024;
-			const auto length = std::char_traits<char>::length(buffer.data());
-			const auto previous = captured.fetch_add(length, std::memory_order_relaxed);
-			if (previous < limit) {
-				const auto count = static_cast<int>(std::min<uint64_t>(length, limit - previous));
-				std::fprintf(stderr, "[Guest] %.*s", count, buffer.data());
-				if (length > limit - previous) {
-					std::fprintf(stderr, "\n[Guest] diagnostic capture limit reached\n");
-				}
-				std::fflush(stderr);
-			}
-		}
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
 

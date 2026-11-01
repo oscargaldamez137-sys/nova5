@@ -4,9 +4,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-struct Program;
-
-void RemoveIdentities(Program& program);
+void RemoveIdentities(const BlockList& blocks);
 void EliminateDeadCode(const BlockList& blocks);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -18,12 +18,6 @@ struct Lifecycle {
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
 
-constexpr int PAD_ERROR_INVALID_ARG     = -2137915391; /* 0x80920001 */
-constexpr int PAD_ERROR_INVALID_HANDLE  = -2137915389; /* 0x80920003 */
-constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
-constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
-constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
-
 constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
 constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
 constexpr uint32_t PAD_BUTTON_OPTIONS   = 0x00000008;
@@ -52,14 +46,27 @@ enum class Axis {
 	AxisMax
 };
 
-enum class Sensor { Accel, Gyro };
-
 struct PadControllerInformation;
 struct PadData;
 struct PadVibrationParam;
 struct PadLightBarParam;
 struct PadTriggerEffectParam;
-struct PadTriggerEffectStateInformation;
+
+// scePadGetTriggerEffectState's information: which state each trigger's effect is in.
+struct PadTriggerEffectStateInformation {
+	int32_t state[2];
+};
+
+// The states a DualSense reports for the effect a trigger runs (scePadTriggerEffectState).
+enum PadTriggerEffectState {
+	PAD_TRIGGER_STATE_NO_FORCE             = 1,
+	PAD_TRIGGER_STATE_IS_PUSHING           = 2,
+	PAD_TRIGGER_STATE_WEAPON_NOT_PRESSED    = 3,
+	PAD_TRIGGER_STATE_WEAPON_ALMOST_PRESSED = 4,
+	PAD_TRIGGER_STATE_WEAPON_FULLY_PRESSED  = 5,
+	PAD_TRIGGER_STATE_VIBRATION_NOT_FIRING  = 6,
+	PAD_TRIGGER_STATE_VIBRATION_IS_FIRING   = 7,
+};
 
 inline int controller_get_axis(int min, int max, int value) {
 	int v = (255 * (value - min)) / (max - min);
@@ -74,60 +81,22 @@ inline int controller_get_axis(int min, int max, int value) {
 
 void Connect(int id);
 void Disconnect(int id);
-// Moves the keyboard to the next player (shared with player 1, then 1-4) while the game runs.
-void CycleKeyboardPlayer();
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
-void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
-void ToggleGyroEmulation(int id);
 void ResetInputState();
-int  GetActiveControllerId();
-// True when the player has a keyboard or gamepad assigned.
-bool IsPlayerConnected(int player);
-
-enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
-
-void  CycleSetting(Setting setting);
-float GetSettingScale(Setting setting);
-
-int  PadCheckHandle(int handle);
-bool PadInitialized();
-
-// Virtual headset only (padVr.cpp): the Sense controller ports of the initial user. Their handles
-// stay outside the per-player range and otherwise act on the first player.
-constexpr int PAD_HANDLE_VR_LEFT = 0x10; // The right controller follows it.
-
-// 0 for the left and 1 for the right Sense controller handle, -1 for any other handle.
-constexpr int PadVrHand(int handle) {
-	return handle == PAD_HANDLE_VR_LEFT || handle == PAD_HANDLE_VR_LEFT + 1
-	           ? handle - PAD_HANDLE_VR_LEFT
-			   : -1;
-}
-
-// Hand of a Sense controller port type, -1 for other types or without the virtual headset.
-int PadVrPortHand(int type);
-// scePadOpen (open) or scePadGetHandle for a Sense controller port.
-int PadVrPort(int user_id, int hand, int index, bool open);
-int PadVrCheckHandle(int handle);
-int PadVrClose(int handle);
-
-struct PadVrControllerData;
-
-int KYTY_SYSV_ABI PadVrControllerReadState(int handle, PadVrControllerData* data);
-int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_handle,
-                                                   const PadTriggerEffectParam* param);
+// Scripted input (live `pad`, automated tours): for `seconds` from now the game reads these stick values (0..255, 128
+// centre; -1: the host's) and these buttons OR-ed into the host's.
+void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds);
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);
-int KYTY_SYSV_ABI PadClose(int handle);
 int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable);
 int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable);
 int KYTY_SYSV_ABI PadResetOrientation(int handle);
 int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformation* info);
-int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote);
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
@@ -135,6 +104,11 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info);
 int KYTY_SYSV_ABI PadResetLightBar(int handle);
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
+
+// The game's vibration as rumble on a pad without the DualSense's haptics (an Xbox controller, a Steam Deck's; issue
+// #236): the vibration port's audio (signed 16-bit, or float when `is_float`; `gains` the guest's per channel), its
+// peaks per channel driving the active pad's two motors. For when no DualSense haptics endpoint takes that port.
+void RumbleFromVibrationAudio(const void* data, uint32_t frames, uint32_t channels, bool is_float, const float* gains);
 
 } // namespace Libs::Controller
 

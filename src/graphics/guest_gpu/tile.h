@@ -86,7 +86,6 @@ struct TileMipLayout {
 	uint32_t padded_height = 0;
 	uint32_t tail_x        = 0;
 	uint32_t tail_y        = 0;
-	bool     operator==(const TileMipLayout&) const = default;
 };
 
 struct TileSurfaceLayout {
@@ -126,12 +125,14 @@ bool     TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch
 bool     TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
                         uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
                         TileSizeAlign& total_size, uint32_t num_fragments_log2 = 0);
-bool     TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t levels,
-                          TileSizeAlign& total_size);
+bool     TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t pitch,
+                                      uint32_t bytes_per_element, uint32_t levels,
+                                      TileSizeAlign& total_size, TileSizeOffset* level_sizes,
+                                      TilePaddedSize* padded_size);
 void     TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
                             uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
                             TileSizeOffset* level_sizes, TilePaddedSize* padded_size);
-void     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+bool     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
                                  uint32_t depth, uint32_t levels, Prospero::TileMode tile,
                                  bool volume_texture, TileSizeAlign& total_size);
 uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,

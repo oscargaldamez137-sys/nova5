@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Bit-exact D32 depth -> 32-bit color reinterpretation (texture cache alias copies). The
+// destination is any 32-bit color image written through an R32_UINT storage view, so the
+// stored bits equal the depth texels' IEEE-754 bits, exactly as a copy through a buffer.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2DArray depth_source;
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2DArray color_destination;
+
+layout(push_constant, std430) uniform Push {
+	uint width;
+	uint height;
+	uint level;
+} params;
+
+void main() {
+	const uvec3 id = gl_GlobalInvocationID;
+	if (id.x >= params.width || id.y >= params.height) {
+		return;
+	}
+	const ivec3 coord = ivec3(id);
+	const float depth = texelFetch(depth_source, coord, int(params.level)).r;
+	imageStore(color_destination, coord, uvec4(floatBitsToUint(depth), 0u, 0u, 0u));
+}

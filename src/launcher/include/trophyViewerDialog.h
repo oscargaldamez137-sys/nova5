@@ -1,26 +1,25 @@
 #ifndef TROPHY_VIEWER_DIALOG_H
 #define TROPHY_VIEWER_DIALOG_H
 
-#include <QDialog>
+#include "common.h"
 
-#include <vector>
+#include <QDialog>
 
 class QTabWidget;
 class QWidget;
 
 class Configuration;
 class TrophyViewerDialog: public QDialog {
+	KYTY_QT_CLASS_NO_COPY(TrophyViewerDialog);
+
 public:
 	explicit TrophyViewerDialog(QWidget* parent = nullptr);
 
 	static bool HasTrophyData(const Configuration* info);
-	static void ShowForGame(const Configuration* info, const QString& runtime_directory,
-	                        QWidget* parent);
-	static void ShowOverview(const std::vector<const Configuration*>& games,
-	                         const QString& runtime_directory, QWidget* parent);
+	static void ShowForGame(const Configuration* info, QWidget* parent);
 
 private:
-	bool LoadGame(const Configuration& info, const QString& runtime_directory, QString& error);
+	bool LoadGame(const Configuration& info, QString& error);
 
 	QTabWidget* m_tabs = nullptr;
 };

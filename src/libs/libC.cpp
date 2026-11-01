@@ -1,3 +1,4 @@
+#include "common/termination.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -54,7 +55,11 @@ struct CContext {
 	std::list<atexit_func_t> atexit;
 };
 
-using InitEnvParams = Loader::EntryParams;
+struct InitEnvParams {
+	int         argc;
+	uint32_t    pad;
+	const char* argv[3];
+};
 
 static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
@@ -71,6 +76,8 @@ const char** GetArgv() {
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
+	Common::Termination::Report("HLE-exit", static_cast<uint32_t>(code),
+	    reinterpret_cast<uint64_t>(__builtin_return_address(0)), true, "LibC::exit" );
 	::exit(code);
 }
 
@@ -267,7 +274,9 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 		return;
 	}
 
-	EXIT_NOT_IMPLEMENTED(params->argc < 0);
+	constexpr int argv_capacity = static_cast<int>(sizeof(params->argv) / sizeof(params->argv[0]));
+
+	EXIT_NOT_IMPLEMENTED(params->argc < 0 || params->argc >= argv_capacity);
 
 	g_argc = params->argc;
 	g_argv = params->argv;
@@ -771,10 +780,10 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
 	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
 	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
-	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp);
-	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp);
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strcmp);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strncmp);
 	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
-	LIB_FUNC("kiZSXIWd9vg", LibcInternal::strcpy);
+	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy);
 	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
 	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);

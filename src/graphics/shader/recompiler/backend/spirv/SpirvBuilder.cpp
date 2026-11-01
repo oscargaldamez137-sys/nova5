@@ -15,17 +15,49 @@ static void AppendInstructionWords(std::vector<uint32_t>& section, const uint32_
 	if (words_num == 0) {
 		return;
 	}
-	const uint32_t opcode     = words[0];
-	const auto     word_count = static_cast<uint32_t>(words_num);
-	section.push_back((word_count << spv::WordCountShift) | opcode);
+	const auto opcode     = words[0];
+	const auto word_count = static_cast<uint32_t>(words_num);
+	section.push_back((word_count << 16u) | opcode);
 	section.insert(section.end(), words + 1, words + words_num);
 }
 
+namespace {
+// The big sections of the thread's last module and the module Build made of them (Recycle), their capacity kept for the
+// next one: grown from empty, a program's were reallocated ~1 MiB at a time, memory the system had to zero-fill each
+// time (the shader prefetch's threads: ~2 GB a minute). Only the larger of two is kept, up to 8 MiB each.
+struct SectionPool {
+	std::vector<uint32_t> debug, annotations, declarations, functions, module;
+};
+thread_local SectionPool t_sections;
+constexpr size_t         PooledWordsLimit = (size_t {8} << 20u) / sizeof(uint32_t);
+
+void Adopt(std::vector<uint32_t>& section, std::vector<uint32_t>& pooled, size_t reserve) {
+	section = std::move(pooled);
+	section.clear();
+	section.reserve(reserve);
+}
+
+void GiveBack(std::vector<uint32_t>& section, std::vector<uint32_t>& pooled) {
+	if (section.capacity() > pooled.capacity() && section.capacity() <= PooledWordsLimit) pooled = std::move(section);
+}
+} // namespace
+
 Builder::Builder(uint32_t version): m_version(version) {
-	m_debug.reserve(InitialSpirvSectionReserve);
-	m_annotations.reserve(InitialSpirvSectionReserve);
-	m_declarations.reserve(InitialSpirvSectionReserve);
-	m_functions.reserve(InitialSpirvFunctionSectionReserve);
+	Adopt(m_debug, t_sections.debug, InitialSpirvSectionReserve);
+	Adopt(m_annotations, t_sections.annotations, InitialSpirvSectionReserve);
+	Adopt(m_declarations, t_sections.declarations, InitialSpirvSectionReserve);
+	Adopt(m_functions, t_sections.functions, InitialSpirvFunctionSectionReserve);
+}
+
+Builder::~Builder() {
+	GiveBack(m_debug, t_sections.debug);
+	GiveBack(m_annotations, t_sections.annotations);
+	GiveBack(m_declarations, t_sections.declarations);
+	GiveBack(m_functions, t_sections.functions);
+}
+
+void Builder::Recycle(std::vector<uint32_t>&& module) {
+	GiveBack(module, t_sections.module);
 }
 
 uint32_t Builder::AllocateId() {
@@ -36,17 +68,15 @@ void Builder::RequireVersion(uint32_t version) {
 	m_version = std::max(m_version, version);
 }
 
-void Builder::RequireCapability(spv::Capability capability) {
+void Builder::RequireCapability(uint32_t capability) {
 	if (m_required_capabilities.insert(capability).second) {
-		AppendInstruction(m_capabilities, spv::OpCapability, capability);
+		AddCapability({capability});
 	}
 }
 
 void Builder::RequireExtension(const char* name) {
 	if (m_required_extensions.emplace(name).second) {
-		std::vector<uint32_t> operands;
-		AppendString(operands, name);
-		AppendInstruction(m_extensions, spv::OpExtension, operands);
+		AddExtension(name);
 	}
 }
 
@@ -56,67 +86,105 @@ uint32_t Builder::Import(const char* name) {
 	}
 	const auto id = AllocateId();
 	m_import_ids.emplace(name, id);
-	std::vector<uint32_t> operands = {id};
-	AppendString(operands, name);
-	AppendInstruction(m_ext_inst_imports, spv::OpExtInstImport, operands);
+	AddExtInstImport(id, name);
 	return id;
 }
 
-uint32_t Builder::DeclareType(spv::Op opcode, std::vector<uint32_t> key) {
-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+uint32_t Builder::FindOrReserveDeclaration(uint32_t& id) {
+	if (const auto it = m_declaration_ids.find(m_key); it != m_declaration_ids.end()) {
 		return it->second;
 	}
-	const auto id = AllocateId();
-	AppendInstruction(m_declarations, opcode, id, std::span<const uint32_t>(key).subspan(2));
-	m_declaration_ids.emplace(std::move(key), id);
+	id = AllocateId();
+	m_declaration_ids.emplace(m_key, id);
+	return 0;
+}
+
+uint32_t Builder::Type(uint32_t opcode, std::initializer_list<uint32_t> operands) {
+	return Type(opcode, operands.begin(), operands.size());
+}
+
+uint32_t Builder::Type(uint32_t opcode, const std::vector<uint32_t>& operands) {
+	return Type(opcode, operands.data(), operands.size());
+}
+
+uint32_t Builder::Type(uint32_t opcode, const uint32_t* operands, size_t count) {
+	m_key.assign({opcode, static_cast<uint32_t>(count)});
+	m_key.insert(m_key.end(), operands, operands + count);
+	uint32_t id = 0;
+	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
+		return found;
+	}
+	m_declarations.push_back((static_cast<uint32_t>(count + 2u) << 16u) | opcode);
+	m_declarations.push_back(id);
+	m_declarations.insert(m_declarations.end(), operands, operands + count);
 	return id;
 }
 
-uint32_t Builder::DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
-                                       std::initializer_list<TypeAnnotation> annotations) {
+uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t> operands,
+                                std::initializer_list<TypeAnnotation> annotations) {
 	if (annotations.size() == 0) {
-		return DeclareType(opcode, std::move(key));
+		return Type(opcode, operands);
 	}
-	const auto operand_count = key[1];
-	key.push_back(static_cast<uint32_t>(annotations.size()));
+	m_key.assign({opcode, static_cast<uint32_t>(operands.size())});
+	m_key.insert(m_key.end(), operands.begin(), operands.end());
+	m_key.push_back(static_cast<uint32_t>(annotations.size()));
 	for (const auto& annotation: annotations) {
-		AppendOperand(key, annotation.opcode);
-		key.push_back(static_cast<uint32_t>(annotation.operands.size()));
-		key.insert(key.end(), annotation.operands.begin(), annotation.operands.end());
+		m_key.push_back(annotation.opcode);
+		m_key.push_back(static_cast<uint32_t>(annotation.operands.size()));
+		m_key.insert(m_key.end(), annotation.operands.begin(), annotation.operands.end());
 	}
-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
-		return it->second;
+	uint32_t id = 0;
+	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
+		return found;
 	}
-	const auto id = AllocateId();
-	AppendInstruction(m_declarations, opcode, id,
-	                  std::span<const uint32_t>(key).subspan(2, operand_count));
-	m_declaration_ids.emplace(std::move(key), id);
+	std::vector<uint32_t> words {opcode, id};
+	words.insert(words.end(), operands.begin(), operands.end());
+	AppendInstructionWords(m_declarations, words.data(), words.size());
 	for (const auto& annotation: annotations) {
-		AppendInstruction(m_annotations, annotation.opcode, id, annotation.operands);
+		words = {annotation.opcode, id};
+		words.insert(words.end(), annotation.operands.begin(), annotation.operands.end());
+		AppendInstructionWords(m_annotations, words.data(), words.size());
 	}
 	return id;
 }
 
-uint32_t Builder::DeclareConstant(spv::Op opcode, std::vector<uint32_t> key) {
-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
-		return it->second;
+uint32_t Builder::Constant(uint32_t opcode, uint32_t type,
+                           std::initializer_list<uint32_t> operands) {
+	return Constant(opcode, type, operands.begin(), operands.size());
+}
+
+uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands) {
+	return Constant(opcode, type, operands.data(), operands.size());
+}
+
+uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count) {
+	m_key.assign({opcode, type});
+	m_key.insert(m_key.end(), operands, operands + count);
+	uint32_t id = 0;
+	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
+		return found;
 	}
-	const auto id = AllocateId();
-	AppendInstruction(m_declarations, opcode, key[1], id,
-	                  std::span<const uint32_t>(key).subspan(2));
-	m_declaration_ids.emplace(std::move(key), id);
+	m_declarations.push_back((static_cast<uint32_t>(count + 3u) << 16u) | opcode);
+	m_declarations.push_back(type);
+	m_declarations.push_back(id);
+	m_declarations.insert(m_declarations.end(), operands, operands + count);
 	return id;
 }
 
-uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class) {
+uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class) {
 	const auto id = AllocateId();
 	DefineGlobalVariable(id, pointer_type, storage_class);
 	return id;
 }
 
-void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
-                                   spv::StorageClass storage_class) {
-	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class);
+void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class) {
+	AddType({59u, pointer_type, id, storage_class});
+}
+
+uint32_t Builder::DefineInitializedVariable(uint32_t pointer_type, uint32_t storage_class, uint32_t initializer) {
+	const auto id = AllocateId();
+	AddType({59u, pointer_type, id, storage_class, initializer});
+	return id;
 }
 
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
@@ -135,20 +203,49 @@ void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
 	}
 }
 
-void Builder::AddMemoryModel(spv::AddressingModel addressing_model, spv::MemoryModel memory_model) {
-	AppendInstruction(m_memory_model, spv::OpMemoryModel, addressing_model, memory_model);
+void Builder::AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+                                const std::vector<uint32_t>& operands) {
+	const uint32_t word_count = static_cast<uint32_t>(operands.size() + 1u);
+	section.push_back((word_count << 16u) | opcode);
+	section.insert(section.end(), operands.begin(), operands.end());
 }
 
-void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_point,
-                            const char* name, const std::vector<uint32_t>& interfaces) {
+void Builder::AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+                                std::initializer_list<uint32_t> operands) {
+	const uint32_t word_count = static_cast<uint32_t>(operands.size() + 1u);
+	section.push_back((word_count << 16u) | opcode);
+	section.insert(section.end(), operands.begin(), operands.end());
+}
+
+void Builder::AddCapability(std::initializer_list<uint32_t> operands) {
+	AppendInstruction(m_capabilities, 17u, operands);
+}
+
+void Builder::AddExtension(const char* name) {
 	std::vector<uint32_t> operands;
-	AppendOperands(operands, execution_model, entry_point);
+	AppendString(operands, name);
+	AppendInstruction(m_extensions, 10u, operands);
+}
+
+void Builder::AddExtInstImport(uint32_t id, const char* name) {
+	std::vector<uint32_t> operands = {id};
+	AppendString(operands, name);
+	AppendInstruction(m_ext_inst_imports, 11u, operands);
+}
+
+void Builder::AddMemoryModel(std::initializer_list<uint32_t> operands) {
+	AppendInstruction(m_memory_model, 14u, operands);
+}
+
+void Builder::AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,
+                            const std::vector<uint32_t>& interfaces) {
+	std::vector<uint32_t> operands = {execution_model, entry_point};
 	AppendString(operands, name);
 	operands.insert(operands.end(), interfaces.begin(), interfaces.end());
 	if (m_version >= 0x00010400u) {
 		for (size_t offset = 0; offset < m_declarations.size();) {
-			const auto count = m_declarations[offset] >> spv::WordCountShift;
-			if ((m_declarations[offset] & spv::OpCodeMask) == spv::OpVariable) {
+			const auto count = m_declarations[offset] >> 16u;
+			if ((m_declarations[offset] & 0xffffu) == 59u) {
 				const auto id = m_declarations[offset + 2u];
 				if (std::find(interfaces.begin(), interfaces.end(), id) == interfaces.end()) {
 					operands.push_back(id);
@@ -157,45 +254,46 @@ void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_
 			offset += count;
 		}
 	}
-	AppendInstruction(m_entry_points, spv::OpEntryPoint, operands);
+	AppendInstruction(m_entry_points, 15u, operands);
 }
 
-uint32_t Builder::AddString(const char* text) {
-	const auto id = AllocateId();
-	std::vector<uint32_t> operands = {id};
-	AppendString(operands, text);
-	AppendInstruction(m_debug, spv::OpString, operands);
-	return id;
+void Builder::AddExecutionMode(std::initializer_list<uint32_t> operands) {
+	AppendInstruction(m_execution_modes, 16u, operands);
 }
 
 void Builder::AddName(uint32_t target, const char* name) {
-	if (!m_emit_names) {
-		return;
-	}
 	std::vector<uint32_t> operands = {target};
 	AppendString(operands, name);
-	AppendInstruction(m_debug, spv::OpName, operands);
+	AppendInstruction(m_debug, 5u, operands);
 }
 
-void Builder::AddFunction(std::span<const uint32_t> words) {
+void Builder::AddAnnotation(std::initializer_list<uint32_t> words) {
+	AppendInstructionWords(m_annotations, words.begin(), words.size());
+}
+
+void Builder::AddType(std::initializer_list<uint32_t> words) {
+	AppendInstructionWords(m_declarations, words.begin(), words.size());
+}
+
+void Builder::AddFunction(std::initializer_list<uint32_t> words) {
+	AppendInstructionWords(m_functions, words.begin(), words.size());
+}
+
+void Builder::AddFunction(const std::vector<uint32_t>& words) {
 	AppendInstructionWords(m_functions, words.data(), words.size());
 }
 
 DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {
-	const DeferredPhi phi {m_functions.size()};
-	const auto word_count = static_cast<uint32_t>(3u + incoming_count * 2u);
-	m_functions.push_back((word_count << spv::WordCountShift) | spv::OpPhi);
-	m_functions.push_back(type);
-	m_functions.push_back(result);
-	m_functions.resize(m_functions.size() + incoming_count * 2u);
+	std::vector<uint32_t> words {245u, type, result};
+	words.resize(words.size() + incoming_count * 2u);
+	const DeferredPhi phi {m_functions.size(), incoming_count};
+	AddFunction(words);
 	m_unpatched_phi_incomings += incoming_count;
 	return phi;
 }
 
 void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent) {
-	const auto incoming_count =
-	    ((m_functions.at(phi.word_offset) >> spv::WordCountShift) - 3u) / 2u;
-	EXIT_IF(incoming >= incoming_count || value == 0 || parent == 0);
+	EXIT_IF(incoming >= phi.incoming_count || value == 0 || parent == 0);
 	const auto value_word  = phi.word_offset + 3u + incoming * 2u;
 	const auto parent_word = value_word + 1u;
 	EXIT_IF(m_functions.at(value_word) != 0 || m_functions.at(parent_word) != 0);
@@ -207,13 +305,14 @@ void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value,
 std::vector<uint32_t> Builder::Build() const {
 	EXIT_IF(m_unpatched_phi_incomings != 0);
 
-	std::vector<uint32_t> module;
+	std::vector<uint32_t> module = std::move(t_sections.module);
+	module.clear();
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +
 	               m_memory_model.size() + m_entry_points.size() + m_execution_modes.size() +
 	               m_debug.size() + m_annotations.size() + m_declarations.size() +
 	               m_functions.size());
 
-	module.push_back(spv::MagicNumber);
+	module.push_back(0x07230203u);
 	module.push_back(m_version);
 	module.push_back(0u);
 	module.push_back(m_next_id);

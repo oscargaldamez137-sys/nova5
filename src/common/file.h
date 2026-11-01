@@ -1,10 +1,10 @@
 #ifndef KYTY_COMMON_FILE_H_
 #define KYTY_COMMON_FILE_H_
 
+#include "common/byteBuffer.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 
-#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -31,10 +31,19 @@ class File {
 public:
 	enum class Mode { Read, Write, ReadWrite, WriteRead };
 
+	struct FindInfo {
+		std::filesystem::path path_with_name;
+		std::filesystem::path rel_path_with_name;
+		DateTime              last_access_time;
+		DateTime              last_write_time;
+		uint64_t              size;
+	};
+
 	struct DirEntry {
 		std::string name;
 		bool        is_file;
 	};
+
 	struct Info {
 		bool     is_file;
 		uint64_t size;
@@ -48,6 +57,7 @@ public:
 	bool Create(const std::filesystem::path& name);
 	bool Open(const std::filesystem::path& name, Mode mode);
 	bool OpenInMem(void* buf, uint32_t buf_size);
+	bool OpenInMem(ByteBuffer& buf); // NOLINT(google-runtime-references)
 	bool CreateInMem();
 
 	void Close();
@@ -69,16 +79,18 @@ public:
 
 	void GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write);
 
-	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
-	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
+	void       Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
+	ByteBuffer Read(uint32_t size);
+	void       Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
+	void       Write(const ByteBuffer& buf, uint32_t* bytes_written = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);
 
-	std::vector<std::byte> ReadWholeBuffer();
+	ByteBuffer ReadWholeBuffer();
 
 	static uint64_t Size(const std::filesystem::path& name);
+	// A file or a directory (also inside an archive, "game.zar!/dir/file"): nothing when it does not exist.
 	static std::optional<Info> GetInfo(const std::filesystem::path& name);
-	static std::optional<Info> GetInfo(const std::filesystem::path& name, std::error_code* error);
 
 	static bool IsDirectoryExisting(const std::filesystem::path& path);
 	static bool IsFileExisting(const std::filesystem::path& name);
@@ -97,10 +109,15 @@ public:
 	static bool SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name,
 	                                         const DateTime& access, const DateTime& write);
 
+	static std::vector<FindInfo> FindFiles(const std::filesystem::path& path);
 	static std::vector<DirEntry> GetDirEntries(const std::filesystem::path& path);
 	static bool CopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static void RemoveReadonly(const std::filesystem::path& name);
+	// This thread's latest failed create, open or write: the system's error code (GetLastError, errno), 0 when none
+	// failed since the last call, which clears it; and an error code's text.
+	static uint32_t    TakeLastError();
+	static std::string ErrorText(uint32_t error);
 
 	KYTY_CLASS_NO_COPY(File);
 

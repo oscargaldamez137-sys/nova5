@@ -1,15 +1,16 @@
 #ifndef EMULATOR_SRC_COMMON_SLOTVECTOR_H_
 #define EMULATOR_SRC_COMMON_SLOTVECTOR_H_
 
-#include "common/common.h"
+#include "common/assert.h"
+#include "common/abi.h"
 
+#include <atomic>
 #include <compare>
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <limits>
-#include <memory>
-#include <new>
-#include <numeric>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -19,105 +20,124 @@ struct SlotId {
 	static constexpr uint32_t INVALID_INDEX = std::numeric_limits<uint32_t>::max();
 
 	constexpr SlotId() noexcept = default;
-	constexpr SlotId(uint32_t index) noexcept: index(index) {}
+	constexpr SlotId(uint32_t value) noexcept: index(value), generation(1) {}
+	constexpr SlotId(uint32_t value, uint32_t slot_generation) noexcept
+	    : index(value), generation(slot_generation) {}
 
-	[[nodiscard]] constexpr explicit operator bool() const noexcept {
-		return index != INVALID_INDEX;
-	}
+	[[nodiscard]] constexpr explicit operator bool() const noexcept { return index != INVALID_INDEX; }
 	constexpr auto operator<=>(const SlotId&) const noexcept = default;
 
 	uint32_t index = INVALID_INDEX;
+	uint32_t generation = 0;
 };
 
-// Fixed-size chunks keep the stored, non-movable resources in place. Occupancy is a byte per
-// slot, not a bitset: a deferred erase runs while fault threads read other slots.
+// Stable-address slot storage for cache resources that are intentionally non-movable. A slot may be read from another
+// thread while the owner inserts and erases: the slots are in chunks that never move (published atomically), a slot's
+// generation and liveness are atomic. An erased object is destroyed by erase: a caller whose object another thread may
+// still be reading defers it.
 template <typename T>
 class SlotVector {
-	static constexpr uint32_t ChunkSize = 256;
-
 public:
 	SlotVector() = default;
+	~SlotVector() {
+		for (uint32_t chunk = 0; chunk < MaxChunks; ++chunk) delete[] m_chunks[chunk].load(std::memory_order_relaxed);
+	}
 	KYTY_CLASS_NO_COPY(SlotVector);
 
-	~SlotVector() noexcept {
-		ForEach([](SlotId, T& value) { value.~T(); });
-	}
-
 	[[nodiscard]] T& operator[](SlotId id) noexcept {
-		return m_chunks[id.index / ChunkSize][id.index % ChunkSize].object;
+		EXIT_IF(!is_allocated(id));
+		return *At(id.index).value;
 	}
 
 	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
-		return m_chunks[id.index / ChunkSize][id.index % ChunkSize].object;
+		EXIT_IF(!is_allocated(id));
+		return *At(id.index).value;
 	}
 
-	[[nodiscard]] T* try_get(SlotId id) noexcept {
-		return is_allocated(id) ? &(*this)[id] : nullptr;
-	}
+	[[nodiscard]] T* try_get(SlotId id) noexcept { return is_allocated(id) ? &*At(id.index).value : nullptr; }
 
-	[[nodiscard]] const T* try_get(SlotId id) const noexcept {
-		return is_allocated(id) ? &(*this)[id] : nullptr;
-	}
+	[[nodiscard]] const T* try_get(SlotId id) const noexcept { return is_allocated(id) ? &*At(id.index).value : nullptr; }
 
+	// The slot's first line (its liveness and the object's first members) loading, for a lookup soon.
+	void prefetch(SlotId id) const noexcept {
+		if (id && id.index < m_capacity.load(std::memory_order_acquire)) __builtin_prefetch(&At(id.index));
+	}
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id.index < m_stored.size() && m_stored[id.index] != 0;
+		if (!id || id.index >= m_capacity.load(std::memory_order_acquire)) return false;
+		const auto& slot = At(id.index);
+		return slot.alive.load(std::memory_order_acquire) && slot.generation.load(std::memory_order_acquire) == id.generation;
 	}
 
 	template <typename... Args>
 	[[nodiscard]] SlotId insert(Args&&... args) {
+		uint32_t index = 0;
 		if (m_free_list.empty()) {
-			Reserve();
+			index = m_capacity.load(std::memory_order_relaxed);
+			EXIT_IF(index >= MaxChunks * ChunkSlots);
+			auto& chunk = m_chunks[index >> ChunkBits];
+			if (chunk.load(std::memory_order_relaxed) == nullptr) chunk.store(new Slot[ChunkSlots], std::memory_order_release);
+		} else {
+			index = m_free_list.back();
+			m_free_list.pop_back();
 		}
-		const uint32_t index = m_free_list.back();
-		m_free_list.pop_back();
-		new (&(*this)[index]) T(std::forward<Args>(args)...);
-		m_stored[index] = 1;
-		return SlotId {index};
+		auto& slot = At(index);
+		EXIT_IF(slot.value.has_value());
+		slot.value.emplace(std::forward<Args>(args)...);
+		slot.alive.store(true, std::memory_order_release);
+		if (index == m_capacity.load(std::memory_order_relaxed)) m_capacity.store(index + 1, std::memory_order_release);
+		++m_size;
+		return SlotId {index, slot.generation.load(std::memory_order_relaxed)};
 	}
 
 	void erase(SlotId id) noexcept {
-		(*this)[id].~T();
-		m_stored[id.index] = 0;
+		EXIT_IF(!is_allocated(id));
+		auto& slot = At(id.index);
+		slot.alive.store(false, std::memory_order_release);
+		const auto generation = slot.generation.load(std::memory_order_relaxed) + 1;
+		slot.generation.store(generation == 0 ? 1 : generation, std::memory_order_release);
+		slot.value.reset();
 		m_free_list.push_back(id.index);
+		--m_size;
 	}
+
+	[[nodiscard]] size_t size() const noexcept { return m_size; }
+	[[nodiscard]] size_t capacity() const noexcept { return m_capacity.load(std::memory_order_acquire); }
 
 	template <typename F>
 	void ForEach(F&& fn) {
-		for (uint32_t index = 0; index < m_stored.size(); ++index) {
-			if (m_stored[index] != 0) {
-				fn(SlotId {index}, (*this)[index]);
-			}
+		for (uint32_t index = 0, count = m_capacity.load(std::memory_order_acquire); index < count; ++index) {
+			auto& slot = At(index);
+			if (slot.value) fn(SlotId {index, slot.generation.load(std::memory_order_relaxed)}, *slot.value);
 		}
 	}
 
 	template <typename F>
 	void ForEach(F&& fn) const {
-		for (uint32_t index = 0; index < m_stored.size(); ++index) {
-			if (m_stored[index] != 0) {
-				fn(SlotId {index}, (*this)[index]);
-			}
+		for (uint32_t index = 0, count = m_capacity.load(std::memory_order_acquire); index < count; ++index) {
+			const auto& slot = At(index);
+			if (slot.value) fn(SlotId {index, slot.generation.load(std::memory_order_relaxed)}, *slot.value);
 		}
 	}
 
 private:
-	union Slot {
-		Slot() noexcept {}
-		~Slot() noexcept {}
-
-		T object;
+	// (The liveness check reads generation and alive, then the caller reads the object: in front of it they share its
+	// first cache line. After it, an object of hundreds of bytes put them on a line of their own: a second cold miss for
+	// every lookup, ~3% of the GPU thread at 1-1.)
+	struct Slot {
+		std::atomic<uint32_t> generation {1};
+		std::atomic<bool>     alive {false};
+		std::optional<T>      value;
 	};
+	static constexpr uint32_t ChunkBits = 10, ChunkSlots = 1u << ChunkBits, MaxChunks = 1u << 12;
 
-	void Reserve() {
-		const auto first = static_cast<uint32_t>(m_stored.size());
-		m_chunks.push_back(std::make_unique<Slot[]>(ChunkSize));
-		m_stored.resize(first + ChunkSize);
-		m_free_list.resize(ChunkSize);
-		std::iota(m_free_list.rbegin(), m_free_list.rend(), first);
+	[[nodiscard]] Slot& At(uint32_t index) const noexcept {
+		return m_chunks[index >> ChunkBits].load(std::memory_order_acquire)[index & (ChunkSlots - 1)];
 	}
 
-	std::vector<std::unique_ptr<Slot[]>> m_chunks;
-	std::vector<uint8_t>                 m_stored;
-	std::vector<uint32_t>                m_free_list;
+	std::unique_ptr<std::atomic<Slot*>[]> m_chunks = std::make_unique<std::atomic<Slot*>[]>(MaxChunks);
+	std::atomic<uint32_t>                 m_capacity {0};
+	std::vector<uint32_t>                 m_free_list;
+	size_t                                m_size = 0;
 };
 
 } // namespace Common
@@ -125,7 +145,7 @@ private:
 template <>
 struct std::hash<Common::SlotId> {
 	[[nodiscard]] size_t operator()(Common::SlotId id) const noexcept {
-		return std::hash<uint32_t> {}(id.index);
+		return std::hash<uint64_t> {}((static_cast<uint64_t>(id.generation) << 32u) | id.index);
 	}
 };
 

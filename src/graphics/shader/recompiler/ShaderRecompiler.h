@@ -3,14 +3,9 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
 
-#include <array>
-#include <bitset>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -20,10 +15,13 @@ struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
+	uint32_t                    scratch_dwords  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
-	bool                        emit_debug_info            = false;
-	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
+	bool                        early_dump                 = false;
+	bool                        enable_lod_stats           = false;
+	bool                        table_mode                 = false; // IR::EnterTableMode
+	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
@@ -42,37 +40,10 @@ struct CompileResult {
 	IR::Program            program;
 };
 
-// Decoded source and typed scalar call queries are retained once per cache source.
-struct ShaderSource {
-	struct Call {
-		uint32_t instruction;
-		std::array<IR::Value, 2> target;
-		std::bitset<128> preserved_registers;
-		uint64_t address = 0;
-	};
-	struct Linked {
-		struct Function { uint32_t offset; uint32_t size; };
-		std::vector<uint32_t> code;
-		Decoder::Program decoded;
-		std::vector<Function> functions;
-		std::vector<uint32_t> observed_function;
-	};
-	std::vector<uint32_t> code;
-	Decoder::Program decoded;
-	IR::ResourcePlan call_targets;
-	std::vector<Call> calls;
-	uint32_t unsupported_call_pc = UINT32_MAX;
-	std::optional<Linked> linked;
-	uint64_t revision = 0;
-	std::vector<std::pair<uint64_t, uint64_t>> reads;
-};
-
-[[nodiscard]] const char* StageName(ShaderType stage);
-[[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
-	                                           const CompileOptions& options);
-const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
-[[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
-	                                           const CompileOptions& options);
+// Storage buffer accesses without an explicit bounds check where the device checks them the same
+// way: robustBufferAccess2 with byte-exact ranges (robustStorageBufferAccessSizeAlignment 1) reads
+// zero out of bounds and drops the stores. Set with the device, before any program compiles.
+void SetDeviceStorageBufferBounds(bool enabled);
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
@@ -80,6 +51,8 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
                                            const CompileOptions& options,
                                            const IR::ResourceSpecialization& specialization,
 	                                       uint32_t push_data_start_dword = 0);
+// A CompileResult's SPIR-V the caller is done with: the thread's next CompileProgram writes its module there.
+void RecycleSpirv(std::vector<uint32_t>&& spirv);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

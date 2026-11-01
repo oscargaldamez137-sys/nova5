@@ -4,20 +4,37 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "live-census.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <fmt/format.h>
 
 namespace Libs::Graphics {
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
+}
+
+uint32_t render_target_write_mask_slot(uint32_t target_mask, uint32_t shader_mask, uint32_t slot) {
+	static const bool ignore_shader_mask = [] {
+		const char* value = std::getenv("KYTY_IGNORE_CB_SHADER_MASK");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto slot_mask = render_target_mask_slot(target_mask, slot);
+	if (ignore_shader_mask || render_target_mask_slot(shader_mask, slot) != 0) {
+		return slot_mask;
+	}
+	return 0;
 }
 
 static bool RenderTargetMaskHasMrt(uint32_t mask) {
@@ -34,7 +51,8 @@ static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 
 	uint32_t bound_targets = 0;
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0 &&
+		    hw.GetRenderTarget(i).info.format != Prospero::ChannelLayout::kInvalid) {
 			bound_targets++;
 		}
 	}
@@ -46,7 +64,8 @@ uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0 &&
+		    hw.GetRenderTarget(i).info.format != Prospero::ChannelLayout::kInvalid) {
 			return i;
 		}
 	}
@@ -56,7 +75,7 @@ uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 
 bool graphics_debug_dump_enabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
+	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
 }
 
 void uc_print(const char* func, const HW::UserConfig& uc) {
@@ -88,75 +107,91 @@ void uc_check(const HW::UserConfig& uc) {
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr3 != false);
 }
 
-std::string rt_print(const char* func, const HW::RenderTarget& rt) {
-	std::string dst;
-	dst.reserve(4096);
+void sh_print(const char* func, const HW::Shader& /*uc*/) {
+	LOGF("%s\n", func);
+}
 
-	dst += fmt::format("{}\n", func);
+std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) {
+	std::vector<std::string> dst;
+	dst.reserve(40);
 
-	dst += fmt::format("\t base.addr                       = 0x{:016x}\n", rt.base.addr);
-	dst += fmt::format("\t view.base_array_slice_index     = 0x{:08x}\n",
-	                  rt.view.base_array_slice_index);
-	dst += fmt::format("\t view.last_array_slice_index     = 0x{:08x}\n",
-	                  rt.view.last_array_slice_index);
-	dst += fmt::format("\t view.current_mip_level          = 0x{:08x}\n", rt.view.current_mip_level);
-	dst += fmt::format("\t info.fmask_compression_enable   = {}\n",
-	                  rt.info.fmask_compression_enable ? "true" : "false");
+	dst.push_back(fmt::format("{}\n", func));
 
-	dst += fmt::format("\t info.fmask_data_compression_disable = {}\n",
-	                  rt.info.fmask_data_compression_disable ? "true" : "false");
-	dst += fmt::format("\t info.fmask_one_frag_mode        = {}\n",
-	                  rt.info.fmask_one_frag_mode ? "true" : "false");
+	dst.push_back(fmt::format("\t base.addr                       = 0x{:016x}\n", rt.base.addr));
+	dst.push_back(fmt::format("\t view.base_array_slice_index     = 0x{:08x}\n",
+	                          rt.view.base_array_slice_index));
+	dst.push_back(fmt::format("\t view.last_array_slice_index     = 0x{:08x}\n",
+	                          rt.view.last_array_slice_index));
+	dst.push_back(
+	    fmt::format("\t view.current_mip_level          = 0x{:08x}\n", rt.view.current_mip_level));
+	dst.push_back(fmt::format("\t info.fmask_compression_enable   = {}\n",
+	                          rt.info.fmask_compression_enable ? "true" : "false"));
 
-	dst += fmt::format("\t info.cmask_fast_clear_enable    = {}\n",
-	                  rt.info.cmask_fast_clear_enable ? "true" : "false");
-	dst += fmt::format("\t info.dcc_compression_enable     = {}\n",
-	                  rt.info.dcc_compression_enable ? "true" : "false");
-	dst += fmt::format("\t info.format                     = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.info.format));
-	dst += fmt::format("\t info.channel_type               = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.info.channel_type));
-	dst += fmt::format("\t info.channel_order              = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.info.channel_order));
-	dst += fmt::format("\t info.blend_bypa                 = {}\n",
-	                  rt.info.blend_bypass ? "true" : "false");
-	dst += fmt::format("\t info.blend_clamp                = {}\n",
-	                  rt.info.blend_clamp ? "true" : "false");
-	dst += fmt::format("\t info.round_mode                 = {}\n",
-	                  rt.info.round_mode ? "true" : "false");
-	dst += fmt::format("\t attrib.force_dest_alpha_to_one  = {}\n",
-	                  rt.attrib.force_dest_alpha_to_one ? "true" : "false");
-	dst += fmt::format("\t attrib.num_samples              = 0x{:08x}\n", rt.attrib.num_samples);
-	dst += fmt::format("\t attrib.num_fragments            = 0x{:08x}\n", rt.attrib.num_fragments);
-	dst += fmt::format("\t attrib2.width                   = 0x{:08x}\n", rt.attrib2.width);
-	dst += fmt::format("\t attrib2.height                  = 0x{:08x}\n", rt.attrib2.height);
-	dst += fmt::format("\t attrib2.num_mip_levels          = 0x{:08x}\n", rt.attrib2.num_mip_levels);
-	dst += fmt::format("\t attrib3.depth                   = 0x{:08x}\n", rt.attrib3.depth);
-	dst += fmt::format("\t attrib3.tile_mode               = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.attrib3.tile_mode));
-	dst += fmt::format("\t attrib3.dimension               = 0x{:08x}\n", rt.attrib3.dimension);
-	dst += fmt::format("\t attrib3.metadata_pipe_aligned   = {}\n",
-	                  rt.attrib3.metadata_pipe_aligned ? "true" : "false");
-	dst += fmt::format("\t attrib3.write_vrs_rate_hint_to_cmask = {}\n",
-	                  rt.attrib3.write_vrs_rate_hint_to_cmask ? "true" : "false");
-	dst += fmt::format("\t dcc.max_uncompressed_block_size = 0x{:08x}\n",
-	                  rt.dcc.max_uncompressed_block_size);
-	dst += fmt::format("\t dcc.max_compressed_block_size   = 0x{:08x}\n",
-	                  rt.dcc.max_compressed_block_size);
-	dst += fmt::format("\t dcc.color_transform             = 0x{:08x}\n", rt.dcc.color_transform);
-	dst += fmt::format("\t dcc.overwrite_combiner_disable  = {}\n",
-	                  rt.dcc.overwrite_combiner_disable ? "true" : "false");
-	dst += fmt::format("\t dcc.independent_block_size      = 0x{:02x}\n",
-	                  static_cast<uint8_t>(rt.dcc.independent_block_size));
-	dst += fmt::format("\t data_write_on_dcc_clear_to_reg  = {}\n",
-	                  rt.dcc.data_write_on_dcc_clear_to_reg ? "true" : "false");
-	dst += fmt::format("\t dcc.dcc_clear_key_enable        = {}\n",
-	                  rt.dcc.dcc_clear_key_enable ? "true" : "false");
-	dst += fmt::format("\t cmask.addr                      = 0x{:016x}\n", rt.cmask.addr);
-	dst += fmt::format("\t fmask.addr                      = 0x{:016x}\n", rt.fmask.addr);
-	dst += fmt::format("\t clear_word0.word0               = 0x{:08x}\n", rt.clear_word0.word0);
-	dst += fmt::format("\t clear_word1.word1               = 0x{:08x}\n", rt.clear_word1.word1);
-	dst += fmt::format("\t dcc_addr.addr                   = 0x{:016x}\n", rt.dcc_addr.addr);
+	// dst.push_back(fmt::format("\t info.fmask_compression_mode     = 0x{:08x}\n", //
+	// rt.info.fmask_compression_mode));
+	dst.push_back(fmt::format("\t info.fmask_data_compression_disable = {}\n",
+	                          rt.info.fmask_data_compression_disable ? "true" : "false"));
+	dst.push_back(fmt::format("\t info.fmask_one_frag_mode        = {}\n",
+	                          rt.info.fmask_one_frag_mode ? "true" : "false"));
+
+	dst.push_back(fmt::format("\t info.cmask_fast_clear_enable    = {}\n",
+	                          rt.info.cmask_fast_clear_enable ? "true" : "false"));
+	dst.push_back(fmt::format("\t info.dcc_compression_enable     = {}\n",
+	                          rt.info.dcc_compression_enable ? "true" : "false"));
+	dst.push_back(fmt::format("\t info.format                     = 0x{:08x}\n",
+	                          static_cast<uint32_t>(rt.info.format)));
+	dst.push_back(fmt::format("\t info.channel_type               = 0x{:08x}\n",
+	                          static_cast<uint32_t>(rt.info.channel_type)));
+	dst.push_back(fmt::format("\t info.channel_order              = 0x{:08x}\n",
+	                          static_cast<uint32_t>(rt.info.channel_order)));
+	dst.push_back(fmt::format("\t info.blend_bypa                 = {}\n",
+	                          rt.info.blend_bypass ? "true" : "false"));
+	dst.push_back(fmt::format("\t info.blend_clamp                = {}\n",
+	                          rt.info.blend_clamp ? "true" : "false"));
+	dst.push_back(fmt::format("\t info.round_mode                 = {}\n",
+	                          rt.info.round_mode ? "true" : "false"));
+	dst.push_back(fmt::format("\t attrib.force_dest_alpha_to_one  = {}\n",
+	                          rt.attrib.force_dest_alpha_to_one ? "true" : "false"));
+	dst.push_back(
+	    fmt::format("\t attrib.num_samples              = 0x{:08x}\n", rt.attrib.num_samples));
+	dst.push_back(
+	    fmt::format("\t attrib.num_fragments            = 0x{:08x}\n", rt.attrib.num_fragments));
+	dst.push_back(fmt::format("\t attrib2.width                   = 0x{:08x}\n", rt.attrib2.width));
+	dst.push_back(
+	    fmt::format("\t attrib2.height                  = 0x{:08x}\n", rt.attrib2.height));
+	dst.push_back(
+	    fmt::format("\t attrib2.num_mip_levels          = 0x{:08x}\n", rt.attrib2.num_mip_levels));
+	dst.push_back(fmt::format("\t attrib3.depth                   = 0x{:08x}\n", rt.attrib3.depth));
+	dst.push_back(fmt::format("\t attrib3.tile_mode               = 0x{:08x}\n",
+	                          static_cast<uint32_t>(rt.attrib3.tile_mode)));
+	dst.push_back(
+	    fmt::format("\t attrib3.dimension               = 0x{:08x}\n", rt.attrib3.dimension));
+	dst.push_back(fmt::format("\t attrib3.metadata_pipe_aligned   = {}\n",
+	                          rt.attrib3.metadata_pipe_aligned ? "true" : "false"));
+	dst.push_back(fmt::format("\t attrib3.write_vrs_rate_hint_to_cmask = {}\n",
+	                          rt.attrib3.write_vrs_rate_hint_to_cmask ? "true" : "false"));
+	dst.push_back(fmt::format("\t dcc.max_uncompressed_block_size = 0x{:08x}\n",
+	                          rt.dcc.max_uncompressed_block_size));
+	dst.push_back(fmt::format("\t dcc.max_compressed_block_size   = 0x{:08x}\n",
+	                          rt.dcc.max_compressed_block_size));
+	dst.push_back(
+	    fmt::format("\t dcc.color_transform             = 0x{:08x}\n", rt.dcc.color_transform));
+	dst.push_back(fmt::format("\t dcc.overwrite_combiner_disable  = {}\n",
+	                          rt.dcc.overwrite_combiner_disable ? "true" : "false"));
+	dst.push_back(fmt::format("\t dcc.independent_block_size      = 0x{:02x}\n",
+	                          static_cast<uint8_t>(rt.dcc.independent_block_size)));
+	dst.push_back(fmt::format("\t data_write_on_dcc_clear_to_reg  = {}\n",
+	                          rt.dcc.data_write_on_dcc_clear_to_reg ? "true" : "false"));
+	dst.push_back(fmt::format("\t dcc.dcc_clear_key_enable        = {}\n",
+	                          rt.dcc.dcc_clear_key_enable ? "true" : "false"));
+	dst.push_back(fmt::format("\t cmask.addr                      = 0x{:016x}\n", rt.cmask.addr));
+	dst.push_back(fmt::format("\t fmask.addr                      = 0x{:016x}\n", rt.fmask.addr));
+	dst.push_back(
+	    fmt::format("\t clear_word0.word0               = 0x{:08x}\n", rt.clear_word0.word0));
+	dst.push_back(
+	    fmt::format("\t clear_word1.word1               = 0x{:08x}\n", rt.clear_word1.word1));
+	dst.push_back(
+	    fmt::format("\t dcc_addr.addr                   = 0x{:016x}\n", rt.dcc_addr.addr));
 
 	return dst;
 }
@@ -209,16 +244,28 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		}
 		if (rt.info.fmask_compression_enable) {
 			EXIT_NOT_IMPLEMENTED(rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
-			// Native MSAA stores expanded samples, independent of FMASK metadata compression.
 			static bool logged = false;
 			if (!logged) {
-				LOGF("RenderTarget: using expanded native Vulkan MSAA samples, "
+				LOGF("RenderTarget: using native Vulkan MSAA without guest FMASK metadata, "
 				     "fmask=0x%016" PRIx64 "\n",
 				     rt.fmask.addr);
 				logged = true;
 			}
 		}
 
+		EXIT_NOT_IMPLEMENTED(rt.info.fmask_data_compression_disable != false);
+
+		if (rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 color metadata fast_clear=%s dcc=%s "
+				     "cmask=0x%016" PRIx64 " dcc_addr=0x%016" PRIx64 "\n",
+				     rt.info.cmask_fast_clear_enable ? "true" : "false",
+				     rt.info.dcc_compression_enable ? "true" : "false", rt.cmask.addr,
+				     rt.dcc_addr.addr);
+				logged = true;
+			}
+		}
 		if (rt.info.blend_bypass) {
 			static bool logged = false;
 			if (!logged) {
@@ -294,6 +341,16 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
+		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
+		    rt.dcc_addr.addr != 0x0000000000000000) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
+				     " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
+				     rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
+				logged = true;
+			}
+		}
 	}
 }
 
@@ -373,9 +430,10 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 static void ClipCheck(const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	EXIT_NOT_IMPLEMENTED(c.user_clip_plane_mode != 0 || c.vertex_kill_any ||
-	                     c.user_clip_plane_negate_y || c.user_clip_plane_cull_only ||
-	                     c.cull_on_clipping_error_disable || c.force_viewport_index_from_vs_enable);
+	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
+	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
+	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
+	                     c.force_viewport_index_from_vs_enable);
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {
@@ -383,18 +441,24 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 
 	LOGF("\t depth_clear_enable       = %s\n"
 	     "\t stencil_clear_enable     = %s\n"
-	     "\t copy_depth_to_color      = %s\n"
-	     "\t copy_stencil_to_color    = %s\n"
 	     "\t resummarize_enable       = %s\n"
 	     "\t stencil_compress_disable = %s\n"
 	     "\t depth_compress_disable   = %s\n"
 	     "\t copy_centroid            = %s\n"
 	     "\t copy_sample              = %" PRIu8 "\n",
 	     c.depth_clear_enable ? "true" : "false", c.stencil_clear_enable ? "true" : "false",
-	     c.copy_depth_to_color ? "true" : "false", c.copy_stencil_to_color ? "true" : "false",
 	     c.resummarize_enable ? "true" : "false", c.stencil_compress_disable ? "true" : "false",
 	     c.depth_compress_disable ? "true" : "false", c.copy_centroid ? "true" : "false",
 	     c.copy_sample);
+}
+
+static void RcCheck(const HW::RenderControl& c) {
+	// EXIT_NOT_IMPLEMENTED(c.depth_clear_enable != false);
+	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
+	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
+	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
+	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
+	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
 }
 
 static void McPrint(const char* func, const HW::ModeControl& c) {
@@ -458,7 +522,8 @@ static void BcPrint(const char* func, const HW::BlendControl& c, const HW::Blend
 	     color.red, color.green, color.blue, color.alpha, cc.mode, cc.op);
 }
 
-static void BcCheck(const HW::BlendColor& color, const HW::ColorControl& cc) {
+static void BcCheck(const HW::BlendControl& /*c*/, const HW::BlendColor& color,
+                    const HW::ColorControl& cc) {
 	if (color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f || color.alpha != 0.0f) {
 		static bool logged = false;
 		if (!logged) {
@@ -520,6 +585,9 @@ static void DPrint(const char* func, const HW::DepthControl& c, const HW::Stenci
 	     sm.stencil_opval, sm.stencil_testval_bf, sm.stencil_mask_bf, sm.stencil_writemask_bf,
 	     sm.stencil_opval_bf);
 }
+
+static void DCheck(const HW::DepthControl& /*c*/, const HW::StencilControl& /*s*/,
+                   const HW::StencilMask& /*sm*/) {}
 
 static void EqaaPrint(const char* func, const HW::EqaaControl& c) {
 	LOGF("%s\n", func);
@@ -587,11 +655,27 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {
+	if (LiveCensus::g_draw_phases) {
+		// Local diagnostic (live census, draw phases): the phase this marker starts.
+		static constexpr const char* phases[] = {"ResolveRenderColorTarget", "ResolveRenderDepthTarget",
+		                                         "GetGraphicsPrograms",      "PrepareBindings",
+		                                         "PrepareVertexBuffers",     "CreatePipeline",
+		                                         "BeginRendering",           "DrawComplete"};
+		for (uint32_t i = 0; i < std::size(phases); ++i)
+			if (std::strcmp(phase, phases[i]) == 0) LiveCensus::MarkDrawPhase(i + 1);
+	}
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
 			LOGF("DrawPhase: %s %s\n", draw_name, phase);
 		}
+	}
+}
+
+void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id) {
+	if (graphics_debug_dump_enabled()) {
+		LOGF("PipelineTrace: %s VS=%" PRIu64 " PS=%" PRIu64 "\n", phase, vertex_program_id,
+		     pixel_program_id);
 	}
 }
 
@@ -819,10 +903,14 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
+	const auto& bc      = hw.GetBlendControl(rt_slot);
 	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
 	const auto& c       = hw.GetClipControl();
 	const auto& rc      = hw.GetRenderControl();
+	const auto& d       = hw.GetDepthControl();
+	const auto& s       = hw.GetStencilControl();
+	const auto& sm      = hw.GetStencilMask();
 	const auto& mc      = hw.GetModeControl();
 	const auto& eqaa    = hw.GetEqaaControl();
 	const auto& cc      = hw.GetColorControl();
@@ -845,10 +933,14 @@ void hw_check(const CommandBuffer& buffer) {
 	VpCheck(vp, smc);
 	log_phase("clip");
 	ClipCheck(c);
+	log_phase("rc");
+	RcCheck(rc);
+	log_phase("depth");
+	DCheck(d, s, sm);
 	log_phase("mode");
 	McCheck(mc);
 	log_phase("blend");
-	BcCheck(bclr, cc);
+	BcCheck(bc, bclr, cc);
 	log_phase("eqaa");
 	EqaaCheck(eqaa, ac);
 	log_phase("aa");
@@ -856,33 +948,14 @@ void hw_check(const CommandBuffer& buffer) {
 	log_phase("done");
 
 	if (graphics_debug_dump_enabled() && RenderTargetMaskHasBoundMrt(buffer)) {
-		const auto& sh = hw.GetShaderRegisters();
-		LOGF("MRT render target mask: 0x%08" PRIx32
-		     " export_modes={%u,%u,%u,%u,%u,%u,%u,%u}\n",
-		     hw.GetRenderTargetMask(), sh.target_output_mode[0], sh.target_output_mode[1],
-		     sh.target_output_mode[2], sh.target_output_mode[3], sh.target_output_mode[4],
-		     sh.target_output_mode[5], sh.target_output_mode[6], sh.target_output_mode[7]);
+		LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
 		for (uint32_t i = 0; i < 8; i++) {
 			const auto& mrt = hw.GetRenderTarget(i);
-			const auto& bc  = hw.GetBlendControl(i);
 			LOGF("\t RT%u addr=0x%010" PRIx64 " mask=0x%x fmt=0x%08" PRIx32
-			     " type=%u order=%u shader_mask=0x%x"
-			     " width=%u height=%u tile=%u blend=%u bypass=%u clamp=%u round_mode=%u"
-			     " samples=%u fragments=%u dcc=%u dcc_addr=0x%010" PRIx64
-			     " cmask_clear=%u cmask_addr=0x%010" PRIx64
-			     " dcc_clear_key=%u clear={%08" PRIx32 ",%08" PRIx32 "}\n",
+			     " width=%u height=%u tile=%u\n",
 			     i, mrt.base.addr, (hw.GetRenderTargetMask() >> (i * 4u)) & 0x0fu,
-			     static_cast<uint32_t>(mrt.info.format), static_cast<uint32_t>(mrt.info.channel_type),
-			     static_cast<uint32_t>(mrt.info.channel_order), (sh.m_cbShaderMask >> (i * 4u)) & 0x0fu,
-			     mrt.attrib2.width + 1, mrt.attrib2.height + 1,
-			     static_cast<uint32_t>(mrt.attrib3.tile_mode), static_cast<uint32_t>(bc.enable),
-			     static_cast<uint32_t>(mrt.info.blend_bypass), static_cast<uint32_t>(mrt.info.blend_clamp),
-			     static_cast<uint32_t>(mrt.info.round_mode), mrt.attrib.num_samples,
-			     mrt.attrib.num_fragments,
-			     static_cast<uint32_t>(mrt.info.dcc_compression_enable), mrt.dcc_addr.addr,
-			     static_cast<uint32_t>(mrt.info.cmask_fast_clear_enable), mrt.cmask.addr,
-			     static_cast<uint32_t>(mrt.dcc.dcc_clear_key_enable), mrt.clear_word0.word0,
-			     mrt.clear_word1.word1);
+			     static_cast<uint32_t>(mrt.info.format), mrt.attrib2.width + 1,
+			     mrt.attrib2.height + 1, static_cast<uint32_t>(mrt.attrib3.tile_mode));
 		}
 	}
 	if (rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&
@@ -926,7 +999,7 @@ void hw_print(const CommandBuffer& buffer) {
 		     hw.GetRenderTargetMask(), hw.GetDepthClearValue(), hw.GetStencilClearValue(),
 		     hw.GetLineWidth(), hw.GetPrimitiveResetIndex());
 
-		LOGF("%s", rt_print("RenderTraget:", rt).c_str());
+		LOGF("%s", Common::Concat(rt_print("RenderTraget:", rt), "").c_str());
 
 		ZPrint("DepthRenderTraget:", z);
 		VpPrint("ScreenViewport:", vp, smc);

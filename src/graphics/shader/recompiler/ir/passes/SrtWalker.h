@@ -3,149 +3,117 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <algorithm>
 #include <span>
-
-namespace Common::ReadbackProfile { struct Origin; }
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+class Value;
 
-// Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
-// root selects by GPU-computed byte offset. The host keeps them resident instead of
-// materializing them.
-struct ImageHeapRequest {
-	uint64_t             base  = 0;
-	uint64_t             size  = 0;
-	uint64_t             step  = 0;
-	uint64_t             first = 0;
-	uint64_t             count = 0;
-	const ImageResource* root  = nullptr;
-};
-
-struct ImageHeapView {
-	uint64_t                         slots      = 0; // Device address of one slot per heap dword.
-	uint32_t                         slot_count = 0; // Keys past it select a trailing null slot.
-	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
-};
-
-class ImageHeapSource {
-public:
-	// False when the host does not keep the table resident.
-	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
-
-protected:
-	~ImageHeapSource() = default;
-};
+using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemorySync   = bool (*)(void* userdata, uint64_t address, uint64_t size);
+// A rejected probe performs no read/sync; the original scalar sequence follows.
+using SrtMemorySpan = bool (*)(void*, uint64_t, uint32_t*, uint32_t count, bool clean);
+// The end of the guest mapping an address lies in (0: none).
+using SrtMappingEnd = uint64_t (*)(void*, uint64_t address);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
+	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
-	std::span<const uint32_t> workgroup_counts;
-	uint64_t                  indirect_args_address = 0;
-	ImageHeapSource*          image_heap            = nullptr;
-	// A nonfaulting, whole-range, live coherence check. No download or callbacks
-	// may be pumped by this reader. False retains the native protected load.
-	bool (*read_clean_memory)(uint64_t address, void* data, uint64_t bytes) = nullptr;
+	SrtMemorySync             sync_memory                = nullptr;
+	SrtMemorySpan             try_read_memory_span       = nullptr;
+	SrtMappingEnd             mapping_end                = nullptr; // (address probes: MaterializeResources)
 };
 
-class SrtReadCapture {
-public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
-	SrtRuntime ObservedRuntime();
+enum class RuntimeValueType { Any, Integer };
 
-private:
-	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
-
-	SrtRuntime                                  m_source;
-	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
-};
-
-// ReadOnlyControlInteger excludes native reads that may overlap writes to their
-// buffer when projecting optional host control, retaining proven disjoint fixed
-// ranges. It is not a proof about aliases through other resources:
-// mandatory descriptor/SRT dependencies still require CommitBindings' checks.
-enum class RuntimeValueType { Any, Integer, ImmutableInteger, ReadOnlyControlInteger };
-
+// Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
+// dynamic offsets remain explicit and are never assigned a fake slot.
+void BuildSrtPlan(Program& program);
+void BuildLinearSrtPlan(ResourcePlan& program);
+// Rebuild only the derived predicate JIT after loading a plan whose linear JIT was retained.
+void BuildActivitySrtPlan(ResourcePlan& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
-// Uniform across a compute wave, including values derived from its workgroup ID.
-// This does not imply that the host can evaluate the value.
-bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
-// Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
-// only evaluates the values, with every block reachable.
-void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
-// Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load. False when a reachable read is unknown.
-bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads);
-// Results of the last walk; false when unknown.
-bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
-bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
-bool WalkedActive(const ResourcePlan& plan, uint32_t source);
-// Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
-// The exception handler completes such a load as a zero read.
-uint32_t SrtWalkerLoadLength(uint64_t rip);
-bool DescribeSrtWalkerRead(uint64_t rip, Common::ReadbackProfile::Origin& origin);
-// Pure proof of a bounded span of unconditional scalar roots sharing the exact
-// base operands. No guest reads, value caching, or assumption of immutability.
-bool SrtReadbackBatchRange(const ResourcePlan& plan, const ResourcePlan::WalkerReadSite& site,
-                           uint64_t fault, uint64_t& address, uint64_t& bytes);
-// Looks up the fault in the running walker, only while the A/B gate is active.
-bool RunningSrtReadbackBatchRange(uint64_t rip, uint64_t fault, uint64_t& address, uint64_t& bytes);
-// Called only after a real tracked read fault was handled, never for a clean-read bypass.
-// Remains enabled during fallback. Call on the originating walker thread AFTER
-// synchronous fault recovery returns, including recovery delegated to GuestGpu.
-bool NoteSrtControlReadback(uint64_t rip);
-// Called only for a recognized walker load (by its generated slow path or the
-// exception handler). Remembers a page hint, never values or alias pointers.
-bool SrtWalkerTryReadClean(uint64_t address, void* data, uint64_t bytes);
+                          RuntimeValueType type = RuntimeValueType::Any,
+                          std::string* reason = nullptr);
+bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
+                            const SrtRuntime& runtime, std::span<uint32_t> results);
 
-// Nonnegative affine coefficients: element zero is constant, remaining elements are
-// caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
-template <size_t Size>
-std::optional<std::array<uint64_t, Size>> AffineIndex(
-    Value value, const auto& resolve, const auto& leaf, uint32_t depth = 0) {
-	value = resolve(value);
-	if (depth > 32u || value.GetType() != Type::U32) return {};
-	std::array<uint64_t, Size> result {};
-	if (value.IsImmediate()) {
-		result[0] = value.U32();
-		return result;
-	}
-	if (const auto index = leaf(value)) {
-		result[*index] = 1u;
-		return result;
-	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) return {};
-	const auto op = inst->GetOpcode();
-	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
-	    op != ValueOpcode::ShiftLeftLogical32) return {};
-	auto left = AffineIndex<Size>(inst->Arg(0), resolve, leaf, depth + 1u);
-	auto right = AffineIndex<Size>(inst->Arg(1), resolve, leaf, depth + 1u);
-	if (!left || !right) return {};
-	const auto constant = [](const auto& coefficients) {
-		return std::ranges::all_of(std::span(coefficients).subspan(1u),
-		                          [](uint64_t coefficient) { return coefficient == 0u; });
+bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
+                              const SrtRuntime& runtime, DescriptorValue& result);
+
+// Evaluates one runtime snapshot transactionally. Scalar values and ReadConst results shared by
+// several descriptors are memoized once across the batch.
+bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results);
+
+// Evaluates potentially reachable descriptor sources and the flattened immediate SRT with one
+// memoized scalar walk. Inactive descriptors are zero; on failure no destination is changed.
+bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
+                            const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
+                            std::vector<uint8_t>& active_sources);
+
+bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
+             std::vector<uint32_t>& flat);
+
+// Every guest dword one linear SRT evaluation reads, split by use (native XPR
+// records). A `data` read reaches only the flattened SRT, unchanged: its flat
+// positions are plain copies of its address. Every other read - one feeding an
+// address, a descriptor dword or a computed value, or a clean read - is
+// `structural`, with the value it had. False when the program is not evaluated
+// by a single linear plan (no plan, control-flow variants, a failed read).
+struct SrtReadTrace {
+	// Why a read is structural (bits): it feeds another read's address (`Pointer`: as the low or high
+	// half of a pointer read's base, `Address`: otherwise), a descriptor dword, a computed value, or it
+	// is a control-flow predicate input.
+	enum Use : uint8_t { Address = 1, Descriptor = 2, Computed = 4, Predicate = 8, Pointer = 16 };
+	// What a pointer read's address is based on: user data pair `root` (user[k] | user[k + 1] << 32)
+	// or the values of the structural reads `low` and `high`, plus an offset that does not depend on it.
+	static constexpr uint8_t  NoRoot = 0xff;
+	static constexpr uint32_t NoBase = UINT32_MAX;
+	struct Base {
+		uint8_t  root = NoRoot;
+		uint32_t low = NoBase, high = NoBase;
 	};
-	if (op == ValueOpcode::IMul32 && !constant(*right)) std::swap(left, right);
-	if (op != ValueOpcode::IAdd32 && !constant(*right)) return {};
-	if (op == ValueOpcode::ShiftLeftLogical32) {
-		if ((*right)[0] >= 32u) return {};
-		(*right)[0] = uint64_t {1} << (*right)[0];
-	}
-	for (size_t index = 0; index < Size; ++index) {
-		(*left)[index] = op == ValueOpcode::IAdd32
-		    ? (*left)[index] + (*right)[index] : (*left)[index] * (*right)[0];
-		if ((*left)[index] > UINT32_MAX) return {};
-	}
-	return left;
-}
+	struct Read {
+		uint64_t address = 0;
+		uint32_t value   = 0;
+		bool     clean   = false;
+		uint8_t  use     = 0;
+		Base     base;
+	};
+	// Structural reads copied unchanged into a descriptor dword of the snapshot.
+	enum class Kind : uint8_t { Buffer, Image, Sampler };
+	struct Feed {
+		uint32_t read  = 0; // index into structural
+		Kind     kind  = Kind::Buffer;
+		uint32_t index = 0; // resource index in the snapshot
+		uint32_t dword = 0;
+	};
+	std::vector<std::pair<uint32_t, uint64_t>> data;       // (flat index, address)
+	std::vector<Base>                          data_bases; // per data read
+	bool                                       unrooted = false; // reads without their roots (the interpreter's)
+	std::vector<Read>                          structural;
+	std::vector<Feed>                          feeds;
+	// Structural reads that are also copied unchanged into the flattened SRT:
+	// (index into structural, flat index).
+	std::vector<std::pair<uint32_t, uint32_t>> flat_feeds;
+	size_t                                     flat_words = 0;
+};
+bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime, SrtReadTrace& trace);
+// How the SRT evaluation uses user data (bit k: user[k]): the words it may read, and the pairs
+// (user[k], user[k + 1]) its linear plan uses for nothing but the bases of its pointer reads (an
+// evaluation with another value there reads the same offsets from the new base). Every word and
+// no pair for a plan with control-flow variants, a uniform fill or indirect images.
+struct SrtUserDataUse {
+	uint32_t read     = UINT32_MAX;
+	uint32_t pointers = 0;
+};
+SrtUserDataUse UserDataUse(const ResourcePlan& program);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

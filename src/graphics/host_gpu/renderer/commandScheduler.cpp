@@ -1,21 +1,42 @@
-#include "common/gpuThreadSampler.h"
+#include "graphics/host_gpu/renderer/passTiming.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
-#include "common/debugCounters.h"
-#include "common/frameTimeline.h"
 #include "common/logging/log.h"
-#include "common/renderStageProfile.h"
-#include "common/submitProfile.h"
-#include "graphics/guest_gpu/submitProfileRuntime.h"
-#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/vkRecorderBackend.h"
+#include "anti-lag.h"
+#include "async-upload.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#include "device-fault.h"
+#endif
+#include "live-trace-gpu.h"
+#include "local-platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <optional>
+
+extern "C" {
+// Dispatches recorded per submission (KYTY_DISPATCH_BATCH).
+volatile std::atomic_uint32_t kyty_local_dispatch_batch {128};
+// Draws recorded per submission (KYTY_DRAW_BATCH, 0: no limit): about 0.5 ms of translated draws.
+volatile std::atomic_uint32_t kyty_local_draw_batch {256};
+// Buffer uploads of pages dirty since before the open command buffer began go into its upload prologue
+// (CommandScheduler::UploadPrologue).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_prologue {1};
+// 0: refresh the master timeline before every drain attempt.
+// 1: prove the pending-operation queue empty before the timeline query and the
+//    operation lock. Draws and dispatches call this with nothing to retire.
+volatile std::atomic<uint32_t> kyty_local_pending_drain_mode {1};
+// Flush points nothing waits on (a label without an interrupt, the end of a queue's slice) leave the open buffer open
+// while the GPU still runs work it was handed (CommandScheduler::DeferrableFlush; KYTY_FLUSH_DEFER=0: flush at once).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_defer {2};
+}
 
 namespace Libs::Graphics {
 
@@ -35,6 +56,7 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	if (result == vk::Result::eErrorDeviceLost) DeviceFault::Report();
 }
 
 } // namespace
@@ -104,66 +126,196 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	static const bool announced = [] {
-		std::fprintf(stderr, "[VK_RECORDER] phase=1 gameplay_supported=1 default=1 gate=command_boundary counters=cumulative\n");
-		return true;
-	}();
-	(void)announced;
+      m_command_pool(graphics, m_master), m_command(*this), m_prologue(*this),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_tick_monitor([this](std::stop_token stop) {
+	      LocalPlatform::SetThreadName("Kyty.TickMon");
+	      {
+		      vk::QueryPoolCreateInfo info {};
+		      info.queryType  = vk::QueryType::eTimestamp;
+		      info.queryCount = LiveTrace::TimestampSlots * 2u;
+		      vk::QueryPool pool {};
+		      if (m_graphics.device.createQueryPool(&info, nullptr, &pool) == vk::Result::eSuccess) {
+			      LiveTrace::g_timestamp_period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+			      LiveTrace::g_timestamp_pool   = static_cast<VkQueryPool>(pool);
+		      }
+		      // Per-draw marks (`tracem`): reset on the host, read after tracing stops.
+		      info.queryCount = LiveTrace::MarkSlots;
+		      vk::QueryPool marks {};
+		      if (m_graphics.device.createQueryPool(&info, nullptr, &marks) == vk::Result::eSuccess) {
+			      m_graphics.device.resetQueryPool(marks, 0, LiveTrace::MarkSlots);
+			      LiveTrace::g_mark_pool = static_cast<VkQueryPool>(marks);
+			      static vk::Device device = m_graphics.device;
+			      LiveTrace::g_read_marks = [](uint32_t count) {
+				      const auto            pool = static_cast<VkQueryPool>(LiveTrace::g_mark_pool);
+				      std::vector<uint64_t> values(count);
+				      if (count != 0 &&
+				          device.getQueryPoolResults(pool, 0, count, count * sizeof(uint64_t), values.data(),
+				                                     sizeof(uint64_t),
+				                                     vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait) ==
+				              vk::Result::eSuccess) {
+					      for (uint32_t i = 0; i < count; ++i)
+						      LiveTrace::Append(LiveTrace::GpuMarkValue, i,
+						                        static_cast<uint64_t>(static_cast<double>(values[i]) *
+						                                              LiveTrace::g_timestamp_period));
+				      }
+				      device.resetQueryPool(pool, 0, LiveTrace::MarkSlots);
+			      };
+		      }
+	      }
+	      uint64_t next = 0;
+	      while (!stop.stop_requested()) {
+		      if (!LiveTrace::g_on.load(std::memory_order_relaxed)) {
+			      next = 0;
+			      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			      continue;
+		      }
+		      if (next == 0) next = m_master.KnownGpuTick() + 1;
+		      vk::SemaphoreWaitInfo wait {};
+		      const auto            semaphore = m_master.Handle();
+		      wait.semaphoreCount           = 1;
+		      wait.pSemaphores              = &semaphore;
+		      wait.pValues                  = &next;
+		      if (m_graphics.device.waitSemaphores(&wait, 2000000) == vk::Result::eSuccess) {
+			      LiveTrace::Event(LiveTrace::TickDone, next);
+			      auto& mapped = LiveTrace::g_tick_slot[next % LiveTrace::TimestampSlots];
+			      if (const auto slot = mapped.exchange(0); slot != 0 && LiveTrace::g_timestamp_pool != nullptr) {
+				      uint64_t times[2] {};
+				      if (m_graphics.device.getQueryPoolResults(
+				              static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool), (slot - 1u) * 2u, 2u,
+				              sizeof(times), times, sizeof(uint64_t), vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
+					      LiveTrace::Event(LiveTrace::GpuSpan, next);
+					      LiveTrace::Event(LiveTrace::GpuSpanNs,
+					                       static_cast<uint64_t>(static_cast<double>(times[0]) * LiveTrace::g_timestamp_period),
+					                       static_cast<uint64_t>(static_cast<double>(times[1]) * LiveTrace::g_timestamp_period));
+				      }
+			      }
+			      ++next;
+		      }
+	      }
+      }) {}
+
+void CommandScheduler::CompleteDispatch() {
+	// Expose command-processor/GPU overlap without a host fence. Bound the
+	// recording batch; resource retirement still uses the submission timeline.
+	// The boundary costs one all-commands dependency, which lets no part of the
+	// next batch begin before this one drains, so its size trades that drain
+	// against how early the queue receives work. Dispatches inside a batch keep
+	// the same chain barriers at any size.
+	if (FlushedDeferred(4)) return;
+	const auto batch = std::clamp(kyty_local_dispatch_batch.load(std::memory_order_relaxed), 1u, 65536u);
+	if (++m_recorded_dispatches < batch) {
+		return;
+	}
+	// While the GPU still runs work handed to it the batch goes on (GpuBusy, asked at the batch's end and every 4
+	// dispatches after it), up to 8 batches.
+	if (m_recorded_dispatches < 8 * batch &&
+	    ((m_recorded_dispatches != batch && (m_recorded_dispatches & 3u) != 0) || GpuBusy())) {
+		return;
+	}
+	CheckActive();
+	m_command.EndRendering();
+	VulkanMemoryBarrier dependency {};
+	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	dependency.dstAccessMask = dependency.srcAccessMask;
+	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
+	                                   0, nullptr, 0, nullptr);
+	Flush();
+}
+
+// As CompleteDispatch for draws: a draw-heavy guest command buffer reaches the GPU in parts while it is still being
+// translated. Whole, the GPU idled through its translation (3-4.5 ms for the big passes) and ran it after, late into the
+// next frame, where the next frame's culling readbacks waited for it.
+void CommandScheduler::CompleteDraws(uint32_t draws) {
+	if (FlushedDeferred(draws)) return;
+	const auto batch = kyty_local_draw_batch.load(std::memory_order_relaxed);
+	if (batch == 0 || (m_recorded_draws += draws) < batch) {
+		return;
+	}
+	// As CompleteDispatch's: on while the GPU is busy (asked at the batch's end and about every 16 draws after it), up
+	// to 8 batches.
+	const bool end = m_recorded_draws - draws < batch;
+	if (m_recorded_draws < 8 * batch && ((!end && (m_recorded_draws & 15u) >= draws && draws < 16) || GpuBusy())) {
+		return;
+	}
+	CheckActive();
+	m_command.EndRendering();
+	VulkanMemoryBarrier dependency {};
+	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	dependency.dstAccessMask = dependency.srcAccessMask;
+	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
+	                                   0, nullptr, 0, nullptr);
+	Flush();
+}
+
+// A batch boundary gives the GPU work early, where it would idle through the batch's translation; while it still runs
+// work it was handed, the boundary gives it nothing it lacks and costs a drain on the GPU (~8 us between back-to-back
+// command buffers) and a submission on the recording worker (~13 us, half of it in the kernel; at 1-1 standing 141
+// submissions a frame were ~1 ms of the GPU's and ~1.8 ms of the worker's, whose lag left the GPU idle ~1.35 ms a frame
+// with work already submitted). The batch then goes on until the GPU has run what it was handed. Same-process A/B, 3-4
+// rounds each: 1-1 standing 60.2 -> 62.4 fps, low1 52.8 -> 56.0 (a boot paced at 60: low1 54.2 -> 55.6); Latria spin
+// 74.2 -> 75.9, low1 53.9 -> 55.4; Shrine standing unchanged (75.3 / 75.3).
+bool CommandScheduler::GpuBusy() {
+	const auto handed = m_driver_tick.load(std::memory_order_acquire);
+	if (m_master.IsFree(handed)) return false;
+	m_master.Refresh();
+	return !m_master.IsFree(handed);
+}
+
+// A flush point nothing waits on (a label without an interrupt, the end of a queue's slice: CommandProcessor::
+// BufferFlushDeferrable) while the GPU has kyty_local_flush_defer (or more) submissions still to run: the buffer stays
+// open, and goes with the next flush, or once the GPU is down to its last submission (FlushedDeferred: asked every 16
+// draws or 4 dispatches, so it never runs dry waiting for this one), or before the GPU thread waits for work
+// (FlushDeferred). Each submission costs the GPU a drain between back-to-back command buffers (~8 us) and the recording
+// worker a submission; ~118 a frame at 1-1, mostly labels and the async queues' slices. A flush while the GPU merely
+// still ran something (GpuBusy, as CompleteDraws asks) halved the submissions but starved the GPU after short ones.
+// (Ended as a submission ends it: the render pass and a compute chain's pending barrier, so the commands after it are
+// recorded as they would be into the next buffer.)
+void CommandScheduler::DeferrableFlush() {
+	if (const auto backlog = kyty_local_flush_defer.load(std::memory_order_relaxed);
+	    backlog != 0 && !m_command.IsInvalid() && BacklogAtLeast(backlog)) {
+		m_command.EndRendering();
+		(void)m_command.Handle();
+		m_flush_deferred = true;
+		return;
+	}
+	Flush();
+}
+
+void CommandScheduler::FlushDeferred() {
+	if (m_flush_deferred) Flush();
+}
+
+// While a flush is deferred, every 16 draws (or 4 dispatches: `weight`) whether the GPU is down to its last submission:
+// then the open buffer is submitted (true).
+bool CommandScheduler::FlushedDeferred(uint32_t weight) {
+	if (!m_flush_deferred) return false;
+	if ((m_deferred_checks += weight) < 16) return false;
+	m_deferred_checks = 0;
+	if (BacklogAtLeast(2)) return false;
+	Flush();
+	return true;
+}
+
+// The GPU's tick as last read is never ahead of it: the backlog it gives is never short. Under `count` that way, under
+// `count` for sure, without a timeline read (a system call on Linux' RADV, ~9 us; these polls asked ~400 times a frame
+// at 1-1, issue #80).
+bool CommandScheduler::BacklogAtLeast(uint64_t count) {
+	const auto backlog = [this] {
+		const auto submitted = m_master.CurrentTick() - 1;
+		const auto done      = m_master.KnownGpuTick();
+		return submitted > done ? submitted - done : 0;
+	};
+	if (backlog() < count) return false;
+	m_master.Refresh();
+	return backlog() >= count;
 }
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
-}
-
-void CommandScheduler::DrainRecorder(Common::CommandRecording::Drain reason) {
-	if (!m_recorder) return;
-	if (reason == Common::CommandRecording::Drain::WaitTick) {
-		using Site = Common::SubmitProfile::WaitSite;
-		switch (Common::SubmitProfile::CurrentWaitSite()) {
-		case Site::BufferReadback: case Site::ReadbackIndirectArgs: case Site::ReadbackColorMetadata:
-		case Site::ReadbackCpuReadFault: case Site::ReadbackCpuWriteInvalidate: case Site::FaultDownload:
-			reason = Common::CommandRecording::Drain::Readback; break;
-		case Site::StreamWrap: reason = Common::CommandRecording::Drain::Upload; break;
-		default: break;
-		}
-	}
-	m_recorder->DrainRecording(reason);
-}
-
-void CommandScheduler::SetRecorderEnabled(bool enabled) {
-	EXIT_NOT_IMPLEMENTED(InDeferredOperation());
-	if (enabled == (m_recorder && m_recorder->Enabled())) return;
-	const bool open = !m_command.IsInvalid();
-	if (open) Submit();
-	if (enabled && !m_recorder) {
-		// Construct on the actual command producer, not the renderer's startup
-		// thread: the transport binds its single producer at construction.
-		m_recorder = std::make_unique<VkRecording::Backend>(m_graphics, m_master);
-	}
-	// B->A waits for recording/queue-submit, NOT GPU completion. Queue order and
-	// the shared timeline protect native resources across both pools.
-	m_recorder->SetEnabled(enabled);
-	std::fprintf(stderr, "[VK_RECORDER_GATE] active=%u tick=%llu\n", enabled,
-	    static_cast<unsigned long long>(CurrentTick()));
-	if (!enabled) m_recorder->Report(stderr);
-	if (open) BeginCommand();
-}
-
-void CommandScheduler::RecorderFrame() {
-	if (!m_recorder || !m_recorder->Enabled()) return;
-	m_recorder->Frame();
-	if (++m_recorder_frames % 60 == 0) m_recorder->Report(stderr);
-}
-
-void CommandScheduler::StopRecorder() {
-	m_recorder_shutdown = true;
-	if (!m_recorder) return;
-	SetRecorderEnabled(false);
-	m_recorder->Stop();
-	m_recorder->Report(stderr);
-	m_recorder.reset(); // also destroys the transport on its producer thread
+	PassTiming::Shutdown(*this);
 }
 
 void CommandScheduler::Shutdown() {
@@ -186,12 +338,9 @@ void CommandScheduler::Shutdown() {
 		}
 		m_operation_state = OperationState::Draining;
 	}
-	Common::SubmitProfile::ReasonScope   reason(Common::SubmitProfile::Reason::Shutdown);
-	Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::Shutdown);
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	DrainRecorder(Common::CommandRecording::Drain::Shutdown);
 	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
 	DrainPriorityOperations();
@@ -200,7 +349,6 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
-	if (m_recorder) m_recorder->Stop();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
@@ -229,7 +377,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 
 void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
-		Current().EndRendering();
+		m_command.EndRendering();
 	}
 }
 
@@ -239,61 +387,58 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
-	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::Flush};
 	Submit(submit);
-	// Backend::Submit publishes the packet immediately. Keep preparing the next
-	// command while the owner records/submits this one. Consumers of its results
-	// wait on the native tick; switching to the direct pool drains in SetEnabled.
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
-	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::Flush};
 	const auto tick = Submit();
-	DrainRecorder(Common::CommandRecording::Drain::Finish);
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
-	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::Flush};
 	CheckActive();
-	Common::SubmitProfile::ReasonScope   reason(Common::SubmitProfile::Reason::Finish);
-	Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::Finish);
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	DrainRecorder(Common::CommandRecording::Drain::Finish);
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
 	PopPendingOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
-	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::Wait};
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
-		Common::SubmitProfile::ReasonScope reason(Common::SubmitProfile::Reason::WaitTick);
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		// Submit already published the work. Waiting for the native tick also
-		// guarantees it was submitted, without a separate recording round trip.
 		m_master.Wait(tick);
 		BeginNext();
 	} else {
-		// An older tick was already published by Submit. In particular, stream
-		// reuse must not publish/drain the CURRENT command merely to check an old
-		// (often already completed) allocation. Only wait for the required tick.
 		m_master.Wait(tick);
 	}
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// The pending queue is empty for the large majority of draws and dispatches.
+	// Refresh() issues a Vulkan timeline query and the drain takes the operation
+	// mutex, so let an atomic count prove there is nothing to retire first. The
+	// count is only a hint: the queue is still re-checked under the lock.
+	if (kyty_local_pending_drain_mode.load(std::memory_order_relaxed) != 0) {
+		if (m_pending_operation_count.load(std::memory_order_acquire) == 0) return;
+		// Nor while the oldest waits for a submission the driver has not been handed yet (the open buffer, or one still
+		// with the recording worker: the GPU cannot have run it), and no timeline read when the GPU was seen past it
+		// already (a system call each on Linux' RADV, issue #80).
+		const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+		if (front > m_driver_tick.load(std::memory_order_acquire)) return;
+		if (!m_master.IsFree(front)) m_master.Refresh();
+	} else {
+		m_master.Refresh();
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -304,52 +449,60 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_pending_front_tick.store(m_pending_operations.empty() ? UINT64_MAX : m_pending_operations.front().tick,
+			                           std::memory_order_relaxed);
+			m_pending_operation_count.fetch_sub(1, std::memory_order_relaxed);
 		}
 		WaitPriorityOperations(operation.tick);
-		Common::FrameTimeline::ContextScope timeline(operation.timeline_frame, operation.timeline_submission);
 		RunOperation(std::move(operation.callback));
 	}
 }
 
 uint64_t CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
-	return QueueOperation(std::move(operation), false);
-}
-
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
-}
-
-uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
-	const auto sequence = priority ? 0 : m_operation_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto sequence = m_deferred_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		const auto timeline = Common::FrameTimeline::Enabled() ? Common::FrameTimeline::context : Common::FrameTimeline::Context{};
-		queue.push({std::move(operation), CurrentTick(), timeline.frame, timeline.submission});
-		lock.unlock();
-		if (priority) {
-			m_operation_available.notify_one();
-		}
+		m_pending_operations.push({std::move(operation), CurrentTick()});
+		if (m_pending_operations.size() == 1) m_pending_front_tick.store(CurrentTick(), std::memory_order_relaxed);
+		m_pending_operation_count.fetch_add(1, std::memory_order_release);
 		return sequence;
 	}
-	if (g_deferred_callback_scheduler != this) {
-		m_operation_available.wait(lock,
-		                           [this] { return m_operation_state == OperationState::Closed; });
+	if (g_deferred_callback_scheduler == this) {
+		lock.unlock();
+		operation();
+		return sequence;
 	}
+	m_operation_available.wait(lock,
+	                           [this] { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
 	operation();
 	return sequence;
 }
 
-bool CommandScheduler::HasPendingPriorityOperations() {
-	std::lock_guard lock(m_operation_mutex);
-	return !m_priority_operations.empty() || m_priority_active;
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	CheckActive();
+	EXIT_IF(!operation);
+	std::unique_lock lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		m_priority_operations.push({std::move(operation), CurrentTick()});
+		lock.unlock();
+		m_operation_available.notify_one();
+		return;
+	}
+	if (g_deferred_callback_scheduler == this) {
+		lock.unlock();
+		operation();
+		return;
+	}
+	m_operation_available.wait(lock,
+	                           [this] { return m_operation_state == OperationState::Closed; });
+	lock.unlock();
+	operation();
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
-	Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::PriorityCallbacks);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -365,13 +518,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		Common::FrameTimeline::ContextScope timeline(operation.timeline_frame, operation.timeline_submission);
 		m_master.Wait(operation.tick);
+		LiveTrace::Event(LiveTrace::GpuDone, operation.tick);
 		if (!stop.stop_requested()) {
-			Common::FrameTimeline::Name("priority completions");
-			Common::FrameTimeline::Current(Common::FrameTimeline::Kind::PriorityBegin, operation.tick);
 			RunOperation(std::move(operation.callback));
-			Common::FrameTimeline::Current(Common::FrameTimeline::Kind::PriorityEnd, operation.tick);
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -390,9 +540,6 @@ void CommandScheduler::DrainPriorityOperations() {
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
-	Common::FrameTimeline::WaitScope timeline(Common::FrameTimeline::Kind::PriorityDrainBegin,
-	    Common::FrameTimeline::Kind::PriorityDrainEnd, tick);
-	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::PriorityWait};
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
@@ -418,62 +565,210 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
+bool CommandScheduler::Active() const noexcept {
+	return m_command.m_registers != nullptr;
+}
+
+uint64_t CommandScheduler::CurrentTick() const noexcept {
+	return m_master.CurrentTick();
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	EXIT_IF(m_command.IsInvalid());
+	CheckActive();
 	return m_command;
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
-	EXIT_IF(!m_command.IsInvalid());
-	// Only the guest command scheduler opts in. Present/UI schedulers remain
-	// direct; their queue operations keep the existing semaphore dependencies.
-	// BufferCache also calls this during RenderContext construction, before
-	// its m_gpu member exists. Use the producer's TLS, never HasGpu() there.
-	if (!m_recorder_shutdown && Common::SubmitProfile::VkRecorderManaged() && GuestGpu::IsGpuThread() &&
-	    this == &m_context.GetCommandScheduler()) {
-		const bool enabled = Common::SubmitProfile::VkRecorderEnabled();
-		if (enabled != (m_recorder && m_recorder->Enabled())) SetRecorderEnabled(enabled);
-	}
-	if (m_recorder && m_recorder->Enabled()) {
-		m_command.m_recorder = m_recorder.get();
-	} else m_command.m_buffer = m_command_pool.Commit();
+	EXIT_IF(!m_command.IsInvalid() || !m_prologue.IsInvalid());
+	++m_command_serial;
+	m_command_clock    = g_cpu_dirty_clock.load(std::memory_order_acquire);
+	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
-	m_context.GetGpuTimeProfile().OnBegin(*this, m_command);
 	m_context.GetGuestClock().OnBegin(*this, m_command);
-	m_dynamic_state.Invalidate();
+	LiveTrace::g_mark_command = static_cast<VkCommandBuffer>(m_command.m_buffer);
 	return m_command;
 }
 
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+namespace {
+// vkEndCommandBuffer + vkQueueSubmit executed by the recording worker, in order with
+// the commands it has replayed. The tick is assigned on the producer as before.
+struct DeferredSubmit {
+	VkCommandBuffer      commands[CommandScheduler::MaxSubmitEntries];
+	uint32_t             count;
+	VkQueue              queue;
+	Common::Mutex*       queue_mutex;
+	uint32_t             waits, signals;
+	VkSemaphore          wait_semaphores[SubmitInfo::MaxSemaphores];
+	uint64_t             wait_ticks[SubmitInfo::MaxSemaphores];
+	VkPipelineStageFlags wait_stages[SubmitInfo::MaxSemaphores];
+	VkSemaphore          signal_semaphores[SubmitInfo::MaxSemaphores];
+	uint64_t             signal_ticks[SubmitInfo::MaxSemaphores];
+	uint64_t             tick;
+	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies these buffers read
+	uint32_t             timestamp_slot;  // live trace (the last buffer the stream ends)
+	std::atomic<uint64_t>* driver_tick;   // CommandScheduler::m_driver_tick (GpuBusy)
+};
+void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
+                  const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
+	AsyncUpload::Wait(submit.upload_sequence);
+	LiveTrace::Event(LiveTrace::GpuSubmit, submit.tick, 1);
+	for (uint32_t i = 0; i < submit.count; ++i) {
+		if (submit.timestamp_slot != UINT32_MAX && i + 1 == submit.count && LiveTrace::g_timestamp_pool != nullptr) {
+			dispatch.vkCmdWriteTimestamp(submit.commands[i], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			                             static_cast<VkQueryPool>(LiveTrace::g_timestamp_pool),
+			                             submit.timestamp_slot * 2u + 1u);
+			LiveTrace::g_tick_slot[submit.tick % LiveTrace::TimestampSlots].store(submit.timestamp_slot + 1u,
+			                                                                        std::memory_order_release);
+		}
+		if (dispatch.vkEndCommandBuffer(submit.commands[i]) != VK_SUCCESS) {
+			EXIT("deferred vkEndCommandBuffer failed, tick=%" PRIu64 "\n", submit.tick);
+		}
+	}
+	VkTimelineSemaphoreSubmitInfo timeline {};
+	timeline.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+	timeline.waitSemaphoreValueCount   = submit.waits;
+	timeline.pWaitSemaphoreValues      = submit.wait_ticks;
+	timeline.signalSemaphoreValueCount = submit.signals;
+	timeline.pSignalSemaphoreValues    = submit.signal_ticks;
+	VkSubmitInfo info {};
+	info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	info.pNext                = &timeline;
+	info.waitSemaphoreCount   = submit.waits;
+	info.pWaitSemaphores      = submit.wait_semaphores;
+	info.pWaitDstStageMask    = submit.wait_stages;
+	info.commandBufferCount   = submit.count;
+	info.pCommandBuffers      = submit.commands;
+	info.signalSemaphoreCount = submit.signals;
+	info.pSignalSemaphores    = submit.signal_semaphores;
+	for (uint32_t i = 0; i < submit.signals; ++i) {
+		if (submit.signal_ticks[i] != submit.tick) continue;
+		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count, // NOLINT
+		                        submit.wait_semaphores, submit.wait_ticks, submit.waits);
+		break;
+	}
+	VkResult result;
+	{
+		Common::LockGuard lock(*submit.queue_mutex);
+		result = Libs::Graphics::AntiLag::QueueSubmit(submit.queue, info, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2);
+	}
+	if (result != VK_SUCCESS) {
+		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
+		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
+	}
+	submit.driver_tick->store(submit.tick, std::memory_order_release);
+	LocalVulkanRecording::NoteDeferredSubmitDone();
+}
+} // namespace
+#endif
+
+vk::CommandBuffer CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t written_serial) {
+	if (kyty_local_upload_prologue.load(std::memory_order_relaxed) == 0 ||
+	    m_command.IsInvalid() || last_dirty > m_command_clock || written_serial == m_command_serial)
+		return nullptr;
+	if (m_prologue.IsInvalid()) {
+		// (Committed for the open buffer's submission: the pool reuses it once that completes.)
+		m_prologue.m_buffer = m_command_pool.Commit();
+		m_prologue.Begin();
+		// The copies after everything submitted before (which may read or write their destinations).
+		VulkanMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		m_prologue.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+		                                    {}, 1, &before, 0, nullptr, 0, nullptr);
+	}
+	return m_prologue.Handle();
+}
+
+CommandScheduler::SubmitEntry CommandScheduler::ClosePrologue() {
+	if (m_prologue_hook) m_prologue_hook(m_prologue.Handle());
+	// Everything after the copies (the open buffer's commands) sees them.
+	VulkanMemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_prologue.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {},
+	                                    1, &after, 0, nullptr, 0, nullptr);
+	const SubmitEntry entry {m_prologue.m_buffer, UINT32_MAX};
+	m_prologue.m_buffer = nullptr;
+	return entry;
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
-	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::Submit};
-	// Includes ending the command buffer, the queue mutex and the Vulkan call.
-	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::Submit};
 	EXIT_IF(m_command.IsInvalid());
+	m_command.EndRendering();
+	// A compute chain's pending barrier closes this buffer (left pending, the next Begin recorded it into a buffer
+	// that had not begun).
+	(void)m_command.Handle();
+	std::array<SubmitEntry, 2> entries {};
+	size_t                     n = 0;
+	if (!m_prologue.IsInvalid()) entries[n++] = ClosePrologue();
+	entries[n++]          = {m_command.m_buffer, m_command.m_timestamp_slot};
+	const auto tick       = SubmitBuffers({entries.data(), n}, submit);
+	m_command.m_buffer    = nullptr;
+	m_recorded_dispatches = 0;
+	m_recorded_draws      = 0;
+	m_flush_deferred      = false;
+	return tick;
+}
+
+uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+	// The work may run once submitted: the pages it writes are read-protected first.
+	PageManager::FlushDeferredProtection();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	EXIT_IF(m_graphics.queue == nullptr || entries.empty() || entries.size() > MaxSubmitEntries);
 
-	// Put the diagnostic BOTTOM timestamp after the existing final rendering
-	// end (including attachment stores). End() then sees rendering already closed;
-	// this does not add a pass break, flush, barrier or submit.
-	if (Common::FrameTimeline::Recording()) m_command.EndRendering();
-	m_context.GetGpuTimeProfile().OnSubmit(*this, m_command, CurrentTick());
-	m_command.End();
-	if (m_command.m_recorder) {
-		const bool trace = this == &m_context.GetCommandScheduler() && Common::FrameTimeline::Recording();
-		const auto timeline = trace ? Common::FrameTimeline::context : Common::FrameTimeline::Context {};
-		const auto tick = m_recorder->Submit(submit, timeline.frame, timeline.submission, trace);
-		m_command.m_recorder = nullptr;
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
-		if (Common::SubmitProfile::Recording()) Common::SubmitProfile::RecordSubmit(SubmitProfileRuntime::ThreadId());
-		return tick;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LocalVulkanRecording::DeferredSubmitEnabled()) {
+		DeferredSubmit deferred {};
+		// This thread alone allocates ticks and the worker submits them in stream order: no queue
+		// lock here (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
+		deferred.tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), deferred.tick);
+		deferred.count          = static_cast<uint32_t>(entries.size());
+		deferred.timestamp_slot = UINT32_MAX;
+		deferred.driver_tick    = &m_driver_tick;
+		for (size_t i = 0; i < entries.size(); ++i) {
+			deferred.commands[i]    = entries[i].buffer;
+			deferred.timestamp_slot = entries[i].timestamp_slot;
+		}
+		deferred.upload_sequence = AsyncUpload::SubmitSequence();
+		deferred.queue           = m_graphics.queue;
+		deferred.queue_mutex     = &m_graphics.queue_mutex;
+		deferred.waits           = submit.num_wait_semaphores;
+		deferred.signals         = submit.num_signal_semaphores;
+		for (uint32_t i = 0; i < deferred.waits; ++i) {
+			deferred.wait_semaphores[i] = submit.wait_semaphores[i];
+			deferred.wait_ticks[i]      = submit.wait_ticks[i];
+			deferred.wait_stages[i]     = static_cast<VkPipelineStageFlags>(submit.wait_stages[i]);
+		}
+		for (uint32_t i = 0; i < deferred.signals; ++i) {
+			deferred.signal_semaphores[i] = submit.signal_semaphores[i];
+			deferred.signal_ticks[i]      = submit.signal_ticks[i];
+		}
+		const LocalVulkanRecording::Segment segments[] {{&deferred, sizeof(deferred)}};
+		LocalVulkanRecording::NoteDeferredSubmitQueued();
+		if (!LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) {
+			// Keep order: everything recorded so far, then this exact submit.
+			LocalVulkanRecording::Drain();
+			ReplaySubmit(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
+		}
+		LiveTrace::Event(LiveTrace::GpuSubmit, deferred.tick);
+		return deferred.tick;
 	}
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+#endif
+	std::array<vk::CommandBuffer, MaxSubmitEntries> buffers {};
+	for (size_t i = 0; i < entries.size(); ++i) {
+		buffers[i] = entries[i].buffer;
+		EXIT_NOT_IMPLEMENTED(buffers[i].end() != vk::Result::eSuccess);
+	}
+	auto& graphics = m_graphics;
+	AsyncUpload::Drain();
 
 	vk::Result result;
 	uint64_t   tick;
@@ -493,19 +788,23 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = static_cast<uint32_t>(entries.size());
+		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
+		DeviceFault::NoteSubmit((uint64_t)(static_cast<VkSemaphore>(m_master.Handle())), tick, // NOLINT
+		                        reinterpret_cast<const VkCommandBuffer*>(buffers.data()),
+		                        static_cast<uint32_t>(entries.size()),
+		                        reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()), submit.wait_ticks.data(),
+		                        submit.num_wait_semaphores);
+#endif
 
-		if (this == &m_context.GetCommandScheduler()) {
-			Common::FrameTimeline::Current(Common::FrameTimeline::Kind::NativeSubmit, tick);
-		}
-		result = graphics.queue.submit(1, &submit_info, nullptr);
-	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
-	if (Common::SubmitProfile::Recording()) {
-		Common::SubmitProfile::RecordSubmit(SubmitProfileRuntime::ThreadId());
+		result = static_cast<vk::Result>(Libs::Graphics::AntiLag::QueueSubmit(
+		    static_cast<VkQueue>(graphics.queue), *reinterpret_cast<const VkSubmitInfo*>(&submit_info),
+		    VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit, VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit2));
+		m_driver_tick.store(tick, std::memory_order_release);
 	}
 
 	if (result != vk::Result::eSuccess) {
@@ -513,15 +812,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
+		EXIT("vkQueueSubmit failed: %s (%d), tick=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), tick);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	m_command.m_buffer = nullptr;
 	return tick;
 }
 
 void CommandScheduler::BeginNext() {
-	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::BeginNext};
 	CheckActive();
 	BeginCommand();
 }

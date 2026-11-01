@@ -45,6 +45,8 @@ struct GuestInstructionPatchResult {
 	uint64_t               control_flow_memory_instruction_count    = 0;
 	uint64_t               unrelocatable_memory_instruction_count   = 0;
 	uint64_t               indirect_red_zone_function_count         = 0;
+	uint64_t swept_instruction_count = 0;
+	uint64_t live_call_count = 0;
 	InstructionPatchCounts reciprocal_sqrt;
 	InstructionPatchCounts extrq;
 	InstructionPatchCounts insertq;
@@ -55,12 +57,17 @@ struct GuestInstructionPatchResult {
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
+// Only loader-inserted TLS calls have no guest stack arguments and need their
+// artificial return address kept below the red zone. Register after TLS rewrite.
+void RegisterGuestInstructionTlsCall(uintptr_t address);
 
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks.
+// precise_rsqrt=false is the automatic missing-ISA mode: valid VRSQRTPS stays native.
+// emulate_amd=false disables all CPU replacements, independently of protect_memory.
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
     bool protect_memory, bool emulate_amd,
-    GuestInstructionHostFeatures host_features = GetGuestInstructionHostFeatures());
+    GuestInstructionHostFeatures host_features = GetGuestInstructionHostFeatures(), bool precise_rsqrt = true);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);

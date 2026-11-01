@@ -3,42 +3,22 @@
 
 #include <cstdint>
 
-struct SDL_Window;
 union SDL_Event;
 
 namespace Libs::Graphics {
 
-struct HostInputTouchPadVisualState {
-	bool     enabled        = false;
-	bool     cursor_visible = true;
-	bool     drawing        = false;
-	bool     position_valid = false;
-	float    x              = 0.5f;
-	float    y              = 0.5f;
-	uint64_t revision       = 0;
-	uint64_t gesture        = 0;
-};
-
-void               HostInputInit(SDL_Window* window);
-void               HostInputShutdown();
+void               HostInputInit();
 void               HostInputKey(int key_code, bool down);
+// The keymap (--keymap) gives that key to a control of the pad.
+[[nodiscard]] bool HostInputMapsKey(int key_code);
+// Whether the keyboard's default keys count (false in the Steam Deck build unless KYTY_DECK_KEYBOARD=1: there Steam's
+// desktop layout sends keys for the Deck's own buttons).
+[[nodiscard]] bool HostInputDefaultKeysUsed();
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
-void               HostInputMouseTouchPad(bool down, float x, float y);
-void               HostInputMouseMotion(float x, float y);
-void               HostInputPadButton(int id, int sdl_button, bool down);
-void               HostInputPadTrigger(int id, bool left, int value);
-void               HostInputDisconnectGamepad(int id);
-void               HostInputSetTouchPadMode(bool enabled);
-// Main/window thread only. Releases guest mouse input and suspends relative mode.
-void               HostInputCaptureMouse(bool captured);
-void               HostInputToggleTouchPadMode();
-void               HostInputToggleGamepadTouchPad(int id);
-[[nodiscard]] bool HostInputGamepadDrawButton(int id, bool down);
-[[nodiscard]] bool HostInputGamepadAxis(int id, bool horizontal, int value);
-void               HostInputDisconnectGamepadTouchPad(int id);
-[[nodiscard]] HostInputTouchPadVisualState GetHostInputTouchPadVisualState();
+// Wheel notches (up > 0, down < 0) on the controls mapped to Mouse:WheelUp / Mouse:WheelDown: a short press each.
+void               HostInputMouseWheel(int notches);
 void               HostInputToggleMouseToJoystick();
-[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
+[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
 
 } // namespace Libs::Graphics
 

@@ -16,8 +16,9 @@
   const NOVA5 = {
     PPSA28997: { status: 'in-game', playable: true, title: 'God of War Sons of Sparta',
       note: 'Gameplay a 60 FPS estables, con sonido y control (Nova5 0.5.0 o posterior).' },
-    PPSA21564: { status: 'in-game', note: 'Jugable a unos 16–17 FPS en el aterrizaje de Sky Garden (RTX + CPU Intel).' },
-    PPSA03671: { note: 'Ya no se cierra al iniciar: Nova5 analiza sus shaders grandes sin desbordarse. Pendiente de jugar.' },
+    PPSA21564: { status: 'in-game', note: '50–60 FPS en el inicio y el mapa de la galaxia; Sky Garden con el cielo correcto a unos 19 FPS. Guarda y carga partidas (Nova5 0.7.0).' },
+    PPSA01341: { status: 'in-game', title: "Demon's Souls", note: '60 FPS a velocidad normal en el tutorial (Nova5 0.7.0).' },
+    PPSA03671: { note: 'Pendiente de comprobar con el motor de Nova5 0.7.0.' },
     PPSA14053: { status: 'in-game', playable: true, community: true, title: 'Afterimage', note: `60 FPS perfectos, audio correcto y sin fallos gráficos. ${report(529)}.` },
     PPSA20052: { status: 'in-game', playable: true, community: true, title: 'Worms Armageddon: Anniversary Edition', note: `60 FPS sólidos, sin fallos de audio ni gráficos. ${report(514)}.` },
     PPSA24643: { status: 'in-game', playable: true, community: true, title: 'The Messenger', note: `Unos 60 FPS; imagen, controles y audio correctos. ${report(311)}.` },

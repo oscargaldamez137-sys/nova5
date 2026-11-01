@@ -1,10 +1,21 @@
 #include "common/hostException.h"
+#include "common/termination.h"
+
+#include "common/guardedCopy.h"
+#include "common/platform/sysVirtual.h"
 
 #include <atomic>
 #include <cstdio>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
+#include <intrin.h> // __fastfail
+#include <stdlib.h> // _set_invalid_parameter_handler
 #else
 #include <algorithm>
 #include <csignal>
@@ -82,12 +93,187 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static std::atomic<GuardPageHandler> g_guard_page_handler {nullptr};
+
+void SetGuardPageHandler(GuardPageHandler handler) {
+	g_guard_page_handler.store(handler, std::memory_order_release);
+}
+
+static std::atomic<ReadGuardArm>    g_read_guard_arm {nullptr};
+static std::atomic<ReadGuardSettle> g_read_guard_settle {nullptr};
+
+void SetReadGuardHandlers(ReadGuardArm arm, ReadGuardSettle settle) {
+	g_read_guard_settle.store(settle, std::memory_order_release);
+	g_read_guard_arm.store(arm, std::memory_order_release);
+}
+
+static std::atomic<ProbeHandler> g_probe_handler {nullptr};
+
+void SetProbeHandler(ProbeHandler handler) {
+	g_probe_handler.store(handler, std::memory_order_release);
+}
+
+// RunOnGuestStack (pthread.cpp) runs guest code with the TEB's stack range set to the guest stacks' region
+// (KYTY_GUEST_TEB_STACK_RANGE_ASM; zeros where the host stack is not above it). Windows cannot dispatch an exception
+// through the guest frames there (guest code has no unwind data): the process ends with the exception's code, whatever
+// a frame would have done with it.
+static bool OnGuestStack() {
+	const auto* tib   = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+	const auto  base  = reinterpret_cast<uint64_t>(tib->StackBase);
+	const auto  limit = reinterpret_cast<uint64_t>(tib->StackLimit);
+	return (base == 0 && limit == 0) || (base == GuestStacksHigh && limit == GuestStacksLow);
+}
+
+// "module+0xoffset" of a code address (or the bare address).
+static void DescribeAddress(uint64_t address, char* out, size_t size) {
+	if (Termination::Describe(address, out, size)) return;
+	HMODULE module = nullptr;
+	char    path[MAX_PATH] {};
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(address), &module) != 0 &&
+	    GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+		const char* name = path;
+		for (const char* at = path; *at != '\0'; at++)
+			if (*at == '\\' || *at == '/') name = at + 1;
+		std::snprintf(out, size, "%s+0x%llx", name,
+		              static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(module)));
+	} else {
+		std::snprintf(out, size, "0x%llx", static_cast<unsigned long long>(address));
+	}
+}
+
+// A debug print (OutputDebugString raises DBG_PRINTEXCEPTION_C / _WIDE_C, which its own handler takes when no debugger
+// does) from a host library on a guest thread ended the emulator: SDL's disk audio driver logs when it opens, on the
+// game's audio thread (exit code 0x4001000A). There it continues as if a debugger had taken it (a debugger sees it
+// first anyway).
+[[gnu::noinline]] static LONG DebugPrintDisposition() {
+	return OnGuestStack() ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// A C++ exception's (0xE06D7363) type as the compiler names it: its ThrowInfo (image-relative on x64: parameter 2, the
+// image base 3) lists the types it can be caught as, the thrown type first. "" for other exceptions.
+static const char* CxxTypeName(const EXCEPTION_RECORD* record) {
+	if (record->ExceptionCode != 0xE06D7363u || record->NumberParameters < 4) return "";
+	const auto base       = static_cast<uint64_t>(record->ExceptionInformation[3]);
+	const auto throw_info = static_cast<uint64_t>(record->ExceptionInformation[2]);
+	if (base == 0 || throw_info == 0) return "";
+	const auto catchables = base + *reinterpret_cast<const uint32_t*>(throw_info + 12);
+	if (*reinterpret_cast<const int32_t*>(catchables) <= 0) return "";
+	const auto catchable = base + *reinterpret_cast<const uint32_t*>(catchables + 4);
+	return reinterpret_cast<const char*>(base + *reinterpret_cast<const uint32_t*>(catchable + 4) + 16);
+}
+
+// Any other exception this handler leaves to the frames: on a guest stack the process ends with no word from the
+// emulator, so the log gets one first (code, where, and a C++ exception's type).
+[[gnu::noinline]] static LONG UndeliverableDisposition(const EXCEPTION_RECORD* record) {
+	static std::atomic_uint32_t reports {0};
+	if (!OnGuestStack() || reports.fetch_add(1, std::memory_order_relaxed) >= 8) return EXCEPTION_CONTINUE_SEARCH;
+	Termination::Report("undeliverable-host-exception", record->ExceptionCode,
+	    reinterpret_cast<uint64_t>(record->ExceptionAddress), true);
+	char where[MAX_PATH + 32] {};
+	DescribeAddress(reinterpret_cast<uint64_t>(record->ExceptionAddress), where, sizeof(where));
+	const char* type = CxxTypeName(record);
+	for (FILE* stream: {stdout, stderr}) {
+		std::fprintf(stream,
+		             "Host exception 0x%08lx at %s on a guest stack (thread %lu)%s%s: Windows cannot deliver it there, "
+		             "the emulator will end\n",
+		             record->ExceptionCode, where, GetCurrentThreadId(), *type != '\0' ? ", C++ type " : "", type);
+		std::fflush(stream);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The ways the process ends with no word from the emulator, a fail fast (0xC0000409) for most: an exception nothing
+// handles (the C++ runtime's filter then calls std::terminate and abort), abort itself, a C runtime function's invalid
+// parameter. Each writes what and where to the log first (issue #56: an RTX 3080 PC ended at start-up with an empty log).
+static std::atomic_bool             g_fatal_reported {false};
+static LPTOP_LEVEL_EXCEPTION_FILTER g_previous_unhandled_filter = nullptr;
+
+static void ReportFatal(const char* what) {
+	g_fatal_reported.store(true, std::memory_order_relaxed);
+	void*      frames[32] {};
+	const auto count = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
+	for (FILE* stream: {stdout, stderr}) {
+		std::fprintf(stream, "Fatal: %s (thread %lu%s)\n", what, GetCurrentThreadId(),
+		             OnGuestStack() ? ", on a guest stack" : "");
+		for (USHORT i = 0; i < count; i++) {
+			char where[MAX_PATH + 32] {};
+			DescribeAddress(reinterpret_cast<uint64_t>(frames[i]), where, sizeof(where));
+			std::fprintf(stream, "  #%u %s\n", static_cast<unsigned>(i), where);
+		}
+		std::fflush(stream);
+	}
+}
+
+static LONG WINAPI OnUnhandledException(PEXCEPTION_POINTERS exception) {
+	const auto* record = exception->ExceptionRecord;
+	Termination::Report("unhandled-host-exception", record->ExceptionCode,
+	    reinterpret_cast<uint64_t>(record->ExceptionAddress), true);
+	char        where[MAX_PATH + 32] {};
+	DescribeAddress(reinterpret_cast<uint64_t>(record->ExceptionAddress), where, sizeof(where));
+	const char* type = CxxTypeName(record);
+	char        what[2 * MAX_PATH + 96] {};
+	std::snprintf(what, sizeof(what), "an exception nothing handled, code 0x%08lx at %s%s%s", record->ExceptionCode,
+	              where, *type != '\0' ? ", C++ type " : "", type);
+	ReportFatal(what);
+	return g_previous_unhandled_filter != nullptr ? g_previous_unhandled_filter(exception) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void OnAbort(int) {
+	if (!g_fatal_reported.load(std::memory_order_relaxed)) ReportFatal("abort");
+}
+
+static void OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t) {
+	ReportFatal("a C runtime function got an invalid parameter");
+	__fastfail(FAST_FAIL_INVALID_ARG);
+}
+
+static void InstallFatalReports() {
+	g_previous_unhandled_filter = SetUnhandledExceptionFilter(OnUnhandledException);
+	std::signal(SIGABRT, OnAbort);
+	_set_invalid_parameter_handler(OnInvalidParameter);
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
+	// A guest page's read guard (KYTY_READ_GUARD): served as the access violation no access raises.
+	bool read_guard = false;
+	if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+		// (First: guest stacks, whose guards the guard-page handler takes, lie among guest memory's addresses but are
+		// private memory, no view's.)
+		const auto arm = g_read_guard_arm.load(std::memory_order_acquire);
+		if (arm != nullptr && exception_record->NumberParameters >= 2 && arm(exception_record->ExceptionInformation[1])) {
+			read_guard = true;
+		} else {
+			const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
+			return handler != nullptr && exception_record->NumberParameters >= 2 &&
+			               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
+			           ? EXCEPTION_CONTINUE_EXECUTION
+			           : EXCEPTION_CONTINUE_SEARCH;
+		}
+	}
+	const bool access_violation = exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || read_guard;
+	const auto served           = [&] {
+		if (read_guard) g_read_guard_settle.load(std::memory_order_acquire)(exception_record->ExceptionInformation[1]);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	};
+
+	// A guarded copy reached a page without access: it stops there (never the guest's fault). (A read guard stays armed.)
+	if (access_violation && ResumeGuardedCopy(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	if (access_violation && exception_record->NumberParameters >= 2) {
+		if (const auto probe = g_probe_handler.load(std::memory_order_acquire);
+		    probe != nullptr &&
+		    probe(exception_record->ExceptionInformation[1], exception->ContextRecord->Rip, exception->ContextRecord,
+		          exception_record->ExceptionInformation[0] == 1))
+			return served();
+	}
+
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
-		return EXCEPTION_CONTINUE_SEARCH;
+		return DebugPrintDisposition();
 	}
 
 	if (exception_record->ExceptionCode == 0x406D1388) {
@@ -100,7 +286,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.native_code       = exception_record->ExceptionCode;
 	info.native_context    = exception->ContextRecord;
 
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+	if (access_violation) {
 		info.type = ExceptionType::AccessViolation;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
@@ -112,7 +298,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		return EXCEPTION_CONTINUE_SEARCH;
+		return UndeliverableDisposition(exception_record);
 	}
 
 	info.rax = exception->ContextRecord->Rax;
@@ -134,7 +320,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
-		return EXCEPTION_CONTINUE_EXECUTION;
+		return served();
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -213,8 +399,15 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 #else
 
 // x86-64 page-fault error bits.
+constexpr uint64_t PAGE_FAULT_ERROR_PRESENT     = 0x01;
 constexpr uint64_t PAGE_FAULT_ERROR_WRITE       = 0x02;
 constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION = 0x10;
+
+static std::atomic<ProbeHandler> g_probe_handler {nullptr};
+
+void SetProbeHandler(ProbeHandler handler) {
+	g_probe_handler.store(handler, std::memory_order_release);
+}
 
 // Let the kernel handle an unresolved fault on retry.
 static void ChainToDefault(int signal_number) noexcept {
@@ -237,6 +430,19 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
 		info.type             = ExceptionType::AccessViolation;
 		const auto error_code = static_cast<uint64_t>(gregs[REG_ERR]);
+		// A minor-mode page's missing PTE first (sysLinuxVirtual.cpp, KYTY_UFFD_MINOR): mapped again, the access runs again;
+		// so does a write whose page the kernel write-protects while its bits say none.
+		if (signal_number == SIGBUS &&
+		    SysVirtualResolveMinorFault(reinterpret_cast<uint64_t>(signal_info->si_addr),
+		                                (error_code & PAGE_FAULT_ERROR_PRESENT) != 0,
+		                                (error_code & PAGE_FAULT_ERROR_WRITE) != 0))
+			return;
+		// The texture offload's pages next, as on Windows: true runs the access again.
+		if (const auto probe = g_probe_handler.load(std::memory_order_acquire);
+		    probe != nullptr && probe(reinterpret_cast<uint64_t>(signal_info->si_addr),
+		                              static_cast<uint64_t>(gregs[REG_RIP]), context,
+		                              (error_code & PAGE_FAULT_ERROR_WRITE) != 0))
+			return;
 		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
 			info.access_violation_type = AccessViolationType::Execute;
 		} else if ((error_code & PAGE_FAULT_ERROR_WRITE) != 0) {
@@ -298,6 +504,7 @@ bool InstallHandler(Handler handler) {
 		printf("AddVectoredExceptionHandler() failed\n");
 		return false;
 	}
+	InstallFatalReports();
 #elif defined(__APPLE__)
 	struct sigaction sa {};
 	sa.sa_sigaction = SignalHandler;
@@ -337,5 +544,9 @@ bool InstallHandler(Handler handler) {
 	g_install_state.store(2, std::memory_order_release);
 	return true;
 }
+
+#if defined(__APPLE__)
+void SetProbeHandler(ProbeHandler /*handler*/) {}
+#endif
 
 } // namespace Common::HostException

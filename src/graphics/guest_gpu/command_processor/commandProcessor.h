@@ -23,12 +23,6 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
-struct IndirectDrawRegisters {
-	uint32_t vertex_offset;
-	uint32_t instance_offset;
-	uint32_t index_offset;
-};
-
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -38,18 +32,24 @@ private:
 
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
-		uint32_t                  offset_dw = 0;
+		uint32_t                  offset_dw           = 0;
+		uint32_t                  deferred_advance_dw = 0;
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
-	std::span<const uint32_t> m_next_buffer;
-	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
 };
 
 class CommandProcessor {
 public:
+	struct FlipInfo {
+		int     handle    = 0;
+		int     index     = 0;
+		int     flip_mode = 0;
+		int64_t flip_arg  = 0;
+	};
+
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
 	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
 	~CommandProcessor() = default;
@@ -61,6 +61,9 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// A flush nothing waits on (a label without an interrupt, a slice's end): deferred while the GPU is busy.
+	void            BufferFlushDeferrable();
+	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
@@ -71,34 +74,71 @@ public:
 	void SetIndexBufferSize(uint32_t index_buffer_size);
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
-	[[nodiscard]] uint64_t GetDispatchIndirectArgsBaseAddress() const {
-		return m_dispatch_indirect_args_base_addr;
-	}
+	void DispatchIndirectAddress(uint64_t args_address, uint32_t mode);
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(DrawIndexArgs args);
+	bool DrawIndex(DrawIndexArgs args);
+	// An indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
+	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
-	void DrawIndexAuto(DrawAutoArgs args);
-	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-	                  uint32_t draw_initiator, bool indexed);
+	bool DrawIndexAuto(DrawAutoArgs args);
+	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.
+	[[nodiscard]] uint32_t TryNativeXprDraws(std::span<const uint32_t> packets, bool clean);
+	// A DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2 from a native record: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeDirectDraw(std::span<const uint32_t> packet);
+	// A DRAW_INDEX_AUTO of a triangle list or strip as a table draw: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
+	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
+	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
+	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
+	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
-	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
-	                uint32_t interrupt_context_id, uint32_t event_control = 0, uint32_t data_control = 0);
-	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
+	                       uint32_t draw_initiator, bool indexed);
+	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
+	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
+	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
+	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0);
+	void WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_write_dest,
+	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
+	                        uint32_t event_write_source, void* dst_gpu_addr, uint64_t value,
+	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0);
+	void Flip();
+	void Flip(void* dst_gpu_addr, uint32_t value);
+	void FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action, void* dst_gpu_addr,
+	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
+	void SynchronizeGpu();
+	void EmitGlobalBarrier();
+	void BreakComputeChain();
+	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
-	                    uint32_t mode);
-	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
+	                    uint32_t mode, uint64_t indirect_args = 0);
+	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// An R_SUPER_RESOLUTION packet (graphics/guest_gpu/superResolution.h): the upscaler in place of Sony's.
+	void SuperResolution(const uint32_t* packet, uint32_t dwords);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
+	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
+	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
+
+	void ResetDeCe();
+	void SetCeComplete(bool complete) { m_ce_complete = complete; }
+	void WaitCe();
+	void WaitDeDiff(uint32_t diff);
 	void WaitForRewind(bool valid);
+	void IncrementDe();
+	void IncrementCe();
+
+	void WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
+	void DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
-	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes, uint32_t control = 0);
+	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	void ReportLodStats(void* dst, uint32_t size, bool reset) { GetGpuResources().GetBufferCache().ReportLodStats(dst, size, reset); }
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
@@ -108,45 +148,52 @@ public:
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
-	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
+	void             ProcessIndirectBuffer(std::span<const uint32_t> commands);
+
+	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
-	void ProcessPm4(Pm4Execution& execution);
-	friend struct CommandProcessorTestAccess;
+	uint32_t m_draw_run_skip = 0;
+	template <typename T>
+	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
+	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
+	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
+	                      uint32_t interrupt_context_id);
+	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
-	void ObserveReferenceClock(uint64_t address, uint64_t value, uint32_t bytes,
-	                           bool release, uint32_t control, uint32_t event);
-	uint32_t            NumInstances();
-	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	void                CheckBuffer() const { GetScheduler().CheckActive(); }
+	GpuResourceManager& GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
-	RenderContext& m_renderer;
-	HW::Context    m_ctx;
-	HW::Context    m_saved_ctx;
-	bool           m_context_state_pushed = false;
-	HW::UserConfig m_ucfg;
-	HW::Shader     m_sh_ctx;
-	uint32_t       m_index_type_and_size              = 0;
-	uint32_t       m_index_buffer_size                = 0;
-	uint64_t       m_index_base_addr                  = 0;
-	uint64_t       m_draw_indirect_args_base_addr     = 0;
-	uint64_t       m_dispatch_indirect_args_base_addr = 0;
-	// Persistent draw state. Indirect draws leave the address of their last instance count,
-	// read only when a later draw inherits it.
-	uint32_t m_num_instances      = 1;
-	uint64_t m_num_instances_addr = 0;
-	struct PendingIndirectCount {
-		IndirectCountSnapshot snapshot;
-		uint64_t args;
-		uint32_t maximum, stride;
-	};
-	std::vector<PendingIndirectCount> m_pending_indirect_counts;
+	RenderContext&   m_renderer;
+	HW::Context      m_ctx;
+	HW::Context      m_saved_ctx;
+	bool             m_context_state_pushed = false;
+	HW::UserConfig   m_ucfg;
+	HW::Shader       m_sh_ctx;
+	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;
+	uint32_t         m_index_type_and_size              = 0;
+	uint32_t         m_index_buffer_size                = 0;
+	uint64_t         m_index_base_addr                  = 0;
+	uint64_t         m_draw_indirect_args_base_addr     = 0;
+	uint64_t         m_dispatch_indirect_args_base_addr = 0;
+	// Persistent draw state: indirect draws update it for subsequent draws.
+	uint32_t m_num_instances = 1;
 
+	uint32_t m_de_count    = 0;
+	uint32_t m_ce_count    = 0;
+	bool     m_ce_complete = false;
+
+	uint32_t m_const_ram[0x3000] = {0};
+	// The dwords [0, m_const_ram_used) may be nonzero: a reset clears only them (all 48 KiB at every DispatchReset).
+	uint32_t m_const_ram_used = 0;
+
+	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;

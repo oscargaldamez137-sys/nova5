@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -12,6 +13,7 @@ class CommandBuffer;
 
 namespace HW {
 class Context;
+class Shader;
 class UserConfig;
 struct RenderTarget;
 struct ScanModeControl;
@@ -26,11 +28,20 @@ struct ScissorRect {
 };
 
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
+// What the CB writes to a target slot: CB_TARGET_MASK, or nothing when CB_SHADER_MASK says the pixel shader exports
+// nothing to it (a depth-only shader drawn with color targets bound: Vulkan leaves such attachments undefined, and
+// AMD drivers write garbage there). KYTY_IGNORE_CB_SHADER_MASK=1: the target mask alone, as before.
+uint32_t                 render_target_write_mask_slot(uint32_t target_mask, uint32_t shader_mask, uint32_t slot);
+template <typename Registers>
+uint32_t render_target_write_mask_slot(const Registers& ctx, uint32_t slot) {
+	return render_target_write_mask_slot(ctx.GetRenderTargetMask(), ctx.GetShaderRegisters().m_cbShaderMask, slot);
+}
 uint32_t                 render_target_first_bound_slot(const CommandBuffer& buffer);
 bool                     graphics_debug_dump_enabled();
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
-std::string              rt_print(const char* func, const HW::RenderTarget& rt);
+void                     sh_print(const char* func, const HW::Shader& uc);
+std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt);
 bool                     RenderIsColorTileModeLinear(Prospero::TileMode tile_mode);
 void                     hw_print(const CommandBuffer& buffer);
 void                     hw_check(const CommandBuffer& buffer);

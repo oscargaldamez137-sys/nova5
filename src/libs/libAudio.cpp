@@ -1,9 +1,6 @@
 #include "common/abi.h"
 #include "libs/ajm/aac_decoder.h"
-#include "libs/acm.h"
-#include "libs/audio3d.h"
 #include "libs/audio.h"
-#include "libs/ngs2.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -131,7 +128,6 @@ LIB_DEFINE(InitAudio_1_AudioOut) {
 	LIB_FUNC("QOQtbeDqsT4", AudioOut::AudioOutOutput);
 	LIB_FUNC("s1--uE9mBFw", AudioOut::AudioOutClose);
 	LIB_FUNC("GrQ9s4IrNaQ", AudioOut::AudioOutGetPortState);
-	LIB_FUNC("R5hemoKKID8", AudioOut::AudioOutGetSystemState);
 }
 
 } // namespace LibAudioOut
@@ -158,8 +154,8 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("gatEUKG+Ea4", AudioOut2::AudioOut2PortGetState);
 	LIB_FUNC("bkBN+CMLwRc", AudioOut2::AudioOut2GetSystemState);
 	LIB_FUNC("xywYcRB7nbQ", AudioOut2::AudioOut2UserCreate);
-	LIB_FUNC("IaZXJ9M79uo", AudioOut2::AudioOut2UserDestroy);
 	LIB_FUNC("iE8trxPKnAg", AudioOut2::AudioOut2UserGetSupportedAttributes);
+	LIB_FUNC("IaZXJ9M79uo", AudioOut2::AudioOut2UserDestroy);
 	LIB_FUNC("G1YOKDJYX2Y", AudioOut2::AudioOut2GetSpeakerArrayMemorySize);
 	LIB_FUNC("+k91hoTuoA8", AudioOut2::AudioOut2SpeakerArrayCreate);
 	LIB_FUNC("erCWQR5eKiQ", AudioOut2::AudioOut2SpeakerArrayDestroy);
@@ -184,7 +180,6 @@ namespace AudioIn = Audio::AudioIn;
 
 LIB_DEFINE(InitAudio_1_AudioIn) {
 	LIB_FUNC("5NE8Sjc7VC8", AudioIn::AudioInOpen);
-	LIB_FUNC("nya-R5gDYhM", AudioIn::AudioInHqOpen);
 	LIB_FUNC("Jh6WbHhnI68", AudioIn::AudioInClose);
 	LIB_FUNC("LozEOU8+anM", AudioIn::AudioInInput);
 	LIB_FUNC("BohEAQ7DlUE", AudioIn::AudioInGetSilentState);
@@ -1057,7 +1052,7 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 		ctrl->pPcmItem->uiPcmSize = static_cast<uint32_t>(result.output_written);
 		audiodec_fill_info(ctrl, decoder);
 		auto* info = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
-		info->iResult = (result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_TOO_MANY_CHANNELS)) != 0
+		info->iResult = (result.result & AJM_RESULT_CODEC_ERROR) != 0
 		                    ? AUDIODEC_M4AAC_RESULT_DECODE_ERROR
 		                    : (result.result & AJM_RESULT_PARTIAL_INPUT) != 0
 		                          ? AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA : 0;
@@ -1148,8 +1143,6 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("mPYgU4oYpuY", Ngs2::Ngs2SystemCreateWithAllocator);
 	LIB_FUNC("u-WrYDaJA3k", Ngs2::Ngs2SystemDestroy);
 	LIB_FUNC("vU7TQ62pItw", Ngs2::Ngs2SystemGetInfo);
-	LIB_FUNC("gThZqM5PYlQ", Ngs2::Ngs2SystemLock);
-	LIB_FUNC("JXRC5n0RQls", Ngs2::Ngs2SystemUnlock);
 	LIB_FUNC("U546k6orxQo", Ngs2::Ngs2RackCreateWithAllocator);
 	LIB_FUNC("cLV4aiT9JpA", Ngs2::Ngs2RackCreate);
 	LIB_FUNC("0eFLVCfWVds", Ngs2::Ngs2RackQueryBufferSize);

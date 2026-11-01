@@ -10,7 +10,7 @@
 #include <windows.h> // IWYU pragma: keep
 
 #include "common/assert.h"
-#include "common/guestCpuProfile.h"
+#include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
 // IWYU pragma: no_include <basetsd.h>
@@ -22,33 +22,45 @@
 // IWYU pragma: no_include <winerror.h>
 // IWYU pragma: no_include <wtypes.h>
 
-namespace Common::VirtualMemory {
+namespace Common {
 
-static DWORD GetProtectionFlag(Mode mode) {
+static DWORD GetProtectionFlag(VirtualMemory::Mode mode) {
 	DWORD protect = PAGE_NOACCESS;
 	switch (mode) {
-		case Mode::Read: protect = PAGE_READONLY; break;
+		case VirtualMemory::Mode::Read: protect = PAGE_READONLY; break;
 
-		case Mode::Write:
-		case Mode::ReadWrite: protect = PAGE_READWRITE; break;
+		case VirtualMemory::Mode::Write:
+		case VirtualMemory::Mode::ReadWrite: protect = PAGE_READWRITE; break;
 
-		case Mode::Execute: protect = PAGE_EXECUTE; break;
+		case VirtualMemory::Mode::Execute: protect = PAGE_EXECUTE; break;
 
-		case Mode::ExecuteRead: protect = PAGE_EXECUTE_READ; break;
+		case VirtualMemory::Mode::ExecuteRead: protect = PAGE_EXECUTE_READ; break;
 
-		case Mode::ExecuteWrite:
-		case Mode::ExecuteReadWrite: protect = PAGE_EXECUTE_READWRITE; break;
+		case VirtualMemory::Mode::ExecuteWrite:
+		case VirtualMemory::Mode::ExecuteReadWrite: protect = PAGE_EXECUTE_READWRITE; break;
 
-		case Mode::NoAccess:
+		case VirtualMemory::Mode::NoAccess:
 		default: protect = PAGE_NOACCESS; break;
 	}
 	return protect;
 }
 
-void Init() {}
+static VirtualMemory::Mode GetProtectionFlag(DWORD mode) {
+	switch (mode) {
+		case PAGE_NOACCESS: return VirtualMemory::Mode::NoAccess;
+		case PAGE_READONLY: return VirtualMemory::Mode::Read;
+		case PAGE_READWRITE: return VirtualMemory::Mode::ReadWrite;
+		case PAGE_EXECUTE: return VirtualMemory::Mode::Execute;
+		case PAGE_EXECUTE_READ: return VirtualMemory::Mode::ExecuteRead;
+		case PAGE_EXECUTE_READWRITE: return VirtualMemory::Mode::ExecuteReadWrite;
+		default: return VirtualMemory::Mode::NoAccess;
+	}
+}
 
-uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
-	auto ptr = (address == 0 ? AllocAligned(address, size, mode, 1)
+void SysVirtualInit() {}
+
+uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	auto ptr = (address == 0 ? SysVirtualAllocAligned(address, size, mode, 1)
 	                         : reinterpret_cast<uintptr_t>(VirtualAlloc(
 	                               reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                               static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
@@ -59,7 +71,7 @@ uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
 		if (err != ERROR_INVALID_ADDRESS) {
 			printf("VirtualAlloc() failed: 0x%08" PRIx32 "\n", err);
 		} else {
-			return AllocAligned(address, size, mode, 1);
+			return SysVirtualAllocAligned(address, size, mode, 1);
 		}
 	}
 	return ptr;
@@ -80,7 +92,8 @@ static uint64_t AlignUp(uint64_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
 }
 
-uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment) {
+uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
+                                uint64_t alignment) {
 	if (alignment == 0) {
 		printf("VirtualAlloc2 failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
 		return 0;
@@ -134,13 +147,13 @@ uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t align
 			printf("VirtualAlloc2(alignment = 0x%016" PRIx64 ") failed: 0x%08" PRIx32 "\n",
 			       alignment, err);
 		} else {
-			return AllocAligned(address, size, mode, alignment << 1u);
+			return SysVirtualAllocAligned(address, size, mode, alignment << 1u);
 		}
 	}
 	return ptr;
 }
 
-bool AllocFixed(uint64_t address, uint64_t size, Mode mode) {
+bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	auto ptr = reinterpret_cast<uintptr_t>(VirtualAlloc(
 	    reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	    static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE), GetProtectionFlag(mode)));
@@ -160,7 +173,7 @@ bool AllocFixed(uint64_t address, uint64_t size, Mode mode) {
 	return true;
 }
 
-bool Commit(uint64_t address, uint64_t size, Mode mode) {
+bool SysVirtualCommit(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	auto ptr = reinterpret_cast<uintptr_t>(
 	    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                 static_cast<DWORD>(MEM_COMMIT), GetProtectionFlag(mode)));
@@ -178,8 +191,8 @@ bool Commit(uint64_t address, uint64_t size, Mode mode) {
 	return true;
 }
 
-uint64_t Reserve(uint64_t address, uint64_t size) {
-	auto ptr = (address == 0 ? ReserveAligned(address, size, 1)
+uint64_t SysVirtualReserve(uint64_t address, uint64_t size) {
+	auto ptr = (address == 0 ? SysVirtualReserveAligned(address, size, 1)
 	                         : reinterpret_cast<uintptr_t>(VirtualAlloc(
 	                               reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                               static_cast<DWORD>(MEM_RESERVE), PAGE_NOACCESS)));
@@ -189,13 +202,13 @@ uint64_t Reserve(uint64_t address, uint64_t size) {
 		if (err != ERROR_INVALID_ADDRESS) {
 			printf("VirtualAlloc(MEM_RESERVE) failed: 0x%08" PRIx32 "\n", err);
 		} else {
-			return ReserveAligned(address, size, 1);
+			return SysVirtualReserveAligned(address, size, 1);
 		}
 	}
 	return ptr;
 }
 
-uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
+uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
 	if (alignment == 0) {
 		printf("VirtualAlloc2(MEM_RESERVE) failed: 0x%08" PRIx32 "\n",
 		       static_cast<uint32_t>(GetLastError()));
@@ -249,13 +262,13 @@ uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
 			       "\n",
 			       alignment, err);
 		} else {
-			return ReserveAligned(address, size, alignment << 1u);
+			return SysVirtualReserveAligned(address, size, alignment << 1u);
 		}
 	}
 	return ptr;
 }
 
-bool ReserveFixed(uint64_t address, uint64_t size) {
+bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 	auto ptr = reinterpret_cast<uintptr_t>(
 	    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                 static_cast<DWORD>(MEM_RESERVE), PAGE_NOACCESS));
@@ -275,7 +288,7 @@ bool ReserveFixed(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool Decommit(uint64_t address, uint64_t size) {
+bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                MEM_DECOMMIT) == 0) {
 		printf("VirtualFree(MEM_DECOMMIT) failed: 0x%08" PRIx32 "\n",
@@ -285,7 +298,7 @@ bool Decommit(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool Free(uint64_t address) {
+bool SysVirtualFree(uint64_t address) {
 	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE) ==
 	    0) {
 		printf("VirtualFree() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
@@ -294,7 +307,7 @@ bool Free(uint64_t address) {
 	return true;
 }
 
-bool FreeRange(uint64_t address, uint64_t size) {
+bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	if (address == 0 || size == 0) {
 		return false;
 	}
@@ -312,21 +325,38 @@ bool FreeRange(uint64_t address, uint64_t size) {
 		}
 		current = next;
 	}
-	return current - address == size && Free(address);
+	return current - address == size && SysVirtualFree(address);
 }
 
-bool Protect(uint64_t address, uint64_t size, Mode mode) {
-	Common::GuestCpuProfile::Stage protect(Common::GuestCpuProfile::Part::VirtualProtect);
+bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
+                       VirtualMemory::Mode* old_mode) {
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {
 		printf("VirtualProtect() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
 		return false;
 	}
+	if (old_mode != nullptr) {
+		*old_mode = GetProtectionFlag(old_protect);
+	}
 	return true;
 }
 
-bool FlushInstructionCache(uint64_t address, uint64_t size) {
+bool SysVirtualProtectWriteWatch(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	return SysVirtualProtect(address, size, mode);
+}
+
+void SysVirtualWriteWatchMapped(uint64_t /*address*/, uint64_t /*size*/, VirtualMemory::Mode /*mode*/) {}
+
+void SysVirtualWriteWatchUnmapped(uint64_t /*address*/, uint64_t /*size*/) {}
+
+void SysVirtualZapNoAccess(bool /*on*/) {}
+
+bool SysVirtualResolveMinorFault(uint64_t /*address*/, bool /*present*/, bool /*write*/) {
+	return false;
+}
+
+bool SysVirtualFlushInstructionCache(uint64_t address, uint64_t size) {
 	if (::FlushInstructionCache(GetCurrentProcess(),
 	                            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),
 	                            size) == 0) {
@@ -337,6 +367,6 @@ bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	return true;
 }
 
-} // namespace Common::VirtualMemory
+} // namespace Common
 
 #endif

@@ -2,17 +2,14 @@
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_SYSTEMOVERLAY_H_
 
 #include "common/common.h"
-#include "graphics/presentation/gameBar.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
-#include <cstddef>
-#include <filesystem>
+#include <cstdint>
 #include <memory>
-#include <span>
-#include <string_view>
+#include <string>
+#include <vector>
 
 union SDL_Event;
-struct SDL_Window;
 
 namespace Libs::Graphics {
 
@@ -23,16 +20,37 @@ struct SystemOverlayVisualState {
 	uint64_t revision;
 };
 
-void                     InitializeSplashScreen(const std::filesystem::path& sce_sys);
-void                     HideSplashScreen();
-void                     InitializeSystemOverlayInput(SDL_Window* window);
+// KYTY_FPS_HUD's frame-time graph (empty frame_ms: none) and the detailed panel's rows (empty: none).
+struct SystemOverlayPerf {
+	std::vector<float> frame_ms; // the last frames' times, oldest first
+	std::vector<float> busy_ms;  // the render thread's busy part of each (empty: not drawn)
+	std::string        graph_note;
+	struct Row {
+		std::string label, value;
+	};
+	std::vector<Row>     rows;
+	std::vector<float>   core_load;  // per logical processor (0..1), bars under the processor's row (empty: none)
+	std::vector<uint8_t> core_fast;  // 1: a performance core of a hybrid processor
+	std::string          core_note;  // the clocks, beside the bars
+};
+
+// Small panels over the game image, drawn with every frame (dialog or not): the frame rate
+// (KYTY_FPS_HUD), the progress of background work (the shader prefetch) and the debug warp.
+struct SystemOverlayHud {
+	std::string title;  // large first line (empty: no frame rate panel)
+	std::string detail; // small second line
+	SystemOverlayPerf perf; // under them
+	std::string status; // the progress line (empty: none), over a bar
+	float       status_fraction = 0.0f;
+	std::string notice; // a text panel (empty: none)
+	vk::Rect2D  region; // the game image in the swapchain image
+	vk::Rect2D  drawn;  // out: the panels, in swapchain pixels
+};
+
+void                     InitializeSystemOverlayInput();
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
-// Called on the SDL window thread; renderer buttons only enqueue actions.
-GameBarAction            PollGameBarAction(bool fullscreen);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
-void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
-                                              std::span<const std::byte> icon_png);
 
 class SystemOverlay final {
 public:
@@ -40,7 +58,8 @@ public:
 	~SystemOverlay();
 	KYTY_CLASS_NO_COPY(SystemOverlay);
 
-	[[nodiscard]] bool PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count);
+	[[nodiscard]] bool PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count,
+	                                SystemOverlayHud* hud = nullptr);
 	void               Record(vk::CommandBuffer command, vk::ImageView target);
 	void               ReleaseVulkan();
 

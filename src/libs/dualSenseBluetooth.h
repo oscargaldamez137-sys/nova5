@@ -11,4 +11,4 @@ void     Close(Stream* stream);
 void     Shutdown();
 } // namespace Libs::Controller::DualSenseBluetooth
 
-#endif
+#endif /* KYTY_LIBS_DUALSENSE_BLUETOOTH_H_ */

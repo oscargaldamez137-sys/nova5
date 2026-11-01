@@ -63,7 +63,7 @@ SysFileTimeStruct DateTimeToFileTimeUtc(const DateTime& date_time) {
 
 struct File::FilePrivate {
 	sys_file_t*                  f;
-	std::unique_ptr<ArchiveFile> archive;
+	std::unique_ptr<ArchiveFile> archive; // A member of an archive (read-only).
 };
 
 File::File(): m_p(std::make_unique<FilePrivate>()) {
@@ -113,6 +113,7 @@ bool File::Open(const std::filesystem::path& name, Mode mode) {
 	EXIT_IF(!IsInvalid());
 
 	m_file_name = name;
+
 	if (IsArchivePath(name)) {
 		if (mode != Mode::Read) {
 			return false;
@@ -147,6 +148,10 @@ bool File::OpenInMem(void* buf, uint32_t buf_size) {
 	}
 
 	return true;
+}
+
+bool File::OpenInMem(ByteBuffer& buf) {
+	return OpenInMem(buf.GetData(), buf.Size());
 }
 
 bool File::CreateInMem() {
@@ -201,18 +206,14 @@ uint64_t File::Size(const std::filesystem::path& name) {
 }
 
 std::optional<File::Info> File::GetInfo(const std::filesystem::path& name) {
-	return GetInfo(name, nullptr);
-}
-
-std::optional<File::Info> File::GetInfo(const std::filesystem::path& name, std::error_code* error) {
-	if (error) { error->clear(); }
 	if (IsArchivePath(name)) {
-		const auto info = GetArchiveInfo(name);
-		if (!info && error) { *error = std::make_error_code(std::errc::no_such_file_or_directory); }
-		return info;
+		return GetArchiveInfo(name);
 	}
 	Info info {};
-	return SysFileGetInfo(name, &info.is_file, &info.size, error) ? std::optional(info) : std::nullopt;
+	if (!SysFileGetInfo(name, &info.is_file, &info.size)) {
+		return {};
+	}
+	return info;
 }
 
 bool File::Seek(uint64_t offset) {
@@ -312,16 +313,14 @@ void File::Printf(const char* format, ...) {
 	Write(s.data(), static_cast<uint32_t>(s.size()));
 }
 
-static std::filesystem::path WithoutTrailingSeparator(
-	const std::filesystem::path& path) {
-		if (!path.empty() && !path.has_filename() &&
-			path != path.root_path()) {
-			return path.parent_path();
-		}
-
-		return path;
+// The path without a trailing separator (a root keeps its own), in its own encoding: a UTF-8 string of it made a path
+// again went through the ANSI code page (non-ASCII names were not found, or the conversion threw).
+static std::filesystem::path WithoutTrailingSeparator(const std::filesystem::path& path) {
+	if (!path.empty() && !path.has_filename() && path != path.root_path()) {
+		return path.parent_path();
+	}
+	return path;
 }
-
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
@@ -339,71 +338,58 @@ bool File::IsFileExisting(const std::filesystem::path& name) {
 	return SysFileIsFileExisting(name);
 }
 
-bool File::CreateDirectory(const std::filesystem::path& path) {
+bool File::CreateDirectory(
+    const std::filesystem::path& path) // @suppress("Member declaration not found")
+{
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    return SysFileCreateDirectory(
-        WithoutTrailingSeparator(path));
+	return SysFileCreateDirectory(WithoutTrailingSeparator(path));
 }
 
 bool File::DeleteDirectory(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    return SysFileDeleteDirectory(
-        WithoutTrailingSeparator(path));
+	return SysFileDeleteDirectory(WithoutTrailingSeparator(path));
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    const auto normalized_path =
-        WithoutTrailingSeparator(path);
-
-    auto current_path = normalized_path.root_path();
-
-    for (const auto& component:
-         normalized_path.relative_path()) {
-        current_path /= component;
-
-        if (IsDirectoryExisting(current_path)) {
-            continue;
-        }
-
-        if (!CreateDirectory(current_path)) {
-            return false;
-        }
-    }
-
-    return true;
+	const auto normalized_path = WithoutTrailingSeparator(path);
+	auto       current_path    = normalized_path.root_path();
+	for (const auto& component: normalized_path.relative_path()) {
+		current_path /= component;
+		if (IsDirectoryExisting(current_path)) {
+			continue;
+		}
+		if (!CreateDirectory(current_path)) // @suppress("Invalid arguments")
+		{
+			return false;
+		}
+	}
+	return true;
 }
 
 bool File::DeleteDirectories(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    const auto normalized_path =
-        WithoutTrailingSeparator(path);
-
-    std::vector<std::filesystem::path> directories;
-    auto current_path = normalized_path.root_path();
-
-    for (const auto& component:
-         normalized_path.relative_path()) {
-        current_path /= component;
-        directories.push_back(current_path);
-    }
-
-    for (auto it = directories.rbegin();
-         it != directories.rend(); ++it) {
-        if (!DeleteDirectory(*it)) {
-            return false;
-        }
-    }
-
-    return true;
+	const auto                         normalized_path = WithoutTrailingSeparator(path);
+	std::vector<std::filesystem::path> directories;
+	auto                               current_path = normalized_path.root_path();
+	for (const auto& component: normalized_path.relative_path()) {
+		current_path /= component;
+		directories.push_back(current_path);
+	}
+	for (auto it = directories.rbegin(); it != directories.rend(); ++it) {
+		if (!DeleteDirectory(*it)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool File::DeleteFile(
@@ -425,7 +411,7 @@ bool File::Flush() {
 	return SysFileFlush(*m_p->f);
 }
 
-std::vector<std::byte> File::ReadWholeBuffer() {
+ByteBuffer File::ReadWholeBuffer() {
 	EXIT_IF(IsInvalid());
 	EXIT_IF(Tell() != 0);
 
@@ -433,12 +419,23 @@ std::vector<std::byte> File::ReadWholeBuffer() {
 
 	EXIT_IF((s >> 32u) != 0);
 
-	const auto            read_size = static_cast<uint32_t>(s);
-	std::vector<std::byte> buf(read_size);
+	ByteBuffer buf(s);
 
-	Read(buf.data(), read_size);
+	Read(buf.GetData(), s);
 
 	return buf;
+}
+
+ByteBuffer File::Read(uint32_t size) {
+	ByteBuffer buf(size);
+	uint32_t   b = 0;
+	Read(buf.GetData(), size, &b);
+	buf.RemoveAt(b, size - b);
+	return buf;
+}
+
+void File::Write(const ByteBuffer& buf, uint32_t* bytes_written) {
+	Write(buf.GetDataConst(), buf.Size(), bytes_written);
 }
 
 DateTime File::GetLastAccessTimeUTC(const std::filesystem::path& name) {
@@ -473,6 +470,7 @@ void File::GetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, DateT
                                         DateTime* write) {
 	EXIT_IF(access == nullptr);
 	EXIT_IF(write == nullptr);
+
 	if (IsArchivePath(name)) {
 		GetLastAccessAndWriteTimeUTC(GetArchiveHostPath(name), access, write);
 		return;
@@ -563,6 +561,54 @@ bool File::SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, const
 	return SysFileSetLastAccessAndWriteTimeUtc(name, af, wf);
 }
 
+std::vector<File::FindInfo> File::FindFiles(const std::filesystem::path& path) {
+	if (IsArchivePath(path)) {
+		return {};
+	}
+	std::vector<sys_file_find_t> files;
+
+	SysFileFindFiles(path, files);
+
+	auto     path_str = PathToGenericString(path);
+	uint32_t len      = static_cast<uint32_t>(path_str.size());
+
+	if (!Common::EndsWith(path_str, "/") && !Common::EndsWith(path_str, "\\")) {
+		len++;
+	}
+
+	std::vector<File::FindInfo> ret;
+	ret.reserve(files.size());
+
+	for (const auto& f: files) {
+		File::FindInfo r {};
+
+		r.path_with_name     = f.path_with_name;
+		r.rel_path_with_name = Common::Mid(PathToGenericString(f.path_with_name), len);
+		r.size               = f.size;
+
+		SysTimeStruct at {};
+		SysTimeStruct wt {};
+
+		SysFileToSystemTimeUtc(f.last_access_time, at);
+		SysFileToSystemTimeUtc(f.last_write_time, wt);
+
+		if (!at.is_invalid && !wt.is_invalid) {
+			r.last_access_time = DateTime(Date(at.Year, at.Month, at.Day),
+			                              Time(at.Hour, at.Minute, at.Second, at.Milliseconds));
+			r.last_write_time  = DateTime(Date(wt.Year, wt.Month, wt.Day),
+			                              Time(wt.Hour, wt.Minute, wt.Second, wt.Milliseconds));
+		}
+
+		// printf("%s, %s, %" PRIu64", %s, %s\n", r.path_with_name.c_str(),
+		// r.rel_path_with_name.c_str(), r.size, r.last_access_time.ToString().c_str(),
+		// r.last_write_time.ToString().c_str());
+
+		ret.push_back(std::move(r));
+	}
+
+	return ret;
+}
+
 std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return GetArchiveDirEntries(path);
@@ -574,8 +620,13 @@ std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& pat
 	std::vector<File::DirEntry> ret;
 	ret.reserve(files.size());
 
-	for (auto& f: files) {
-		ret.emplace_back(std::move(f.name), f.is_file);
+	for (const auto& f: files) {
+		File::DirEntry r {};
+
+		r.name    = f.name;
+		r.is_file = f.is_file;
+
+		ret.push_back(std::move(r));
 	}
 
 	return ret;
@@ -608,6 +659,14 @@ void File::RemoveReadonly(const std::filesystem::path& name) {
 		return;
 	}
 	SysFileRemoveReadonly(name);
+}
+
+uint32_t File::TakeLastError() {
+	return SysFileTakeLastError();
+}
+
+std::string File::ErrorText(uint32_t error) {
+	return SysFileErrorText(error);
 }
 
 } // namespace Common

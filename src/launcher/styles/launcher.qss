@@ -1,24 +1,22 @@
-/* The views get their transparent background from their own styleSheet in
-   configuration_list_widget.ui: Breeze paints black behind the scrollbars of views without one. */
-QTreeWidget#cfgs_list,
-QListView#cfgs_grid {
+GameListTreeWidget#cfgs_list {
+    background: transparent;
     border: 1px solid palette(mid);
     color: palette(text);
     outline: 0;
 }
 
-QTreeWidget#cfgs_list::item {
+GameListTreeWidget#cfgs_list::item {
     background: transparent;
     border-bottom: 1px solid palette(mid);
     padding: 4px;
 }
 
-QTreeWidget#cfgs_list::item:selected {
+GameListTreeWidget#cfgs_list::item:selected {
     background: palette(highlight);
     color: palette(highlighted-text);
 }
 
-QTreeWidget#cfgs_list QHeaderView::section {
+GameListTreeWidget#cfgs_list QHeaderView::section {
     background: palette(button);
     color: palette(button-text);
     border: 0;
@@ -41,12 +39,9 @@ QLineEdit#search_line_edit:focus {
     border-color: palette(highlight);
 }
 
-QToolButton#grid_view_button,
-QToolButton#refresh_button,
 QToolButton#global_settings_button,
 QToolButton#input_mapping_button,
 QToolButton#edit_button,
-QToolButton#trophy_overview_button,
 QToolButton#delete_button {
     background: transparent;
     border: 1px solid transparent;
@@ -54,24 +49,17 @@ QToolButton#delete_button {
     padding: 3px;
 }
 
-QToolButton#grid_view_button:hover,
-QToolButton#refresh_button:hover,
 QToolButton#global_settings_button:hover,
 QToolButton#input_mapping_button:hover,
 QToolButton#edit_button:hover,
-QToolButton#trophy_overview_button:hover,
 QToolButton#delete_button:hover {
     background: palette(button);
     border-color: palette(mid);
 }
 
-QToolButton#grid_view_button:checked,
-QToolButton#grid_view_button:pressed,
-QToolButton#refresh_button:pressed,
 QToolButton#global_settings_button:pressed,
 QToolButton#input_mapping_button:pressed,
 QToolButton#edit_button:pressed,
-QToolButton#trophy_overview_button:pressed,
 QToolButton#delete_button:pressed {
     background: palette(midlight);
 }

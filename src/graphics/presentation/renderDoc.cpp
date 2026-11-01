@@ -162,15 +162,14 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {
-		++g_captured_flips;
-		LOGF("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
+		LOGF("RenderDoc: captured guest flip %u/2\n", ++g_captured_flips);
 		if (g_captured_flips < 2) {
 			return;
 		}
 	}
 
 	// Capture boundaries follow presentation and exclude concurrent queue access.
-	Common::LockGuard render_lock(renderer.GetMutex());
+	RenderLockGuard render_lock(renderer.GetMutex());
 	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 	if (state == RenderDocState::Requested) {
 		StartCapture();

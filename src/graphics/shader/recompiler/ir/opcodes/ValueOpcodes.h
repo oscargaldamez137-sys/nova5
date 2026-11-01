@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-enum class ValueOpcode : uint16_t {
+enum class ValueOpcode {
 #define VALUE_OPCODE(name, ...) name,
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
 #undef VALUE_OPCODE
@@ -17,6 +17,8 @@ enum class ValueOpcode : uint16_t {
 };
 
 enum class BufferAccess { None, Read, Write, Atomic };
+// Waitcnt's default remains a no-op. VSCNT=0 waits for vector stores (Nova5).
+enum class WaitcntKind : uint32_t { None, StoreCompletion };
 enum class SharedAccess { None, Read, Write, Atomic, Append, Consume };
 enum class AddressAccess { None, Read, Write };
 enum class ImageAccess { None, Read, Write, Atomic };
@@ -34,12 +36,11 @@ struct ImageOpcodeInfo {
 };
 
 struct DppMoveFlags {
-	uint32_t control   : 24 = 0;
-	uint32_t row_mask  : 4  = 0xf;
-	uint32_t bank_mask : 4  = 0xf;
+	uint16_t control        = 0;
+	uint8_t  row_mask       = 0xf;
+	uint8_t  bank_mask      = 0xf;
 	bool     fetch_inactive = false;
 	bool     bound_control  = false;
-	bool     dpp8           = false;
 };
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);
@@ -52,9 +53,13 @@ struct PermlaneFlags {
 static_assert(sizeof(PermlaneFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<PermlaneFlags>);
 
-struct FPCompareFlags {
-	bool flush_input_denorms = false;
+// AnyLane, ReadLane, ReadFirstLane of a cooperative lane-local program (Program::lane_cooperative): the wave's answer,
+// the two 32-lane halves exchanging their lanes through workgroup memory (not the subgroup's alone).
+struct WaveFlags {
+	bool cooperative = false;
 };
+static_assert(sizeof(WaveFlags) <= sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<WaveFlags>);
 
 struct MemoryFlags {
 	uint32_t index = 0;

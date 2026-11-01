@@ -1,27 +1,32 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
-#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelects.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
-#include <functional>
 #include <map>
 #include <span>
 #include <utility>
@@ -29,6 +34,10 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
+
+const char* GetDumpLabel(const CompileOptions& options) {
+	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
@@ -40,21 +49,109 @@ std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	return dump;
 }
 
-void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
+const char* StageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Pixel: return "PS";
+		default: return "unknown";
+	}
+}
+
+// KYTY_SHADER_DUMP_ONLY=<hash,hash,...>: KYTY_SHADER_DUMP writes only these programs.
+bool DumpSelected(uint64_t hash) {
+	static const std::string only = [] {
+		const char* value = std::getenv("KYTY_SHADER_DUMP_ONLY");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	return only.empty() || only.find(fmt::format("{:016x}", hash)) != std::string::npos;
+}
+
+// KYTY_SHADER_DUMP=<dir>: the guest ISA and its disassembly for every translated shader, once
+// per stage and hash (<dir>/<stage>_<hash>.bin and .rdna2), without the debug logging.
+void DumpDecodedShader(const CompileOptions& options, std::span<const uint32_t> code,
+                       const Decoder::Program& decoded) {
+	static const char* const dir = std::getenv("KYTY_SHADER_DUMP");
+	if (dir == nullptr || *dir == '\0' || !DumpSelected(options.shader_hash)) {
+		return;
+	}
+	const auto      base = std::filesystem::path(dir) /
+	                  fmt::format("{}_{:016x}", StageName(options.stage), options.shader_hash);
+	std::error_code error;
+	if (std::filesystem::exists(base.string() + ".rdna2", error)) {
+		return;
+	}
+	std::filesystem::create_directories(dir, error);
+	if (FILE* file = std::fopen((base.string() + ".bin").c_str(), "wb")) {
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
+	const auto text = Decoder::ProgramToString(decoded);
+	if (FILE* file = std::fopen((base.string() + ".rdna2").c_str(), "wb")) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
+
+// With KYTY_SHADER_DUMP: the renderer-facing resource table (index = the slot a frame capture
+// reports) and the final IR, as <stage>_<hash>.ir, once per stage and hash.
+void DumpShaderIr(const CompileOptions& options, const IR::Program& ir) {
+	static const char* const dir = std::getenv("KYTY_SHADER_DUMP");
+	if (dir == nullptr || *dir == '\0' || !DumpSelected(options.shader_hash)) {
+		return;
+	}
+	const auto path = std::filesystem::path(dir) /
+	                  fmt::format("{}_{:016x}.ir", StageName(options.stage), options.shader_hash);
+	std::error_code error;
+	if (std::filesystem::exists(path, error)) {
+		return;
+	}
+	std::string text;
+	for (size_t i = 0; i < ir.info.images.size(); ++i) {
+		const auto& image = ir.info.images[i];
+		text += fmt::format("image[{}] source={} class={} numeric={} dim={} mips={} read={} written={} "
+		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x} max_layer={}\n",
+		                    i, image.source, static_cast<int>(image.resource_class),
+		                    static_cast<int>(image.numeric_class), static_cast<int>(image.dimension),
+		                    image.mip_count, image.read, image.written, image.atomic,
+		                    image.depth_compare, image.cube, image.first_use_pc,
+		                    image.max_array_index == IR::ImageResource::NoArrayIndexBound
+		                        ? std::string("-")
+		                        : std::to_string(image.max_array_index));
+	}
+	for (size_t i = 0; i < ir.info.buffers.size(); ++i) {
+		const auto& buffer = ir.info.buffers[i];
+		text += fmt::format("buffer[{}] source={} format={} stride={} extent={} read={} written={} "
+		                    "atomic={} scalar={} first_pc=0x{:x}\n",
+		                    i, buffer.source, static_cast<int>(buffer.descriptor_format),
+		                    buffer.packed_stride, buffer.max_byte_extent, buffer.read, buffer.written,
+		                    buffer.atomic, buffer.scalar, buffer.first_use_pc);
+	}
+	text += fmt::format("samplers={}\n\n", ir.info.samplers.size());
+	text += IR::ProgramToString(ir);
+	if (FILE* file = std::fopen(path.string().c_str(), "wb")) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
+
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase,
+                           const std::string& reason) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
 	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
 	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
-	LOGF("ShaderRecompiler %s CFG dispatcher fallback: hash=0x%016" PRIx64
+	LOGF("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
 	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
 	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
 	     " reason=%s\n",
-	     StageName(options.stage), options.shader_hash, phase,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase,
 	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
-	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
+	     static_cast<uint64_t>(cfg.back_edges.size()), reason.c_str());
 }
 
 enum class EmbeddedFetchValueType {
@@ -70,6 +167,7 @@ struct EmbeddedFetchSgprInfo {
 	EmbeddedFetchValueType type      = EmbeddedFetchValueType::Unknown;
 	int                    attrib_id = 0;
 	uint32_t               value     = 0;
+	std::vector<uint32_t>  prolog_loads;
 };
 
 using EmbeddedFetchVectorLanes = std::map<uint64_t, EmbeddedFetchSgprInfo>;
@@ -87,6 +185,8 @@ void ClearEmbeddedFetchVectorLanes(EmbeddedFetchVectorLanes* lanes, uint32_t reg
 	const auto last  = lanes->lower_bound(EmbeddedFetchVectorLaneKey(reg + 1u, 0));
 	lanes->erase(first, last);
 }
+
+using EmbeddedFetchData = Frontend::EmbeddedFetchPlan;
 
 bool IsDecodedSgpr(const Decoder::Operand& op) {
 	return op.kind == Decoder::OperandKind::Sgpr || op.kind == Decoder::OperandKind::VccLo ||
@@ -191,21 +291,20 @@ int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
 }
 
-Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
-    const Decoder::Program& decoded, const ShaderVertexInputInfo& input_info,
-    uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
-	const uint32_t    vertex_index_reg   = input_info.logical_stage == ShaderType::Local ? 2u : 5u;
-	const uint32_t    instance_index_reg = input_info.logical_stage == ShaderType::Local ? 5u : 8u;
-	Frontend::EmbeddedFetchPlan data;
-	data.loads.reserve(input_info.resources_num);
+EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded,
+                                            const ShaderVertexInputInfo* input_info,
+                                            uint32_t user_data_base, uint32_t user_data_count,
+                                            uint32_t wave_size) {
+	EmbeddedFetchData data;
+	data.loads.reserve(input_info->resources_num);
 	int32_t vertex_offset_candidate   = -1;
 	int32_t instance_offset_candidate = -1;
 	bool    vertex_offset_conflict    = false;
 	bool    instance_offset_conflict  = false;
 
 	const int shift_regs = 8;
-	const int attrib_reg = input_info.fetch_attrib_reg + shift_regs;
-	const int buffer_reg = input_info.fetch_buffer_reg + shift_regs;
+	const int attrib_reg = input_info->fetch_attrib_reg + shift_regs;
+	const int buffer_reg = input_info->fetch_buffer_reg + shift_regs;
 
 	std::array<EmbeddedFetchSgprInfo, 108> sgprs {};
 	std::array<bool, 256>                 vgpr_is_index {};
@@ -236,17 +335,16 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 		// corresponding direct-draw offsets before fetching.
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
-		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == vertex_index_reg));
+		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
 		const bool instance_index_accumulator =
-		    IsDecodedVgpr(inst.dst) &&
-		    (inst.dst.reg == (user_data_base == 8 ? instance_index_reg : 3u));
+		    IsDecodedVgpr(inst.dst) && (inst.dst.reg == (user_data_base == 8 ? 8u : 3u));
 		uint32_t   sad_zero = 0;
 		const bool index_offset_add =
-		    (vertex_index_accumulator || instance_index_accumulator) && IsDecodedSgpr(inst.src0) &&
+		    (vertex_index_accumulator || instance_index_accumulator) &&
+		    IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 &&
-		      (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
+		     (user_data_base == 8 && (inst.dst.reg == 5 || inst.dst.reg == 8) &&
 		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
 		      inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
@@ -305,6 +403,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 						auto& dst = sgprs[DecodedSgprReg(inst.dst)];
 						dst.type  = EmbeddedFetchValueType::Constant;
 						dst.value = value;
+						dst.prolog_loads.clear();
 					} else {
 						ClearEmbeddedFetchSgprs(sgprs, inst.dst, 1);
 					}
@@ -315,6 +414,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 					auto& dst = sgprs[DecodedSgprReg(inst.dst)];
 					dst.type  = EmbeddedFetchValueType::Constant;
 					dst.value = inst.src0.value;
+					dst.prolog_loads.clear();
 				}
 				break;
 			default:
@@ -331,6 +431,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 								auto& dst        = sgprs[register_id + i];
 								dst.type         = EmbeddedFetchValueType::Attrib;
 								dst.attrib_id    = index + static_cast<int>(i);
+								dst.prolog_loads = {inst.pc};
 							}
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
@@ -348,6 +449,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 								dst.type  = EmbeddedFetchValueType::Buffer;
 								dst.attrib_id =
 								    BufferTableAttribFromOffset(raw_offset, static_cast<int>(i));
+								dst.prolog_loads = {inst.pc};
 							}
 						} else if (IsDecodedSgpr(inst.src1) &&
 						           DecodedSgprReg(inst.src1) < sgprs.size() &&
@@ -359,6 +461,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 								auto& dst        = sgprs[register_id + i];
 								dst.type         = EmbeddedFetchValueType::Buffer;
 								dst.attrib_id    = sgprs[DecodedSgprReg(inst.src1)].attrib_id;
+								dst.prolog_loads = sgprs[DecodedSgprReg(inst.src1)].prolog_loads;
+								dst.prolog_loads.push_back(inst.pc);
 							}
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
@@ -371,8 +475,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 						ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg);
 					}
 					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgpr_is_index.size() &&
-					    IsDecodedVgpr(inst.src0) && inst.src0.reg == instance_index_reg &&
-					    IsDecodedVgpr(inst.src1) && inst.src1.reg == vertex_index_reg) {
+					    IsDecodedVgpr(inst.src0) && inst.src0.reg == 8 &&
+					    IsDecodedVgpr(inst.src1) && inst.src1.reg == 5) {
 						vgpr_is_index[inst.dst.reg] = true;
 					}
 				} else if (IsEmbeddedFetchAttribPropagationAlu(inst)) {
@@ -397,6 +501,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 									break;
 								default: dst.value = src0 + src1; break;
 							}
+							dst.prolog_loads.clear();
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, 1);
 						}
@@ -419,6 +524,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 						load.pc           = inst.pc;
 						load.attrib_id    = buffer.attrib_id;
 						load.components   = DecodedDstSize(inst);
+						load.prolog_loads = buffer.prolog_loads;
 					}
 				}
 				break;
@@ -440,9 +546,22 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
                                     std::vector<uint32_t>& joined_code) {
 	EXIT_IF(back.empty());
-	auto       result      = Decoder::DecodeFrontProgram(front);
-	const auto front_words = static_cast<uint32_t>(result.code.size());
-	joined_code.assign(result.code.begin(), result.code.end());
+	Decoder::Program result;
+	uint32_t         front_words = 0;
+	while (front_words < front.size()) {
+		auto& inst = result.instructions.emplace_back();
+		Decoder::DecodeInstruction(front, front_words, inst);
+		front_words += inst.word_count;
+		if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
+			                     inst.src0.reg != 6u);
+			break;
+		}
+		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_ENDPGM);
+	}
+	EXIT_IF(result.instructions.empty() ||
+	        result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64);
+	joined_code.assign(front.begin(), front.begin() + front_words);
 	joined_code.insert(joined_code.end(), back.begin(), back.end());
 	// The merged-stage ABI passes the back shader in s[6:7]. Give that handoff an
 	// ordinary CFG edge, retaining both bodies in one register and LDS lifetime.
@@ -451,7 +570,6 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	Decoder::DecodeInstruction(joined_code, front_words - 1u, result.instructions.back());
 	Decoder::Program back_program;
 	Decoder::DecodeProgram(back, back_program);
-	result.has_swap_pc |= back_program.has_swap_pc;
 	const auto back_pc = front_words * sizeof(uint32_t);
 	for (auto& inst: back_program.instructions) {
 		// A back-stage PC-relative data reference requires its guest code address.
@@ -464,412 +582,186 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
-void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
-	using namespace IR;
-	EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
-	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
-		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
-		source.calls.push_back({.instruction = i});
-	}
-	const auto graph = CFG::BuildGraph(source.decoded);
-	Program query;
-	query.stage = options.stage;
-	query.user_data_base = options.user_data_base;
-	query.user_data_count = static_cast<uint32_t>(options.user_data.size());
-	query.wave_size = options.wave_size;
-	auto& block = *query.block_storage.emplace_back(std::make_unique<Block>());
-	query.blocks.push_back(&block);
-	struct Producer { bool ready = false; std::map<uint32_t, Value> values; };
-	std::map<uint32_t, Producer> producers;
-	std::function<Value(uint32_t, uint32_t)> Register;
-	std::function<Value(uint32_t, Value)> Resolve = [&](uint32_t before, Value value) -> Value {
-		value = value.Resolve();
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) return value;
-		uint32_t code = UINT32_MAX;
-		switch (inst->GetOpcode()) {
-			case ValueOpcode::GetScalarRegister: code = static_cast<uint32_t>(inst->Arg(0).ScalarRegister()); break;
-			case ValueOpcode::GetVccLo: code = 106u; break;
-			case ValueOpcode::GetVccHi: code = 107u; break;
-			default: break;
-		}
-		if (code != UINT32_MAX) {
-			const auto result = Register(before, code);
-			inst->ReplaceUsesWith(result);
-			return result;
-		}
-		for (size_t i = 0; i < inst->NumArgs(); ++i) inst->SetArg(i, Resolve(before, inst->Arg(i)));
-		return value;
-	};
-	Register = [&](uint32_t before, uint32_t code) -> Value {
-		std::vector<uint32_t> crossed_calls;
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
-		for (const auto crossed: crossed_calls) {
-			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
-		}
-		if (index == UINT32_MAX) {
-			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
-			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
-		}
-		auto [entry, inserted] = producers.try_emplace(index);
-		auto& producer = entry->second;
-		if (inserted) {
-			Block translated;
-			Frontend::Translator translator(query, &translated, 1u,
-			    (options.input_info.compute->float_mode & 0x10u) == 0u,
-			    !options.input_info.compute->async_compute);
-			translator.TranslateInstruction(source.decoded.instructions[index]);
-			for (const auto& inst: translated) {
-				uint32_t destination = UINT32_MAX;
-				Value value;
-				switch (inst.GetOpcode()) {
-					case ValueOpcode::SetScalarRegister:
-						destination = static_cast<uint32_t>(inst.Arg(0).ScalarRegister()); value = inst.Arg(1); break;
-					case ValueOpcode::SetVccLo: destination = 106u; value = inst.Arg(0); break;
-					case ValueOpcode::SetVccHi: destination = 107u; value = inst.Arg(0); break;
-					default: break;
-				}
-				if (destination != UINT32_MAX) producer.values.insert_or_assign(destination, value);
-			}
-			for (auto& [destination, value]: producer.values) value = Resolve(index, value);
-			for (auto& inst: translated) inst.SetParent(&block);
-			block.Instructions().splice(block.end(), translated.Instructions());
-			producer.ready = true;
-		}
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
-		return producer.values.at(code).Resolve();
-	};
-	for (auto& site: source.calls) {
-		const auto& call = source.decoded.instructions[site.instruction];
-		EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
-		                     call.dst.kind != Decoder::OperandKind::Sgpr ||
-		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
-		for (uint32_t i = 0; i < 2u; ++i) {
-			const auto value = Register(site.instruction, call.src0.reg + i);
-			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
-				source.unsupported_call_pc = call.pc;
-				source.calls.clear();
-				return;
-			}
-			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
-			root.SetArg(0, value);
-			site.target[i] = Value(&root);
-		}
-	}
-	RewriteToSsa(query.blocks);
-	ConstantPropagationPass(query.blocks, query.wave_size);
-	RemoveIdentities(query);
-	EliminateDeadCode(query.blocks);
-	for (auto& site: source.calls)
-		for (auto& value: site.target) value = value.Instruction()->Arg(0).Resolve();
-	query.value_storage.clear();
-	for (auto& inst: block) {
-		inst.SetParent(nullptr);
-		if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 || inst.GetOpcode() == ValueOpcode::ReadConstBuffer)
-			inst.SetFlags(MemoryFlags {.index = inst.Flags<MemoryFlags>().index});
-	}
-	query.value_storage.splice(query.value_storage.end(), block.Instructions());
-	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
-	std::vector<Value> targets;
-	for (const auto& site: source.calls) targets.insert(targets.end(), site.target.begin(), site.target.end());
-	CompileSrtWalker(source.call_targets, targets);
-}
-
 } // namespace
 
-const char* StageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Compute: return "CS";
-		case ShaderType::Vertex: return "VS";
-		case ShaderType::Local: return "LS";
-		case ShaderType::TessellationControl: return "HS";
-		case ShaderType::TessellationEvaluation: return "TES";
-		case ShaderType::Mesh: return "MS";
-		case ShaderType::Pixel: return "PS";
-		default: return "unknown";
-	}
-}
-
-ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
-	EXIT_IF(code.empty());
-	ShaderSource source;
-	if (!options.back_code.empty()) {
-		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
-	} else if (options.stage == ShaderType::Local) {
-		source.decoded = Decoder::DecodeFrontProgram(code);
-		auto& handoff = source.decoded.instructions.back();
-		handoff.opcode = Decoder::Opcode::S_ENDPGM;
-		handoff.src_count = 0;
-	} else {
-		Decoder::DecodeProgram(code, source.decoded);
-	}
-	if (source.decoded.has_swap_pc) {
-		PrepareCallTargets(source, options);
-		source.code.assign(code.begin(), code.end());
-		source.decoded.code = source.code;
-	}
-	return source;
-}
-
-const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
-	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
-	auto& reads = source.reads;
-	reads.clear();
-	std::vector<uint32_t> flat;
-	const bool walked = IR::WalkSrt(source.call_targets, runtime, flat, &reads);
-	const auto read_code = [&](uint64_t address, std::span<uint32_t> words) {
-		if (runtime.read_specialization_memory == nullptr ||
-		    !runtime.read_specialization_memory(runtime.userdata, address, words)) return false;
-		reads.emplace_back(address, words.size_bytes());
-		return true;
-	};
-	for (auto& site: source.calls) {
-		uint32_t low = 0, high = 0;
-		if (!walked || !IR::WalkedValue(source.call_targets, site.target[0], low) ||
-		    !IR::WalkedValue(source.call_targets, site.target[1], high))
-			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
-			     source.decoded.instructions[site.instruction].pc);
-		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
-		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
-		EXIT_IF(address == 0u);
-		site.address = address;
-	}
-	const auto query_reads = reads.size();
-	if (source.linked) {
-		auto& linked = *source.linked;
-		bool unchanged = true;
-		for (size_t i = 0; i < source.calls.size(); ++i) {
-			const auto& function = linked.functions[i];
-			const auto expected = std::span(linked.code).subspan(function.offset, function.size);
-			const auto preceding = std::span(source.calls).first(i);
-			const auto previous = std::ranges::find(preceding, source.calls[i].address, &ShaderSource::Call::address);
-			if (previous != preceding.end()) {
-				const auto& observed = linked.functions[previous - preceding.begin()];
-				if (std::ranges::equal(expected, std::span(linked.code).subspan(observed.offset, observed.size))) continue;
-				unchanged = false;
-				break;
-			}
-			linked.observed_function.resize(function.size);
-			if (!read_code(source.calls[i].address, linked.observed_function) ||
-			    !std::ranges::equal(expected, linked.observed_function)) {
-				unchanged = false;
-				break;
-			}
-		}
-		if (unchanged) return linked.decoded;
-		reads.resize(query_reads);
-	}
-	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
-	const auto& last = source.decoded.instructions.back();
-	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
-	// Keep the caller's data/footer at native offsets. Expand leaf CFGs per call site
-	// before SSA, so return edges neither require a dispatcher nor merge resource roots.
-	uint32_t function_pc = last.pc + last.word_count * sizeof(uint32_t);
-	std::map<uint64_t, std::vector<Decoder::Instruction>> functions;
-	for (size_t i = 0; i < source.calls.size(); ++i) {
-		const auto& site = source.calls[i];
-		const auto& call = source.decoded.instructions[site.instruction];
-		const auto address = source.calls[i].address;
-		auto [entry, inserted] = functions.try_emplace(address);
-		auto& function = entry->second;
-		if (inserted) {
-			for (uint32_t index = 0;;) {
-				std::array<uint32_t, Decoder::MaxInstructionRawWords> words {};
-				EXIT_IF(index > UINT32_MAX / sizeof(uint32_t) - words.size() ||
-				        address > UINT64_MAX - (uint64_t {index} + words.size()) * sizeof(uint32_t));
-				uint32_t count = 1;
-				Decoder::Instruction inst;
-				for (;;) {
-					if (!read_code(address + uint64_t {index} * sizeof(uint32_t), std::span(words).first(count)))
-						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
-					inst = {};
-					Decoder::DecodeInstruction(words, 0u, inst);
-					if (inst.word_count <= count) break;
-					count = inst.word_count;
-				}
-				inst.pc = index * sizeof(uint32_t);
-				if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
-				index += inst.word_count;
-				EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_ENDPGM);
-				function.push_back(inst);
-				if (inst.opcode == Decoder::Opcode::S_SETPC_B64) break;
-			}
-		}
-		const uint32_t function_size = function.back().pc + function.back().word_count * sizeof(uint32_t);
-		EXIT_IF(function_pc > UINT32_MAX - function_size);
-		const auto function_offset = static_cast<uint32_t>(linked.code.size());
-		for (auto inst: function) {
-			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
-			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
-			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
-				if (site.preserved_registers[code] && CFG::MayWriteScalarRegister(inst, code))
-					EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
-			}
-			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
-			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
-				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
-				inst.opcode = Decoder::Opcode::S_BRANCH;
-				inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
-			} else if (Decoder::IsDirectBranch(inst.opcode)) {
-				EXIT_IF(inst.branch_target >= function_size);
-				inst.branch_target += function_pc;
-			}
-			inst.pc += function_pc;
-			linked.decoded.instructions.push_back(std::move(inst));
-		}
-		linked.functions.push_back({function_offset, function_size / 4u});
-		linked.decoded.instructions[site.instruction].branch_target = function_pc;
-		function_pc += function_size;
-	}
-	reads.resize(query_reads);
-	for (size_t i = 0; i < source.calls.size(); ++i) {
-		const auto preceding = std::span(source.calls).first(i);
-		if (std::ranges::find(preceding, source.calls[i].address, &ShaderSource::Call::address) == preceding.end())
-			reads.emplace_back(source.calls[i].address, linked.functions[i].size * sizeof(uint32_t));
-	}
-	linked.decoded.code = linked.code;
-	linked.observed_function.resize(std::ranges::max_element(linked.functions, {},
-	    &ShaderSource::Linked::Function::size)->size);
-
-	source.linked = std::move(linked);
-	++source.revision;
-	return source.linked->decoded;
-}
-
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
-	auto source = PrepareShaderSource(code, options);
-	return TranslateProgram(source.decoded, options);
-}
-
-TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
-	EXIT_IF(decoded.instructions.empty());
-	if (decoded.has_swap_pc) {
-		for (const auto& inst: decoded.instructions) {
-			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
-				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
-		}
+	if (code.empty()) {
+		EXIT("shader recompiler input is empty\n");
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
+	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh) {
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
 
-	const auto* stage        = StageName(options.stage);
 	const auto compile_begin = std::chrono::steady_clock::now();
-	const auto phase_ms = [&compile_begin]() {
+	const auto phase_ms      = [&compile_begin]() {
 		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-		    std::chrono::steady_clock::now() - compile_begin).count());
+		                                 std::chrono::steady_clock::now() - compile_begin)
+		                                 .count());
 	};
+
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(code.size()));
+
+	// The decoded instructions go in the thread's vector of its last program's, its capacity kept (up to 8 MiB): a new one
+	// of ~0.8 MiB for every program was memory the system had to zero-fill (the shader prefetch's threads: 5 GB a minute).
+	static thread_local std::vector<Decoder::Instruction> t_instructions;
+	Decoder::Program decoded;
+	decoded.instructions = std::move(t_instructions);
+	struct KeepInstructions {
+		Decoder::Program& program;
+		~KeepInstructions() {
+			if (program.instructions.capacity() * sizeof(Decoder::Instruction) <= (size_t {8} << 20u))
+				t_instructions = std::move(program.instructions);
+		}
+	} keep_instructions {decoded};
+	std::vector<uint32_t> joined_code;
+	if (!options.back_code.empty()) {
+		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+	} else {
+		Decoder::DecodeProgram(code, decoded);
+	}
+	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
+	                  decoded);
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
-		LOGF("ShaderRecompiler %s decoded RDNA2:\n%s", stage, decoded_dump.c_str());
-	}
-
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG BuildGraph\n", stage,
-	     options.shader_hash);
-	auto native_cfg = CFG::BuildGraph(decoded);
-	CFG::Graph structured_cfg;
-	auto* selected_cfg = &native_cfg;
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
-	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash,
-	     static_cast<uint64_t>(native_cfg.blocks.size()),
-	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
-	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	if (native_cfg.irreducible) {
-		LogDispatcherFallback(options, native_cfg, "build");
-	} else {
-		LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG Structurize\n", stage,
-		     options.shader_hash);
-		structured_cfg = CFG::Structurize(native_cfg);
-		if (structured_cfg.unsupported) {
-			native_cfg.unsupported = true;
-			native_cfg.failure_kind = structured_cfg.failure_kind;
-			native_cfg.failure_block = structured_cfg.failure_block;
-			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
-			LogDispatcherFallback(options, native_cfg, "structurize");
-		} else {
-			selected_cfg = &structured_cfg;
-			LOGF("ShaderRecompiler %s structured CFG success: blocks=%" PRIu64 "\n", stage,
-			     static_cast<uint64_t>(selected_cfg->blocks.size()));
+		if (options.early_dump) {
+			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options), decoded_dump.c_str());
 		}
-		LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
-		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-		     stage, options.shader_hash,
-		     static_cast<uint64_t>(selected_cfg->blocks.size()),
-		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
 
-	const auto& cfg = *selected_cfg;
-	Frontend::EmbeddedFetchPlan embedded_fetch;
-	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
-	    options.input_info.vertex->fetch_embedded) {
-		embedded_fetch = DetectEmbeddedVertexFetch(
-		    decoded, *options.input_info.vertex, options.user_data_base,
-		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+	     StageName(options.stage), options.shader_hash);
+	auto cfg = CFG::BuildGraph(decoded);
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+	bool        dispatcher_fallback = false;
+	std::string dispatcher_reason;
+	if (cfg.irreducible) {
+		dispatcher_fallback = true;
+		dispatcher_reason   = cfg.unsupported_reason;
+		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+	} else {
+		const auto unstructured_cfg = cfg;
+		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+		if (!CFG::Structurize(cfg)) {
+			dispatcher_fallback      = true;
+			dispatcher_reason        = cfg.unsupported_reason;
+			const auto failure_kind  = cfg.failure_kind;
+			const auto failure_block = cfg.failure_block;
+			LogDispatcherFallback(options, cfg, "structurize", dispatcher_reason);
+			cfg                    = unstructured_cfg;
+			cfg.unsupported        = true;
+			cfg.failure_kind       = failure_kind;
+			cfg.failure_block      = failure_block;
+			cfg.unsupported_reason = dispatcher_reason;
+		} else {
+			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+			     static_cast<uint64_t>(cfg.blocks.size()));
+		}
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		     static_cast<uint64_t>(cfg.blocks.size()),
+		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
+	}
+
+	const ShaderVertexInputInfo*  vertex  = nullptr;
+	const ShaderPixelInputInfo*   pixel   = nullptr;
+	const ShaderComputeInputInfo* compute = nullptr;
+	switch (options.stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
+		case ShaderType::Pixel:
+			pixel = options.input_info.pixel;
+			break;
+		case ShaderType::Compute:
+			compute = options.input_info.compute;
+			break;
+		default: break;
+	}
+	EmbeddedFetchData embedded_fetch;
+	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
+		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, options.user_data_base,
+		                                           static_cast<uint32_t>(options.user_data.size()),
+		                                           options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
-			LOGF("ShaderRecompiler %s embedded vertex fetch plan: detected=%" PRIu64 "\n", stage,
+			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage            = options.stage,
-	    .wave_size        = options.wave_size,
-	    .shader_hash      = options.shader_hash,
-	    .user_data_base   = options.user_data_base,
-	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info       = options.input_info,
-	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .stage               = options.stage,
+	    .wave_size           = options.wave_size,
+	    .shader_hash         = options.shader_hash,
+	    .user_data_base      = options.user_data_base,
+	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
+	    .scratch_dwords      = options.scratch_dwords,
+	    .dispatcher_fallback = dispatcher_fallback,
+	    .cfg_failure_kind    = cfg.failure_kind,
+	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
+	                                                    : dispatcher_reason,
+	    .vertex              = vertex,
+	    .pixel               = pixel,
+	    .compute             = compute,
+	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
-	     options.shader_hash);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
-	const auto simplify = [&ir] {
-		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-		IR::RemoveIdentities(ir);
-		IR::EliminateDeadCode(ir.blocks);
-	};
-	simplify();
+	IR::ConstantPropagationPass(ir.blocks);
+	IR::ResolveControlFlowIdentities(ir);
+	IR::RemoveIdentities(ir.blocks);
+	IR::EliminateDeadCode(ir.blocks);
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
-	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
-		LOGF("ShaderRecompiler %s read-lane elimination: reads=%" PRIu32
-		     " reductions=%" PRIu32 "\n",
-		     stage, read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
+	if (read_lane_stats.rewritten_reads != 0) {
+		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
+		     read_lane_stats.rewritten_reads);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
 	}
-	// Cleanup also exposes profitable folds by removing dead predicate consumers.
-	simplify();
-	if (decoded.has_swap_pc) {
-		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
-		for (const auto* block: ir.blocks)
-			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
+	const auto waterfalls = IR::RewriteWaterfallDescriptors(ir);
+	if (waterfalls != 0) {
+		LOGF("%s waterfall descriptor de-scalarization: stage=%s hash=0x%016" PRIx64
+		     " loops=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, waterfalls);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
 	}
-	LowerTessellationMemory(ir, options);
-	std::string cfg_dump;
-	if (options.dump_ir) {
-		cfg_dump = CFG::GraphToString(cfg);
-		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
-		     MakeIrDump(cfg_dump, ir).c_str());
+	IR::BuildSrtPlan(ir);
+	IR::EliminateDeadCode(ir.blocks);
+	if (options.dump_ir && options.early_dump) {
+		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+		     IR::ProgramToString(ir).c_str());
 	}
-	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	IR::TrackResources(ir);
+	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
-		result.cfg_dump     = std::move(cfg_dump);
+		result.cfg_dump     = CFG::GraphToString(cfg);
 	}
 	return result;
 }
@@ -879,63 +771,61 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
-	const auto* stage = StageName(ir.stage);
 	IR::ApplyResourceSpecialization(ir, specialization);
-	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
-	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
-	for (auto& inst: ir.value_storage) {
-		inst.Invalidate();
-	}
-	for (auto* block: ir.blocks) {
-		for (auto& inst: *block) {
-			const auto op = inst.GetOpcode();
-			uint32_t first = 0;
-			if (op == IR::ValueOpcode::GetBufferResource) {
-				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-					       IR::ResourceKind::IndirectBuffer;
-				})) {
-					continue;
-				}
-				const auto resource = inst.Flags<uint32_t>();
-				first               = resource < ir.info.buffers.size() &&
-				                              ir.info.buffers[resource].indirect_root == resource
-				                          ? 1u
-				                          : 0u;
-			} else if (op == IR::ValueOpcode::GetImageResource) {
-				const auto resource = inst.Flags<uint32_t>();
-				first = resource < ir.info.images.size() &&
-				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
-			} else if (op == IR::ValueOpcode::GetSamplerResource) {
-				const auto resource = inst.Flags<uint32_t>();
-				first = resource < ir.info.samplers.size() &&
-				                !ir.info.samplers[resource].indirect_resources.empty() ? 1u : 0u;
-			} else {
-				continue;
-			}
-			for (size_t index = first; index < inst.NumArgs(); index++) {
-				inst.SetArg(index, IR::Value(0u));
-			}
+	IR::RemoveIdentities(ir.blocks);
+	IR::EliminateDeadCode(ir.blocks);
+	if ((Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureExecSelects) != 0) {
+		const auto selects = IR::EliminateExecSelects(ir.blocks);
+		if (selects.bypassed != 0 || selects.dropped != 0) {
+			LOGF("%s exec selects: bypassed=%" PRIu32 " dropped=%" PRIu32 "\n", GetDumpLabel(options), selects.bypassed,
+			     selects.dropped);
+			IR::EliminateDeadCode(ir.blocks);
 		}
 	}
-	ir.value_storage.clear();
-	IR::RemoveIdentities(ir);
-	IR::EliminateDeadCode(ir.blocks);
 
-	IR::CollectShaderInfo(ir, options.input_info);
+	const ShaderVertexInputInfo*  vertex  = nullptr;
+	const ShaderPixelInputInfo*   pixel   = nullptr;
+	const ShaderComputeInputInfo* compute = nullptr;
+	switch (options.stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
+		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
+		case ShaderType::Compute: compute = options.input_info.compute; break;
+		default: EXIT("invalid shader stage\n");
+	}
+
+	IR::ShaderInfoOptions info_options;
+	info_options.vertex  = vertex;
+	info_options.pixel   = pixel;
+	info_options.compute = compute;
+	IR::CollectShaderInfo(ir, info_options);
+	if (options.table_mode) {
+		IR::EnterTableMode(ir);
+		ir.table_slots_at_use = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0;
+	}
+	ir.native_float_min_max =
+	    (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureNativeFloatMinMax) != 0;
+	ir.bda_group_walks = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureBdaGroupWalks) != 0;
+	ir.pixel_quad_reads = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePixelQuadReads) != 0;
+	ir.unfused_mad = (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureUnfusedMad) != 0;
+	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
+	DumpShaderIr(options, ir);
+	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
-		LOGF("ShaderRecompiler %s native IR:\n%s", stage, ir_dump.c_str());
+		if (options.early_dump) {
+			LOGF("%s native IR and bindings (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
+		}
 	}
 
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
-	     ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
-	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
-	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(spirv.size()),
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
@@ -947,6 +837,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		result.ir_dump      = std::move(ir_dump);
 	}
 	return result;
+}
+
+void RecycleSpirv(std::vector<uint32_t>&& spirv) {
+	Spirv::Builder::Recycle(std::move(spirv));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

@@ -9,21 +9,14 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-// Host device capabilities that change the emitted SPIR-V. Built once per device.
-struct Profile {
-	bool maintenance8         = false; // Dynamic texel offsets on image samples.
-	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
-	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
-	uint32_t device_clock_period_ps = 0;
-};
+void AnalyzeProgramRequirements(IR::Program& program);
 
-inline constexpr Profile DefaultProfile {};
+std::vector<uint32_t> EmitProgram(const IR::Program& program,
+                                  ShaderStageInputInfo input_info);
 
-// Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
-std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t       push_data_start_dword = 0,
-                                  const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+// Whether the GPU has subgroup quad operations in pixel shaders (default: yes), set with the device before anything is
+// translated: DPP quad_perm moves in pixel shaders read by them, or by shuffles without them.
+void SetPixelQuadOperations(bool supported);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

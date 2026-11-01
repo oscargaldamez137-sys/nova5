@@ -714,9 +714,18 @@ public sealed class MainWindow : Window
 	private sealed record Setting(string Label, Func<string> Value, Action<int> Change);
 
 	private static readonly string[] Resolutions = { "R1280X720", "R1920X1080", "R2560X1440", "R3840X2160" };
+	private static readonly int[] RefreshRates = { 60, 120, 144 };
+
+	private int RefreshRate() =>
+	    int.TryParse(_emulator.Ini.Get("GlobalConfiguration", "vblank_frequency"), out var hz) ? hz : 60;
 
 	private List<Setting> Settings() => new()
 	{
+		DemonsSoulsToggle("Demon's Souls: espera de workers (experimental)", "ds_idle_enabled"),
+		DemonsSoulsToggle("Demon's Souls: pausa en bucle de espera (experimental)", "ds_spin_backoff_enabled"),
+		DemonsSoulsToggle("Demon's Souls: desactivar culling de índices (experimental)", "ds_disable_index_culling"),
+		DemonsSoulsToggle("Demon's Souls: afinidad a núcleos P (experimental)", "ds_affinity_enabled"),
+		DemonsSoulsToggle("Demon's Souls: prioridad de render (experimental)", "ds_render_priority_enabled"),
 		Toggle("Pantalla completa al jugar", "fullscreen_enabled", true),
 		new("Resolución", () => _emulator.Ini.Get("GlobalConfiguration", "screen_resolution")?.TrimStart('R').Replace('X', '×') ?? "1920×1080",
 		    step =>
@@ -724,6 +733,13 @@ public sealed class MainWindow : Window
 			    var current = Array.IndexOf(Resolutions, _emulator.Ini.Get("GlobalConfiguration", "screen_resolution") ?? "R1920X1080");
 			    SetIni("screen_resolution", Resolutions[(Math.Max(current, 0) + step + Resolutions.Length) % Resolutions.Length]);
 		    }),
+		// Emulated display refresh. At 119 Hz or more games are told the screen is 120 Hz, so
+		// those with a 120 Hz mode can pass 60 FPS; games that count vblanks could run faster.
+		new("Frecuencia de pantalla", () => $"{RefreshRate()} Hz", step =>
+		{
+			var current = Array.IndexOf(RefreshRates, RefreshRate());
+			SetIni("vblank_frequency", RefreshRates[(Math.Max(current, 0) + step + RefreshRates.Length) % RefreshRates.Length].ToString());
+		}),
 		Toggle("Contador de FPS en pantalla", "perf_overlay_enabled", false),
 		Toggle("Caché de shaders (cargas más rápidas)", "shader_cache_enabled", true),
 		Toggle("Compatibilidad de CPU (--amd-cpu)", "amd_cpu_enabled", false),
@@ -752,6 +768,13 @@ public sealed class MainWindow : Window
 		    _ => Process.Start(new ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),
 		new("Salir de Nova5", () => "", _ => ShowPrompt(true)),
 	};
+
+	private Setting DemonsSoulsToggle(string label, string key)
+	{
+		var variable = DemonsSoulsOptions.Switches.Single(s => s.Key == key).Variable;
+		bool Enabled() => DemonsSoulsOptions.Effective(_emulator.Ini.Get("GlobalConfiguration", key), Environment.GetEnvironmentVariable(variable));
+		return new(label, () => Enabled() ? "Sí" : "No", _ => SetIni(key, Enabled() ? "false" : "true"));
+	}
 
 	private Setting Toggle(string label, string key, bool fallback) =>
 	    new(label, () => _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? "Sí" : "No",

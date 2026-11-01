@@ -1,6 +1,26 @@
-﻿#include "graphics/presentation/window.h"
+#include "graphics/presentation/window.h"
 
+#include "SDL.h"
+#include "SDL_error.h"
+#include "SDL_events.h"
+#include "SDL_filesystem.h"
+#include "SDL_gamecontroller.h"
+#include "SDL_hints.h"
+#include "SDL_joystick.h"
+#include "SDL_keyboard.h"
+#include "SDL_keycode.h"
+#include "SDL_mouse.h"
+#include "SDL_pixels.h"
+#include "SDL_rwops.h"
+#include "SDL_stdinc.h"
+#include "SDL_surface.h"
+#include "SDL_syswm.h"
+#include "SDL_thread.h"
+#include "SDL_touch.h"
+#include "SDL_video.h"
+#include "SDL_vulkan.h"
 #include "common/assert.h"
+#include "common/termination.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -12,30 +32,41 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/demonsSoulsWarp.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "local-platform.h"
+#include "local/input-trace.h"
+#include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/startupProgress.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
-#include <SDL3/SDL.h>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdlib>
-#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_SIMD
 #include "stb_image.h"
 
 // IWYU pragma: no_include <intrin.h>
 
+#define KYTY_ENABLE_DEBUG_PRINTF
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
@@ -52,22 +83,41 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
+static uint32_t ControllerButtonToPadButton(int button) {
+	switch (button) {
+		case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CROSS;
+		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
+		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
+		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
+		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
+		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
+		case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return Controller::PAD_BUTTON_L1;
+		case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return Controller::PAD_BUTTON_R1;
+		case SDL_CONTROLLER_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
+		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
+		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
+		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
+		default: return 0;
+	}
+}
 
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
-		case SDL_GAMEPAD_AXIS_LEFTX: return Controller::Axis::LeftX;
-		case SDL_GAMEPAD_AXIS_LEFTY: return Controller::Axis::LeftY;
-		case SDL_GAMEPAD_AXIS_RIGHTX: return Controller::Axis::RightX;
-		case SDL_GAMEPAD_AXIS_RIGHTY: return Controller::Axis::RightY;
-		case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: return Controller::Axis::TriggerLeft;
-		case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: return Controller::Axis::TriggerRight;
+		case SDL_CONTROLLER_AXIS_LEFTX: return Controller::Axis::LeftX;
+		case SDL_CONTROLLER_AXIS_LEFTY: return Controller::Axis::LeftY;
+		case SDL_CONTROLLER_AXIS_RIGHTX: return Controller::Axis::RightX;
+		case SDL_CONTROLLER_AXIS_RIGHTY: return Controller::Axis::RightY;
+		case SDL_CONTROLLER_AXIS_TRIGGERLEFT: return Controller::Axis::TriggerLeft;
+		case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: return Controller::Axis::TriggerRight;
 		default: return Controller::Axis::AxisMax;
 	}
 }
 
 static bool ControllerAxisIsTrigger(int axis_id) {
-	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-	       axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+	return axis_id == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
+	       axis_id == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
 }
 
 static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
@@ -75,6 +125,57 @@ static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
 	           ? Controller::controller_get_axis(0, SDL_JOYSTICK_AXIS_MAX, axis_value)
 	           : Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
 	                                             axis_value);
+}
+
+// The sticks of a pad other than a PlayStation one, whose sticks rest a few percent off centre (more as they wear): a
+// round dead zone of KYTY_PAD_DEADZONE percent of the range (12 by default, 0 none), the rest stretched to the full
+// range, which the stick reaches at KYTY_PAD_DEADZONE_OUTER percent of it (90 by default). On an Xbox pad the character
+// kept walking slowly after a run let go (issue #236); with the dead zone stretched to the edge alone, a stick pushed all
+// the way (a little under its full range at some angles) lost the run more easily. PlayStation pads are passed as they
+// are, to the game's own dead zone as on a PS5; so is the Steam Deck build's pad (Steam Input has one).
+static int PadDeadZonePercent() {
+	static const int percent = [] {
+#if defined(KYTY_STEAM_DECK)
+		const int fallback = 0;
+#else
+		const int fallback = 12;
+#endif
+		const char* value = std::getenv("KYTY_PAD_DEADZONE");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 50) : fallback;
+	}();
+	return percent;
+}
+
+static int PadOuterPercent() {
+	static const int percent = [] {
+		const char* value = std::getenv("KYTY_PAD_DEADZONE_OUTER");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 60, 100) : 90;
+	}();
+	return percent;
+}
+
+// The stick of `axis_id` with the dead zone, both its axes set (PadDeadZonePercent, PadOuterPercent); false: as it is.
+static bool SetStickWithDeadZone(int id, int axis_id) {
+	const int percent = PadDeadZonePercent();
+	if (percent == 0 || ControllerAxisIsTrigger(axis_id)) return false;
+	auto* pad = SDL_GameControllerFromInstanceID(id);
+	if (pad == nullptr) return false;
+	const auto type = SDL_GameControllerGetType(pad);
+	if (type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5) return false;
+	const bool left   = axis_id == SDL_CONTROLLER_AXIS_LEFTX || axis_id == SDL_CONTROLLER_AXIS_LEFTY;
+	const auto axis_x = left ? SDL_CONTROLLER_AXIS_LEFTX : SDL_CONTROLLER_AXIS_RIGHTX;
+	const auto axis_y = left ? SDL_CONTROLLER_AXIS_LEFTY : SDL_CONTROLLER_AXIS_RIGHTY;
+	const double x = SDL_GameControllerGetAxis(pad, axis_x), y = SDL_GameControllerGetAxis(pad, axis_y);
+	const double radius = std::sqrt(x * x + y * y) / SDL_JOYSTICK_AXIS_MAX;
+	const double dead   = percent / 100.0;
+	const double outer  = std::max(dead + 0.05, PadOuterPercent() / 100.0);
+	const double scale  = radius <= dead ? 0.0 : std::min(1.0, (radius - dead) / (outer - dead)) / radius;
+	const auto   value  = [&](double v) {
+        return static_cast<int>(std::clamp(std::lround(v * scale), long {SDL_JOYSTICK_AXIS_MIN}, long {SDL_JOYSTICK_AXIS_MAX}));
+	};
+	Controller::SetAxis(id, ControllerAxisFromSdl(axis_x), ControllerAxisValueFromSdl(axis_x, value(x)));
+	Controller::SetAxis(id, ControllerAxisFromSdl(axis_y), ControllerAxisValueFromSdl(axis_y, value(y)));
+	return true;
 }
 
 struct EventMouse {
@@ -128,13 +229,37 @@ struct EventController {
 	double timestamp_seconds;
 };
 
+enum class DisplayOrientation {
+	Unknown,   /* The display orientation can't be determined */
+	Landscape, /* The display is in landscape mode, with the right side up, relative to portrait
+	              mode */
+	LandscapeFlipped, /* The display is in landscape mode, with the left side up, relative to
+	                     portrait mode */
+	Portrait,         /* The display is in portrait mode */
+	PortraitFlipped,  /* The display is in portrait mode, upside down */
+
+	DisplayEventOrientation = 0xF0
+};
+
+struct EventDisplay {
+	DisplayOrientation orientation;
+};
+
+constexpr uint32_t KYTY_SDL_BUTTON_LMASK  = SDL_BUTTON_LMASK;  // NOLINT(hicpp-signed-bitwise)
+constexpr uint32_t KYTY_SDL_BUTTON_MMASK  = SDL_BUTTON_MMASK;  // NOLINT(hicpp-signed-bitwise)
+constexpr uint32_t KYTY_SDL_BUTTON_RMASK  = SDL_BUTTON_RMASK;  // NOLINT(hicpp-signed-bitwise)
+constexpr uint32_t KYTY_SDL_BUTTON_X1MASK = SDL_BUTTON_X1MASK; // NOLINT(hicpp-signed-bitwise)
+constexpr uint32_t KYTY_SDL_BUTTON_X2MASK = SDL_BUTTON_X2MASK; // NOLINT(hicpp-signed-bitwise)
+
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+std::atomic<uint32_t>          g_output_width {0}, g_output_height {0}; // WindowOutputSize
 
 } // namespace
 
-constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
+constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Nova5";
+constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
 static void SetPause(WindowLoopState& game, bool flag) {
 	LOGF("Pause: %s\n", flag ? "true" : "false");
@@ -142,13 +267,15 @@ static void SetPause(WindowLoopState& game, bool flag) {
 	game.paused.store(flag, std::memory_order_release);
 }
 
-static void GameEventQuit(WindowLoopState& game) {
+static void GameEventQuit(WindowLoopState& game, const char* origin = "SDL/OS; producer unknown") {
+	Common::Termination::Report("SDL_QUIT", 0, 0, false, origin);
 	LOGF("Event: quit\n");
 
 	game.need_exit = true;
 }
 
 static void GameEventTerminate(WindowLoopState& game) {
+	Common::Termination::Report("SDL_APP_TERMINATING", 0, 0, false, "SDL/OS");
 	LOGF("Event: terminate\n");
 
 	game.need_exit = true;
@@ -160,14 +287,25 @@ static void ToggleDesktopFullscreen() {
 	}
 
 	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
-	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
+	const bool fullscreen =
+	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode =
+	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
+	} else if (g_window->presenter != nullptr) {
+		// (A full screen of the window's own size changes nothing a present reports; FSR's frame generation swapchain
+		// then kept presenting to the window it had: the picture froze, issue #174.)
+		g_window->presenter->RequestSwapchainRecreate();
 	}
 }
 
-static void GameEventKeyboard(const EventKeyboard& key) {
+static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	static SDL_Keycode fullscreen_key = SDLK_UNKNOWN;
+	if (key.key_code == SDLK_F2 || (key.key_code == SDLK_p && (key.mod & KMOD_GUI) != 0)) {
+		if (key.down && !key.repeat) PerfOverlay::Toggle();
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	LOGF("Key: time = %.04f, %s%s, %s%s, %s, scan = %d, key = %d, mod = %04" PRIx16 "\n",
@@ -179,9 +317,18 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_F1:
+			// Space pauses and resumes, unless the keymap gives it to the game or the default keys do not count (the Steam
+			// Deck build: Steam's desktop layout sends Space for one of the Deck's buttons, and a press of it left the game
+			// paused, its picture frozen, 10-28); the Pause key always does.
+			case SDLK_SPACE:
+				if (!HostInputMapsKey(SDLK_SPACE) && HostInputDefaultKeysUsed())
+					SetPause(game, !game.paused.load(std::memory_order_acquire));
+				break;
+			case SDLK_PAUSE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			// F8: the emulator's overlay off, the frame rate, detailed, off... (it starts as the launcher's Overlay).
+			case SDLK_F8:
 				if (!key.repeat) {
-					RenderDocRequestCapture();
+					PerfOverlay::CycleLevel();
 				}
 				break;
 			case SDLK_F11:
@@ -191,7 +338,7 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 				break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
-				if (!key.repeat && (key.mod & SDL_KMOD_ALT) != 0) {
+				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
 					ToggleDesktopFullscreen();
 					fullscreen_key = key.key_code;
 				}
@@ -247,15 +394,6 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		}
 
 		HostInputMouseButton(mouse_button, mb.down);
-		if (!mb.touch && mb.left) {
-			HostInputMouseTouchPad(mb.down, static_cast<float>(mb.x), static_cast<float>(mb.y));
-		}
-	} else if (mb.motion && !mb.touch) {
-		if (mb.left) {
-			HostInputMouseTouchPad(true, static_cast<float>(mb.x), static_cast<float>(mb.y));
-		} else {
-			HostInputMouseMotion(static_cast<float>(mb.x), static_cast<float>(mb.y));
-		}
 	}
 }
 
@@ -274,8 +412,70 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
+// The PS button (an Xbox pad's Guide button) held for two seconds quits, as Close Game on the PS5's home screen (issue
+// #203: pads and Steam Big Picture had no way out): the game has no use for it, and a short press does nothing. With
+// KYTY_PAD_QUIT=backstart (or both) so do Back and Start held together (an Xbox pad's View and Menu, a PlayStation pad's
+// Create and Options), for a pad whose Guide button Steam or Windows' Game Bar takes; not by default, since some pads
+// switch their own mode (XInput, Switch) on that hold. off: neither. A pad that leaves cancels its holds.
+static SDL_TimerID g_quit_hold = 0, g_quit_combo = 0;
+// The hold that produced the next SDL_QUIT (static strings). Not a registered event type: this file
+// pushes raw SDL_USEREVENT for main-thread posts, which is the first type SDL_RegisterEvents returns.
+static std::atomic<const char*> g_quit_origin {nullptr};
+
+static uint32_t QuitAfterHold(uint32_t /*interval*/, void* what) {
+	LOGF("Controller: %s held for 2 s, quitting\n", static_cast<const char*>(what));
+	g_quit_origin.store(static_cast<const char*>(what), std::memory_order_release);
+	SDL_Event quit {};
+	quit.type = SDL_QUIT;
+	if (SDL_PushEvent(&quit) != 1) {
+		Common::Termination::Report("quit-request-not-queued", 0, 0, false,
+		    static_cast<const char*>(what));
+	}
+	return 0;
+}
+
+static bool PadQuits(bool combo) {
+	static const std::string_view mode = [] {
+		const char* value = std::getenv("KYTY_PAD_QUIT");
+		return std::string_view(value != nullptr ? value : "guide");
+	}();
+	return combo ? mode == "backstart" || mode == "both" : mode != "off" && mode != "backstart";
+}
+
+static void CancelQuitHolds() {
+	for (auto* timer: {&g_quit_hold, &g_quit_combo}) {
+		if (*timer != 0) (void)SDL_RemoveTimer(*timer);
+		*timer = 0;
+	}
+}
+
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// (A new mapping for a connected controller, e.g. from Steam: its buttons arrive mapped from then on.)
+	if (f.remapped) {
+		return;
+	}
+
+	if (f.removed) CancelQuitHolds();
+	if (f.button == SDL_CONTROLLER_BUTTON_GUIDE && (f.down || f.up) && PadQuits(false)) {
+		if (f.down && g_quit_hold == 0)
+			g_quit_hold = SDL_AddTimer(2000, QuitAfterHold, const_cast<char*>("Guide/PS held 2 s"));
+		if (f.up && g_quit_hold != 0) {
+			(void)SDL_RemoveTimer(g_quit_hold);
+			g_quit_hold = 0;
+		}
+	}
+	if ((f.button == SDL_CONTROLLER_BUTTON_BACK || f.button == SDL_CONTROLLER_BUTTON_START) && (f.down || f.up) &&
+	    PadQuits(true)) {
+		auto*      pad  = SDL_GameControllerFromInstanceID(f.id);
+		const bool both = f.down && pad != nullptr && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0 &&
+		                  SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+		if (both && g_quit_combo == 0)
+			g_quit_combo = SDL_AddTimer(2000, QuitAfterHold, const_cast<char*>("Back+Start held 2 s"));
+		if (f.up && g_quit_combo != 0) {
+			(void)SDL_RemoveTimer(g_quit_combo);
+			g_quit_combo = 0;
+		}
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -293,41 +493,38 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
+		// (One that cannot be opened, e.g. gone again by now, stays out: its removal is then ignored too.)
+		if (auto* pad = SDL_GameControllerOpen(f.id); pad != nullptr) {
+			int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+			Controller::Connect(id);
+		} else {
+			LOGF("Controller %d could not be opened: %s\n", f.id, SDL_GetError());
 		}
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		HostInputDisconnectGamepad(f.id);
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
-		}
+		Controller::Disconnect(f.id);
+		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
 	}
 
 	if (f.down || f.up) {
-		HostInputPadButton(f.id, f.button, f.down);
+		auto button = ControllerButtonToPadButton(f.button);
+		// A pad without a touchpad (an Xbox pad's View, others' Back or Select) presses it with that button (issue #197:
+		// otherwise the game's touchpad menu was out of reach); a PlayStation pad's Create button stays the system's.
+		if (f.button == SDL_CONTROLLER_BUTTON_BACK) {
+			const auto type = SDL_GameControllerGetType(SDL_GameControllerFromInstanceID(f.id));
+			if (type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5) button = Controller::PAD_BUTTON_TOUCH_PAD;
+		}
+		if (button != 0) {
+			Controller::SetButton(f.id, button, f.down);
+		}
 	}
 
 	if (f.axis) {
-		if (f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-		    f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
-			HostInputPadTrigger(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+		const auto axis = ControllerAxisFromSdl(f.axis_id);
+		if (axis != Controller::Axis::AxisMax && !SetStickWithDeadZone(f.id, f.axis_id)) {
+			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
-		} else if (const auto axis = ControllerAxisFromSdl(f.axis_id);
-		           axis != Controller::Axis::AxisMax) {
-			const int value = ControllerAxisValueFromSdl(f.axis_id, f.axis_value);
-			if ((f.axis_id == SDL_GAMEPAD_AXIS_LEFTX || f.axis_id == SDL_GAMEPAD_AXIS_LEFTY) &&
-			    HostInputGamepadAxis(f.id, f.axis_id == SDL_GAMEPAD_AXIS_LEFTX, value)) {
-				return;
-			}
-			Controller::SetAxis(f.id, axis, value);
 		}
 	}
 }
@@ -356,85 +553,130 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
-void WindowContext::Resize(int new_width, int new_height) {
-	if (new_width <= 0 || new_height <= 0) {
-		return;
-	}
+void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
+	EXIT_IF(new_width == 0 || new_height == 0);
 	Common::LockGuard lock(mutex);
-	graphic_ctx.screen_width  = static_cast<uint32_t>(new_width);
-	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
+	graphic_ctx.screen_width  = new_width;
+	graphic_ctx.screen_height = new_height;
+}
+
+// Cold-path evidence independent of log level/input tracing. An empty
+// Process.MainWindowTitle alone cannot distinguish a hidden window from a dead
+// process (Astro's PageManager fatal was written only to stderr).
+static void TraceWindowState(SDL_Window* window, const char* stage) {
+	if (window == nullptr) return;
+	std::printf("[WINDOW] stage=%s id=%u flags=0x%x title=\"%s\"", stage,
+	            SDL_GetWindowID(window), SDL_GetWindowFlags(window), SDL_GetWindowTitle(window));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SDL_SysWMinfo info {};
+	SDL_VERSION(&info.version);
+	if (SDL_GetWindowWMInfo(window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS) {
+		const auto hwnd = info.info.win.window;
+		RECT rect {};
+		const bool have_rect = GetWindowRect(hwnd, &rect) != FALSE;
+		STARTUPINFOW startup {};
+		startup.cb = sizeof(startup);
+		GetStartupInfoW(&startup);
+		std::printf(" pid=%lu hwnd=%p visible=%d minimized=%d rect-valid=%d rect=%ld,%ld,%ld,%ld"
+		            " startup-flags=0x%lx startup-show=%u", GetCurrentProcessId(), static_cast<void*>(hwnd),
+		            IsWindowVisible(hwnd) != FALSE, IsIconic(hwnd) != FALSE, have_rect,
+		            rect.left, rect.top, rect.right, rect.bottom, startup.dwFlags,
+		            static_cast<unsigned>(startup.wShowWindow));
+	} else {
+		std::printf(" native-state=unavailable");
+	}
+#endif
+	std::printf("\n");
+	std::fflush(stdout);
 }
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
-	switch (window_event.type) {
-		case SDL_EVENT_WINDOW_SHOWN:
+	if (window_event.windowID == SDL_GetWindowID(window)) {
+		switch (window_event.event) {
+			case SDL_WINDOWEVENT_SHOWN: TraceWindowState(window, "shown"); break;
+			case SDL_WINDOWEVENT_HIDDEN: TraceWindowState(window, "hidden"); break;
+			case SDL_WINDOWEVENT_MINIMIZED: TraceWindowState(window, "minimized"); break;
+			case SDL_WINDOWEVENT_RESTORED: TraceWindowState(window, "restored"); break;
+			default: break;
+		}
+	}
+	switch (window_event.event) {
+		case SDL_WINDOWEVENT_SHOWN:
 			LOGF("Window %" PRIu32 " shown\n", window_event.windowID);
 			break;
 
-		case SDL_EVENT_WINDOW_HIDDEN:
+		case SDL_WINDOWEVENT_HIDDEN:
 			LOGF("Window %" PRIu32 " hidden\n", window_event.windowID);
 			break;
 
-		case SDL_EVENT_WINDOW_EXPOSED:
+		case SDL_WINDOWEVENT_EXPOSED:
 			LOGF("Window %" PRIu32 " exposed\n", window_event.windowID);
 			break;
 
-		case SDL_EVENT_WINDOW_MOVED:
+		case SDL_WINDOWEVENT_MOVED:
 			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
 			break;
 
-		case SDL_EVENT_WINDOW_RESIZED:
+		case SDL_WINDOWEVENT_RESIZED:
 			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
-			break;
 
-		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
-			     window_event.windowID, window_event.data1, window_event.data2);
-
+			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
 			Resize(window_event.data1, window_event.data2);
 
 			break;
 
-		case SDL_EVENT_WINDOW_MINIMIZED:
+		case SDL_WINDOWEVENT_SIZE_CHANGED:
+			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
+			     window_event.windowID, window_event.data1, window_event.data2);
+
+			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
+			Resize(window_event.data1, window_event.data2);
+
+			break;
+
+		case SDL_WINDOWEVENT_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_MAXIMIZED:
+		case SDL_WINDOWEVENT_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_RESTORED:
+		case SDL_WINDOWEVENT_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_MOUSE_ENTER:
+		case SDL_WINDOWEVENT_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+		case SDL_WINDOWEVENT_LEAVE:
 			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
-			HostInputSetTouchPadMode(false);
 			break;
-		case SDL_EVENT_WINDOW_FOCUS_GAINED:
+		case SDL_WINDOWEVENT_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_FOCUS_LOST:
+		case SDL_WINDOWEVENT_FOCUS_LOST:
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+		case SDL_WINDOWEVENT_CLOSE:
+			Common::Termination::Report("SDL_WINDOWEVENT_CLOSE", window_event.windowID, 0, false, "SDL/OS close request");
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
 			break;
 		default:
-			LOGF("Window %" PRIu32 " got unknown event %" PRIu32 "\n", window_event.windowID,
-			     static_cast<uint32_t>(window_event.type));
+			LOGF("Window %" PRIu32 " got unknown event %" PRIu8 "\n", window_event.windowID,
+			     window_event.event);
 			break;
 	}
 }
 
 void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
-	switch (display.type) {
-		case SDL_EVENT_DISPLAY_ORIENTATION: {
-			LOGF("Display %" PRIu32 " changed orientation to %d - ", display.displayID,
-			     static_cast<int>(display.data1));
+	bool sdl = false;
+
+	switch (display.event) {
+		case SDL_DISPLAYEVENT_ORIENTATION: sdl = true; [[fallthrough]];
+		case static_cast<Uint8>(DisplayOrientation::DisplayEventOrientation): {
+			LOGF("Display %" PRIu32 "[%s] changed orientation to %d - ", display.display,
+			     sdl ? "SDL" : "Kyty", static_cast<int>(display.data1));
 
 			switch (display.data1) {
 				case SDL_ORIENTATION_UNKNOWN: LOGF("UNKNOWN\n"); break;
@@ -448,8 +690,8 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 			break;
 		}
 		default:
-			LOGF("Display %" PRIu32 " got unknown event 0x%" PRIx32 "\n", display.displayID,
-			     static_cast<uint32_t>(display.type));
+			LOGF("Display %" PRIu32 " got unknown event 0x%" PRIx8 "\n", display.display,
+			     display.event);
 			break;
 	}
 }
@@ -457,99 +699,90 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
-	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
-		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
-		switch (event->key.key) {
-			case SDLK_F7:
-				if (pressed) {
-					HostInputToggleMouseToJoystick();
-				}
-				return;
-			case SDLK_F8:
-				if (pressed) {
-					Controller::CycleKeyboardPlayer();
-				}
-				return;
-#if defined(__APPLE__)
-			case SDLK_P:
-				if ((event->key.mod & SDL_KMOD_GUI) == 0) {
-					break;
-				}
-				[[fallthrough]];
-#endif
-			case SDLK_F2:
-				if (pressed) {
-					if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {
-						TogglePerformanceOverlayDetails();
-					} else {
-						TogglePerformanceOverlay();
-					}
-				}
-				return;
-			default: break;
+	const bool trace_key = InputTrace::Enabled() && (event->type == SDL_KEYDOWN || event->type == SDL_KEYUP);
+	if (trace_key) {
+		std::printf("[INPUT] SDL-key window=%u key=%d scan=%d down=%d repeat=%u focus=%u\n",
+		            event->key.windowID, event->key.keysym.sym, event->key.keysym.scancode,
+		            event->type == SDL_KEYDOWN, event->key.repeat,
+		            SDL_GetKeyboardFocus() != nullptr ? SDL_GetWindowID(SDL_GetKeyboardFocus()) : 0);
+		std::fflush(stdout);
+	}
+	if (InputTrace::Enabled() && event->type == SDL_WINDOWEVENT &&
+	    (event->window.event == SDL_WINDOWEVENT_FOCUS_GAINED || event->window.event == SDL_WINDOWEVENT_FOCUS_LOST)) {
+		std::printf("[INPUT] SDL-focus window=%u gained=%d\n", event->window.windowID,
+		            event->window.event == SDL_WINDOWEVENT_FOCUS_GAINED);
+		std::fflush(stdout);
+	}
+	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
+	    event->key.keysym.sym == SDLK_F7) {
+		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+			HostInputToggleMouseToJoystick();
 		}
+		return;
 	}
 	if (ProcessSystemOverlayInput(*event)) {
-		return;
-	}
-	if (event->type >= SDL_EVENT_WINDOW_FIRST && event->type <= SDL_EVENT_WINDOW_LAST) {
-		if (event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) GameEventQuit(game);
-		ProcessWindowEvent(event->window);
-		return;
-	}
-	if (event->type >= SDL_EVENT_DISPLAY_FIRST && event->type <= SDL_EVENT_DISPLAY_LAST) {
-		ProcessDisplayEvent(event->display);
+		if (trace_key) std::printf("[INPUT] SDL-key consumed by system overlay\n");
 		return;
 	}
 
 	switch (event->type) {
-		case SDL_EVENT_QUIT: GameEventQuit(game); break;
+		case SDL_QUIT: {
+			const auto* origin = g_quit_origin.exchange(nullptr, std::memory_order_acq_rel);
+			if (origin != nullptr) GameEventQuit(game, origin);
+			else GameEventQuit(game);
+			break;
+		}
 
-		case SDL_EVENT_TERMINATING: GameEventTerminate(game); break;
+		case SDL_APP_TERMINATING: GameEventTerminate(game); break;
 
-		case SDL_EVENT_LOW_MEMORY: GameEventLowMemory(); break;
+		case SDL_APP_LOWMEMORY: GameEventLowMemory(); break;
 
-		case SDL_EVENT_WILL_ENTER_BACKGROUND: GameEventWillEnterBackground(game); break;
+		case SDL_APP_WILLENTERBACKGROUND: GameEventWillEnterBackground(game); break;
 
-		case SDL_EVENT_DID_ENTER_BACKGROUND: GameEventDidEnterBackground(); break;
+		case SDL_APP_DIDENTERBACKGROUND: GameEventDidEnterBackground(); break;
 
-		case SDL_EVENT_WILL_ENTER_FOREGROUND: GameEventWillEnterForeground(); break;
+		case SDL_APP_WILLENTERFOREGROUND: GameEventWillEnterForeground(); break;
 
-		case SDL_EVENT_DID_ENTER_FOREGROUND: GameEventDidEnterForeground(game); break;
+		case SDL_APP_DIDENTERFOREGROUND: GameEventDidEnterForeground(game); break;
 
-		case SDL_EVENT_KEY_DOWN:
-		case SDL_EVENT_KEY_UP: {
+		case SDL_KEYDOWN:
+		case SDL_KEYUP: {
 			EventKeyboard key {};
 
-			key.down              = (event->type == SDL_EVENT_KEY_DOWN);
-			key.up                = (event->type == SDL_EVENT_KEY_UP);
-			key.pressed           = event->key.down;
-			key.released          = !event->key.down;
+			key.down              = (event->type == SDL_KEYDOWN);
+			key.up                = (event->type == SDL_KEYUP);
+			key.pressed           = (event->key.state == SDL_PRESSED);
+			key.released          = (event->key.state == SDL_RELEASED);
 			key.repeat            = (event->key.repeat != 0u);
-			key.scan_code         = event->key.scancode;
-			key.key_code          = event->key.key;
-			key.mod               = event->key.mod;
+			key.scan_code         = event->key.keysym.scancode;
+			key.key_code          = event->key.keysym.sym;
+			key.mod               = event->key.keysym.mod;
 			key.timestamp_seconds = time_s;
 
-			GameEventKeyboard(key);
+			GameEventKeyboard(game, key);
 
 			break;
 		}
 
-		case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		case SDL_EVENT_MOUSE_BUTTON_UP: {
+		case SDL_WINDOWEVENT: ProcessWindowEvent(event->window); break;
+
+		case SDL_DISPLAYEVENT: ProcessDisplayEvent(event->display); break;
+
+		case SDL_MOUSEBUTTONDOWN:
+		case SDL_MOUSEBUTTONUP: {
 			EventMouse mb {};
 
-			mb.down              = (event->button.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
-			mb.up                = (event->button.type == SDL_EVENT_MOUSE_BUTTON_UP);
+			mb.down              = (event->button.type == SDL_MOUSEBUTTONDOWN);
+			mb.up                = (event->button.type == SDL_MOUSEBUTTONUP);
 			mb.left              = (event->button.button == SDL_BUTTON_LEFT);
 			mb.middle            = (event->button.button == SDL_BUTTON_MIDDLE);
 			mb.right             = (event->button.button == SDL_BUTTON_RIGHT);
 			mb.x1                = (event->button.button == SDL_BUTTON_X1);
 			mb.x2                = (event->button.button == SDL_BUTTON_X2);
 			mb.touch             = (event->button.which == SDL_TOUCH_MOUSEID);
-			mb.pressed           = event->button.down;
-			mb.released          = !event->button.down;
+			mb.pressed           = (event->button.state == SDL_PRESSED);
+			mb.released          = (event->button.state == SDL_RELEASED);
 			mb.num_of_clicks     = event->button.clicks;
 			mb.wheel             = false;
 			mb.x                 = event->button.x;
@@ -564,7 +797,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_EVENT_MOUSE_WHEEL: {
+		case SDL_MOUSEWHEEL: {
 			EventMouse mb {};
 
 			mb.down              = false;
@@ -587,20 +820,23 @@ void WindowContext::ProcessEvent(double time_s) {
 			mb.timestamp_seconds = time_s;
 
 			GameEventMouse(mb);
+			// (Notches away from the user count as up whatever the system's scroll direction.)
+			if (event->wheel.which != SDL_TOUCH_MOUSEID)
+				HostInputMouseWheel(event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event->wheel.y : event->wheel.y);
 
 			break;
 		}
 
-		case SDL_EVENT_MOUSE_MOTION: {
+		case SDL_MOUSEMOTION: {
 			EventMouse mb {};
 
 			mb.down              = false;
 			mb.up                = false;
-			mb.left              = ((event->motion.state & SDL_BUTTON_LMASK) != 0u);
-			mb.middle            = ((event->motion.state & SDL_BUTTON_MMASK) != 0u);
-			mb.right             = ((event->motion.state & SDL_BUTTON_RMASK) != 0u);
-			mb.x1                = ((event->motion.state & SDL_BUTTON_X1MASK) != 0u);
-			mb.x2                = ((event->motion.state & SDL_BUTTON_X2MASK) != 0u);
+			mb.left              = ((event->motion.state & KYTY_SDL_BUTTON_LMASK) != 0u);
+			mb.middle            = ((event->motion.state & KYTY_SDL_BUTTON_MMASK) != 0u);
+			mb.right             = ((event->motion.state & KYTY_SDL_BUTTON_RMASK) != 0u);
+			mb.x1                = ((event->motion.state & KYTY_SDL_BUTTON_X1MASK) != 0u);
+			mb.x2                = ((event->motion.state & KYTY_SDL_BUTTON_X2MASK) != 0u);
 			mb.touch             = (event->motion.which == SDL_TOUCH_MOUSEID);
 			mb.pressed           = false;
 			mb.released          = false;
@@ -618,16 +854,16 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_EVENT_FINGER_MOTION:
-		case SDL_EVENT_FINGER_DOWN:
-		case SDL_EVENT_FINGER_UP: {
+		case SDL_FINGERMOTION:
+		case SDL_FINGERDOWN:
+		case SDL_FINGERUP: {
 			EventFinger f {};
 
-			f.down              = (event->tfinger.type == SDL_EVENT_FINGER_DOWN);
-			f.up                = (event->tfinger.type == SDL_EVENT_FINGER_UP);
-			f.motion            = (event->tfinger.type == SDL_EVENT_FINGER_MOTION);
-			f.finger_id         = static_cast<int>(event->tfinger.fingerID);
-			f.touch_id          = static_cast<int>(event->tfinger.touchID);
+			f.down              = (event->tfinger.type == SDL_FINGERDOWN);
+			f.up                = (event->tfinger.type == SDL_FINGERUP);
+			f.motion            = (event->tfinger.type == SDL_FINGERMOTION);
+			f.finger_id         = static_cast<int>(event->tfinger.fingerId);
+			f.touch_id          = static_cast<int>(event->tfinger.touchId);
 			f.x                 = event->tfinger.x;
 			f.y                 = event->tfinger.y;
 			f.dx                = event->tfinger.dx;
@@ -640,13 +876,13 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+		case SDL_CONTROLLERAXISMOTION: {
 			EventController c {};
 
-			c.id                = event->gaxis.which;
-			c.button            = SDL_GAMEPAD_BUTTON_INVALID;
-			c.axis_id           = event->gaxis.axis;
-			c.axis_value        = event->gaxis.value;
+			c.id                = event->caxis.which;
+			c.button            = SDL_CONTROLLER_BUTTON_INVALID;
+			c.axis_id           = event->caxis.axis;
+			c.axis_value        = event->caxis.value;
 			c.down              = false;
 			c.up                = false;
 			c.added             = false;
@@ -662,22 +898,22 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-		case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+		case SDL_CONTROLLERBUTTONDOWN:
+		case SDL_CONTROLLERBUTTONUP: {
 			EventController c {};
 
-			c.id                = event->gbutton.which;
-			c.button            = event->gbutton.button;
-			c.axis_id           = SDL_GAMEPAD_AXIS_INVALID;
+			c.id                = event->cbutton.which;
+			c.button            = event->cbutton.button;
+			c.axis_id           = SDL_CONTROLLER_AXIS_INVALID;
 			c.axis_value        = 0;
-			c.down              = event->gbutton.down;
-			c.up                = !event->gbutton.down;
+			c.down              = (event->cbutton.type == SDL_CONTROLLERBUTTONDOWN);
+			c.up                = (event->cbutton.type == SDL_CONTROLLERBUTTONUP);
 			c.added             = false;
 			c.removed           = false;
 			c.remapped          = false;
 			c.axis              = false;
-			c.pressed           = event->gbutton.down;
-			c.released          = !event->gbutton.down;
+			c.pressed           = (event->cbutton.state == SDL_PRESSED);
+			c.released          = (event->cbutton.state == SDL_RELEASED);
 			c.timestamp_seconds = time_s;
 
 			GameEventController(c);
@@ -685,44 +921,30 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
-		case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
-		case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
-			if (event->gtouchpad.touchpad == 0) {
-				Controller::SetTouchPad(event->gtouchpad.which, event->gtouchpad.finger,
-				                        event->gtouchpad.type != SDL_EVENT_GAMEPAD_TOUCHPAD_UP,
-				                        event->gtouchpad.x, event->gtouchpad.y);
+		case SDL_CONTROLLERTOUCHPADDOWN:
+		case SDL_CONTROLLERTOUCHPADMOTION:
+		case SDL_CONTROLLERTOUCHPADUP:
+			if (event->ctouchpad.touchpad == 0) {
+				Controller::SetTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
+				                        event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
+				                        event->ctouchpad.x, event->ctouchpad.y);
 			}
 			break;
 
-		case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: {
-			const auto& sensor = event->gsensor;
-			if (sensor.sensor == SDL_SENSOR_ACCEL || sensor.sensor == SDL_SENSOR_GYRO) {
-				Controller::SetSensor(sensor.which,
-				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
-				                                                        : Controller::Sensor::Gyro,
-				                      sensor.data,
-				                      sensor.sensor_timestamp != 0
-				                          ? sensor.sensor_timestamp / 1000
-				                          : sensor.timestamp / 1000);
-			}
-			break;
-		}
-
-		case SDL_EVENT_GAMEPAD_ADDED:
-		case SDL_EVENT_GAMEPAD_REMOVED:
-		case SDL_EVENT_GAMEPAD_REMAPPED: {
+		case SDL_CONTROLLERDEVICEADDED:
+		case SDL_CONTROLLERDEVICEREMOVED:
+		case SDL_CONTROLLERDEVICEREMAPPED: {
 			EventController c {};
 
-			c.id                = event->gdevice.which;
-			c.button            = SDL_GAMEPAD_BUTTON_INVALID;
-			c.axis_id           = SDL_GAMEPAD_AXIS_INVALID;
+			c.id                = event->cdevice.which;
+			c.button            = SDL_CONTROLLER_BUTTON_INVALID;
+			c.axis_id           = SDL_CONTROLLER_AXIS_INVALID;
 			c.axis_value        = 0;
 			c.down              = false;
 			c.up                = false;
-			c.added             = (event->gdevice.type == SDL_EVENT_GAMEPAD_ADDED);
-			c.removed           = (event->gdevice.type == SDL_EVENT_GAMEPAD_REMOVED);
-			c.remapped          = (event->gdevice.type == SDL_EVENT_GAMEPAD_REMAPPED);
+			c.added             = (event->cdevice.type == SDL_CONTROLLERDEVICEADDED);
+			c.removed           = (event->cdevice.type == SDL_CONTROLLERDEVICEREMOVED);
+			c.remapped          = (event->cdevice.type == SDL_CONTROLLERDEVICEREMAPPED);
 			c.axis              = false;
 			c.pressed           = false;
 			c.released          = false;
@@ -735,6 +957,62 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+void WindowContext::RunOnMainThread(std::function<void()> task) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+
+	uint64_t ticket = 0;
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		ticket = ++main_tasks_queued;
+	}
+
+	// Wake the main loop in case it is blocked in SDL_WaitEvent.
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+
+	Common::LockGuard lock(main_task_mutex);
+	while (main_tasks_run < ticket) {
+		main_task_done.Wait(&main_task_mutex);
+	}
+}
+
+void WindowContext::PostToMainThread(std::function<void()> task) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		++main_tasks_queued;
+	}
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+}
+
+void WindowContext::DrainMainThreadTasks() {
+	std::vector<std::function<void()>> tasks;
+	{
+		Common::LockGuard lock(main_task_mutex);
+		tasks.swap(main_tasks);
+	}
+	if (tasks.empty()) {
+		return;
+	}
+	for (auto& task: tasks) {
+		task();
+	}
+	Common::LockGuard lock(main_task_mutex);
+	main_tasks_run += tasks.size();
+	main_task_done.SignalAll();
+}
+
 void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
@@ -743,17 +1021,34 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
-	constexpr uint64_t title_interval_ms = 1000;
-	auto               title_time        = SDL_GetTicks();
-	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
-
 	while (!loop.need_exit) {
-		switch (PollGameBarAction((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0)) {
-			case GameBarAction::Fullscreen: ToggleDesktopFullscreen(); break;
-			case GameBarAction::Exit: GameEventTerminate(loop); break;
-			case GameBarAction::None: break;
+		if (InputTrace::Enabled()) {
+			static uint64_t next_report = 0;
+			const auto now = SDL_GetTicks64();
+			if (now >= next_report) {
+				next_report = now + 5000;
+				auto* focus = SDL_GetKeyboardFocus();
+				std::printf("[INPUT] window-alive ms=%llu id=%u flags=0x%x focus=%u keydown-enabled=%u keyup-enabled=%u",
+				            static_cast<unsigned long long>(now), SDL_GetWindowID(window), SDL_GetWindowFlags(window),
+				            focus != nullptr ? SDL_GetWindowID(focus) : 0,
+				            SDL_GetEventState(SDL_KEYDOWN), SDL_GetEventState(SDL_KEYUP));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				SDL_SysWMinfo info {};
+				SDL_VERSION(&info.version);
+				if (SDL_GetWindowWMInfo(window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS) {
+					const auto foreground = GetForegroundWindow();
+					DWORD foreground_pid = 0;
+					GetWindowThreadProcessId(foreground, &foreground_pid);
+					std::printf(" hwnd=%p foreground=%p foreground-pid=%lu self-pid=%lu",
+					            static_cast<void*>(info.info.win.window), static_cast<void*>(foreground),
+					            foreground_pid, GetCurrentProcessId());
+				}
+#endif
+				std::printf("\n");
+				std::fflush(stdout);
+			}
 		}
-		if (loop.need_exit) break;
+		DrainMainThreadTasks();
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -762,20 +1057,7 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		// Refresh the title on the main thread without making presentation wait for it.
-		const auto now     = SDL_GetTicks();
-		const auto elapsed = now - title_time;
-		if (elapsed >= title_interval_ms) {
-			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
-			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
-			}
-			title_time   = now;
-			title_frames = frames;
-		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
+		if (!HostInputWaitEvent(&loop.event)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
@@ -790,14 +1072,33 @@ static void WindowCreate(WindowContext& context) {
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	// RenderDoc can hide Wayland Vulkan surface support; prefer X11 for captures.
-	if (Config::RenderDocEnabled()) {
-		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
-	}
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a
+	// 200% desktop gets a half-size swapchain that the compositor stretches back (blurry).
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
-	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+
+	// (The timers: the PS button's hold to quit, QuitAfterHold.)
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) < 0) {
 		EXIT("%s\n", SDL_GetError());
+	}
+	HostInputInit();
+	InitializeSystemOverlayInput();
+
+	// A window larger than the screen it opens on (2560x1440 on a 1080p or 1440p one) would hang
+	// off it, title bar included: the same shape scaled into the usable area, 5% of its height
+	// left for the title bar.
+	if (SDL_Rect usable {}; !Config::FullscreenEnabled() && SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+		const double scale = std::min(usable.w / static_cast<double>(width), usable.h * 0.95 / height);
+		if (scale < 1.0) {
+			width                             = static_cast<int>(width * scale) & ~1;
+			height                            = static_cast<int>(height * scale) & ~1;
+			context.graphic_ctx.screen_width  = static_cast<uint32_t>(width);
+			context.graphic_ctx.screen_height = static_cast<uint32_t>(height);
+		}
 	}
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
@@ -808,14 +1109,15 @@ static void WindowCreate(WindowContext& context) {
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
 	// override, and fall back to SDL's normal loader search when no bundle is present.
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
-		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
+		if (char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
+			SDL_free(base_path);
 			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
 			if (!Common::File::IsFileExisting(moltenvk_path)) {
 				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
 			}
 			if (Common::File::IsFileExisting(moltenvk_path) &&
-			    SDL_setenv_unsafe("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
+			    SDL_setenv("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
 				LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
 			}
 		}
@@ -828,22 +1130,39 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
+#if defined(_WIN32) || defined(__linux__)
+	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
+	// then becomes that loader (the instance and device are created through it). Linux: KYTY_UPSCALER=dlss loads
+	// the NGX bridge (libkyty_dlss.so) here, before the instance it adds extensions to.
+	Libs::Graphics::FrameGen::Initialize();
+#endif
+	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
+	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
 	}
+	TraceWindowState(context.window, "created");
 
-	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-	HostInputInit(context.window);
-	InitializeSystemOverlayInput(context.window);
+	// Resizable, so the title bar's maximize button is enabled: Windows greys it out for a
+	// fixed-size window. Only the presented image follows the window - the guest keeps rendering
+	// at its own resolution, the swapchain takes the new client size and the present blit scales
+	// the frame into it (KYTY_PRESENT_ASPECT=fit keeps the aspect ratio instead of stretching).
+	SDL_SetWindowResizable(context.window, SDL_TRUE);
 	context.UpdateIcon();
+	// SDL2 starts text input with the video subsystem, which keeps the IME attached to the
+	// window: with a Japanese/Chinese IME on, letter keys (the default Cross, WASD...) never
+	// reach the game. The system overlay starts text input itself while it needs it.
+	SDL_StopTextInput();
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
-	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+	// SDL_WINDOW_RESIZABLE is what makes the maximize button usable on Windows; the size the
+	// window opens at still comes from --screen-width/--screen-height.
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN) |
+	             static_cast<uint32_t>(SDL_WINDOW_RESIZABLE);
 	if (fullscreen) {
-		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
+		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	}
 	return flags;
 }
@@ -858,10 +1177,32 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	window->graphic_ctx.screen_height = height;
 
 	WindowCreate(*window);
+	// The pipeline cache's start-up work (warmup) runs in CreateVulkan: its progress in the window.
+	if (Config::SplashEnabled()) StartupProgressShow(window->window);
 	window->CreateVulkan();
+	StartupProgressHide();
+	TraceWindowState(window->window, "graphics-ready");
+	// The size the game is shown at: the display's in full screen (the window may not have it yet), else the window's
+	// drawable size (its swapchain's). Demon's Souls' render size follows it (loader/demonsSoulsRenderSize.h).
+	int output_width = 0, output_height = 0;
+	if (Config::FullscreenEnabled()) {
+		SDL_DisplayMode mode {};
+		if (SDL_GetDesktopDisplayMode(std::max(SDL_GetWindowDisplayIndex(window->window), 0), &mode) == 0) {
+			output_width  = mode.w;
+			output_height = mode.h;
+		}
+	}
+	if (output_width <= 0 || output_height <= 0) SDL_Vulkan_GetDrawableSize(window->window, &output_width, &output_height);
+	g_output_width.store(static_cast<uint32_t>(std::max(output_width, 0)), std::memory_order_relaxed);
+	g_output_height.store(static_cast<uint32_t>(std::max(output_height, 0)), std::memory_order_relaxed);
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
 	return presenter;
+}
+
+void WindowOutputSize(uint32_t* width, uint32_t* height) {
+	*width  = g_output_width.load(std::memory_order_relaxed);
+	*height = g_output_height.load(std::memory_order_relaxed);
 }
 
 void WindowRun() {
@@ -869,13 +1210,21 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
-	Common::LockGuard lock(g_window->render_context->GetMutex());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The focus back to the window that had it before the game (KYTY_RETURN_FOCUS), before the caches are saved.
+	if (SDL_SysWMinfo info {}; g_window->window != nullptr) {
+		SDL_VERSION(&info.version);
+		if (SDL_GetWindowWMInfo(g_window->window, &info) == SDL_TRUE && info.subsystem == SDL_SYSWM_WINDOWS)
+			LocalPlatform::ReturnFocus(info.info.win.window);
+	}
+#endif
+	g_window->render_context->GetPipelineCache().StopWarmup();
+	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
 }
 
 void WindowShutdown() {
 	if (g_window != nullptr) {
-		HostInputShutdown();
 		Controller::EmergencyShutdown();
 		g_window.reset();
 	}
@@ -911,15 +1260,15 @@ struct WindowIcon {
 	void*        pixels  = nullptr;
 
 	~WindowIcon() {
-		SDL_DestroySurface(surface);
+		SDL_FreeSurface(surface);
 		stbi_image_free(pixels);
 	}
 };
 
-static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* icon) {
+static void WindowLoadPngIcon(const std::string& path, WindowIcon* icon) {
 	Common::File f;
-	if (!f.Open(path, Common::File::Mode::Read)) {
-		EXIT("Can't open icon file %s\n", Common::PathToString(path).c_str());
+	if (!f.Open(Common::PathFromUtf8(path), Common::File::Mode::Read)) { // (UTF-8: SystemContentGetIconPath)
+		EXIT("Can't open icon file %s\n", path.c_str());
 	}
 
 	int width  = 0;
@@ -935,8 +1284,8 @@ static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* ico
 
 	EXIT_IF(icon->pixels == nullptr);
 
-	icon->surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels,
-	                                      width * 4);
+	icon->surface = SDL_CreateRGBSurfaceWithFormatFrom(icon->pixels, width, height, 32, width * 4,
+	                                                   SDL_PIXELFORMAT_RGBA32);
 	EXIT_NOT_IMPLEMENTED(icon->surface == nullptr);
 }
 
@@ -945,7 +1294,7 @@ void WindowContext::UpdateIcon() {
 	static bool       icon_loaded = false;
 
 	if (!icon_loaded) {
-		std::filesystem::path icon_path;
+		std::string icon_path;
 		if (Loader::SystemContentGetIconPath(&icon_path)) {
 			WindowLoadPngIcon(icon_path, &icon);
 		}
@@ -957,7 +1306,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
+void WindowContext::UpdateTitle(uint32_t presented, const char* generator) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -967,6 +1316,12 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
+	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
+	static uint64_t frame_num   = 0;
+	static uint64_t fps_frames  = 0;
+	static uint64_t fps_shown   = 0; // images shown, generated ones included
+	static double   current_fps = 0.0;
+	static double   shown_fps   = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -976,14 +1331,45 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static constexpr auto build_type = "Unknown";
 #endif
 
+	const auto now       = Common::Timer::QueryPerformanceCounter();
+	const auto frequency = Common::Timer::QueryPerformanceFrequency();
+	frame_num++;
+	fps_frames++;
+	fps_shown += presented;
+	if (now - fps_start >= frequency) {
+		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
+		              static_cast<double>(now - fps_start);
+		shown_fps   = static_cast<double>(fps_shown) * static_cast<double>(frequency) / static_cast<double>(now - fps_start);
+		fps_start   = now;
+		fps_frames  = 0;
+		fps_shown   = 0;
+	}
+
+	// Twice a second at most, and never waiting for the main thread (PostToMainThread): the title is set while the
+	// present thread goes on.
+	static uint64_t title_at = 0;
+	if (now - title_at < frequency / 2 || title_posted.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	title_at = now;
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "Nova5 [{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// (The game's frame rate first, the rate shown with the generated frames after it.)
+	if (generator != nullptr && shown_fps > current_fps + 0.5) {
+		text += fmt::format(" ({}: {:.0f})", generator, shown_fps);
+	}
+	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
+		text += fmt::format(", waypoints: {}", waypoints);
+	}
 
-	SDL_SetWindowTitle(window, text.c_str());
+	PostToMainThread([this, text = std::move(text)] {
+		SDL_SetWindowTitle(window, text.c_str());
+		title_posted.store(false, std::memory_order_release);
+	});
 }
 
 } // namespace Libs::Graphics

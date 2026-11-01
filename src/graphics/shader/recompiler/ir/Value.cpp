@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <memory>
+#include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -66,13 +66,7 @@ Inst* Value::ResolveInstruction() const {
 }
 
 Value Value::Resolve() const {
-	// Identity chains need no recursive calls or per-link stack frames. Keeping
-	// the common non-identity case small also lets callers inline the lookup.
-	auto value = *this;
-	while (value.IsIdentity()) {
-		value = value.inst->Arg(0);
-	}
-	return value;
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -141,16 +135,10 @@ bool Value::operator==(const Value& other) const {
 }
 
 Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
-    : opcode(value_opcode),
-      num_args(value_opcode == ValueOpcode::Phi ? PhiArity
-                                               : static_cast<uint8_t>(NumArgsOf(value_opcode))),
-      flags(value_flags) {
-	if (num_args == PhiArity) {
-		std::destroy_at(&fixed_args);
-		std::construct_at(&phi_args);
-	} else if (num_args > InlineArity) {
-		std::destroy_at(&fixed_args);
-		std::construct_at(&large_args, num_args);
+    : opcode(value_opcode), flags(value_flags) {
+	const auto count = NumArgsOf(opcode);
+	if (count != std::numeric_limits<size_t>::max()) {
+		args.resize(count);
 	}
 }
 
@@ -166,13 +154,16 @@ Type Inst::GetType() const {
 	if (opcode == ValueOpcode::Phi) {
 		return static_cast<Type>(flags);
 	}
-	if (opcode == ValueOpcode::Identity && num_args != 0) {
-		return Arg(0).GetType();
+	if (opcode == ValueOpcode::Identity && !args.empty()) {
+		return args.front().GetType();
 	}
 	return TypeOf(opcode);
 }
 
 bool Inst::MayHaveSideEffects() const {
+	if (opcode == ValueOpcode::Waitcnt) {
+		return Flags<WaitcntKind>() == WaitcntKind::StoreCompletion;
+	}
 	return HasSideEffects(opcode);
 }
 
@@ -185,24 +176,21 @@ size_t Inst::UseCount() const {
 }
 
 size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
+	return args.size();
 }
 
 size_t Inst::NumPhiBlocks() const {
-	return num_args == PhiArity ? phi_args.size() : 0;
+	return phi_blocks.size();
 }
 
 Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+	EXIT_IF(index >= args.size());
+	return args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {
-	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_args.size());
-	return phi_args[index].first;
+	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_blocks.size());
+	return phi_blocks[index];
 }
 
 Block* Inst::Parent() const {
@@ -218,17 +206,15 @@ void Inst::SetParent(Block* block) {
 }
 
 void Inst::SetArg(size_t index, Value value) {
-	const auto old = Arg(index);
+	if (index >= args.size()) {
+		EXIT_IF(NumArgsOf(opcode) != std::numeric_limits<size_t>::max());
+		args.resize(index + 1);
+	}
+	const auto old = args[index];
 	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
-	if (num_args <= InlineArity) {
-		fixed_args[index] = value;
-	} else if (num_args == PhiArity) {
-		phi_args[index].second = value;
-	} else {
-		large_args[index] = value;
-	}
+	args[index] = value;
 	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
 		AddUse(new_inst, index);
 	}
@@ -236,23 +222,38 @@ void Inst::SetArg(size_t index, Value value) {
 
 void Inst::AddPhiOperand(Block* predecessor, Value value) {
 	EXIT_IF(opcode != ValueOpcode::Phi);
-	const auto index = phi_args.size();
-	phi_args.emplace_back(predecessor, value);
+	const auto index = args.size();
+	args.push_back(value);
+	phi_blocks.push_back(predecessor);
 	if (auto* value_inst = value.TryInstruction(); value_inst != nullptr) {
 		AddUse(value_inst, index);
 	}
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
+	// Every use moves: take the list whole instead of erasing its entries one by one from the front.
+	const auto old_uses = std::exchange(uses, {});
+	auto*      new_inst = replacement.TryInstruction();
 	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+		use.user->args[use.operand] = replacement;
+		if (new_inst != nullptr) {
+			use.user->AddUse(new_inst, use.operand);
+		}
 	}
 	Invalidate();
 	if (preserve) {
-		opcode = ValueOpcode::Identity;
-		num_args = 1;
+		ReplaceOpcode(ValueOpcode::Identity);
+		args.resize(1);
 		SetArg(0, replacement);
+	}
+}
+
+void Inst::ReplaceOpcode(ValueOpcode value_opcode) {
+	opcode           = value_opcode;
+	const auto count = NumArgsOf(opcode);
+	if (count != std::numeric_limits<size_t>::max()) {
+		EXIT_IF(!args.empty() && args.size() != count);
+		args.resize(count);
 	}
 }
 
@@ -262,35 +263,37 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	// (find_if: MSVC STL 14.51's vectorized find fails a static assertion for the 16-byte Use under clang-cl 22.)
+	EXIT_IF(ValidationEnabled() &&
+	        std::ranges::find_if(used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; }) !=
+	            used->uses.end());
 	used->uses.push_back({this, operand});
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
+	// From the back: passes remove users latest first (dead code, EXEC selects), which is then O(1) where a value of
+	// thousands of users (an EXEC predicate) took O(n) for each. A use is there once: the same one goes either way.
 	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found == used->uses.end());
-	used->uses.erase(found);
+	    used->uses.rbegin(), used->uses.rend(), [&](const Use& use) { return use.user == this && use.operand == operand; });
+	EXIT_IF(found == used->uses.rend());
+	used->uses.erase(std::next(found).base());
+}
+
+void Inst::DropLinks() {
+	args.clear();
+	phi_blocks.clear();
+	uses.clear();
+	opcode = ValueOpcode::Void;
 }
 
 void Inst::ClearArgs() {
-	for (size_t index = 0; index < NumArgs(); index++) {
-		if (auto* value_inst = Arg(index).TryInstruction(); value_inst != nullptr) {
+	for (size_t index = 0; index < args.size(); index++) {
+		if (auto* value_inst = args[index].TryInstruction(); value_inst != nullptr) {
 			RemoveUse(value_inst, index);
 		}
 	}
-	if (num_args == PhiArity) {
-		std::destroy_at(&phi_args);
-		std::construct_at(&fixed_args);
-	} else if (num_args > InlineArity) {
-		std::destroy_at(&large_args);
-		std::construct_at(&fixed_args);
-	} else {
-		fixed_args.fill(Value {});
-	}
-	num_args = 0;
+	args.clear();
+	phi_blocks.clear();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

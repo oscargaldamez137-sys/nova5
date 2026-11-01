@@ -4,6 +4,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -36,24 +45,25 @@ struct Fixture {
 
 void CheckRejected(const ShaderMappedData& data, const char* text) {
 	ShaderVertexMetadata output;
-	std::array<ShaderSemantic, 7> prior_semantics {};
-	output.vertex_buffer_reg = 37;
-	output.vertex_attrib_reg = 41;
-	output.input_semantics   = prior_semantics;
-	Check(ShaderReadVertexMetadata(data, 64, output) != nullptr, text);
+	output.vertex_buffer_reg     = 37;
+	output.vertex_attrib_reg     = 41;
+	output.input_semantics_count = 7;
+	std::string error;
+	Check(!ShaderReadVertexMetadata(data, 64, output, &error), text);
+	Check(!error.empty(), "metadata rejection omitted its diagnostic");
 	Check(output.vertex_buffer_reg == 37 && output.vertex_attrib_reg == 41 &&
-	          output.input_semantics.data() == prior_semantics.data() &&
-	          output.input_semantics.size() == prior_semantics.size(),
+	          output.input_semantics_count == 7,
 	      "metadata rejection changed the prior output");
 }
 
 void TestValidAndInvalidMetadata() {
 	Fixture              fixture;
 	ShaderVertexMetadata output;
-	Check(ShaderReadVertexMetadata(fixture.mapped, 64, output) == nullptr,
+	std::string          error;
+	Check(ShaderReadVertexMetadata(fixture.mapped, 64, output, &error),
 	      "valid AGC vertex metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == 4 &&
-	          output.input_semantics.size() == 1,
+	          output.input_semantics_count == 1,
 	      "valid AGC vertex metadata was decoded incorrectly");
 
 	Fixture buffer_only;
@@ -61,10 +71,10 @@ void TestValidAndInvalidMetadata() {
 	    AGC_ILLEGAL_DIRECT_OFFSET;
 	buffer_only.mapped.input_semantics     = nullptr;
 	buffer_only.mapped.num_input_semantics = 0;
-	Check(ShaderReadVertexMetadata(buffer_only.mapped, 64, output) == nullptr,
+	Check(ShaderReadVertexMetadata(buffer_only.mapped, 64, output, &error),
 	      "vertex-buffer-only AGC metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == -1 &&
-	          output.input_semantics.empty(),
+	          output.input_semantics_count == 0,
 	      "vertex-buffer-only AGC metadata was decoded incorrectly");
 
 	Fixture attrib_only;
@@ -108,7 +118,37 @@ void TestValidAndInvalidMetadata() {
 } // namespace
 
 int main() {
+#ifdef _WIN32
+	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
 	TestValidAndInvalidMetadata();
+	std::array<uint32_t, 4> guest{1, 2, 3, 4}, current{11, 12, 13, 14};
+	bool backing = false;
+	unsigned probes = 0;
+	const auto probe = [&](uint64_t, void* out, uint64_t bytes) {
+		++probes; Check(bytes == 16, "descriptor probe must cover exactly four words");
+		std::memcpy(out, current.data(), bytes); return true;
+	};
+	Check(ShaderReadMetadataWords<4>(guest.data(), true, probe, backing) == current && backing,
+	      "metadata must use certified backing");
+	current[0] = 99;
+	Check(ShaderReadMetadataWords<4>(guest.data(), true, probe, backing) == current && probes == 2,
+	      "metadata must not cache previous descriptor contents");
+	const auto reject = [](uint64_t, void* out, uint64_t) {
+		*static_cast<uint32_t*>(out) = 777; return false;
+	};
+	Check(ShaderReadMetadataWords<4>(guest.data(), true, reject, backing) == guest && !backing,
+	      "failed probe must overwrite partial output via normal read");
+	Check(ShaderReadMetadataWords<4>(guest.data(), false, probe, backing) == guest && probes == 2 && !backing,
+	      "A/B disabled must bypass backing probe");
+#ifdef _WIN32
+	auto* protected_page = static_cast<uint32_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS));
+	Check(protected_page != nullptr, "protected metadata test allocation failed");
+	Check(ShaderReadMetadataWords<4>(protected_page, true, probe, backing) == current && backing,
+	      "clean metadata must not touch the watched guest mapping");
+	VirtualFree(protected_page, 0, MEM_RELEASE);
+#endif
 	std::puts("ShaderVertexMetadataTests: all cases passed");
 	return 0;
 }

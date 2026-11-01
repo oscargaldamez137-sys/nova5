@@ -1,6 +1,5 @@
 #include "loader/gamePatch.h"
 
-#include "common/assert.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"

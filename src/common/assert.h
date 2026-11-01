@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 
 #include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -26,6 +27,29 @@ int  DbgExitIfHandler(char const* expr, char const* file, int line);
 int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
+
+// What DbgExit runs before the process ends (output written asynchronously reaching its file), and RunExitDrain
+// for the other ends that skip exit handlers (std::_Exit, TerminateProcess).
+void SetExitDrain(void (*drain)()) noexcept;
+void RunExitDrain() noexcept;
+
+// A report a thread is writing (the device-loss report): a fatal exit on another thread ends the process after it
+// (DbgExit waits, 5 s at most), not in its middle.
+void BeginExitBlockingReport() noexcept;
+void EndExitBlockingReport() noexcept;
+
+// While one is alive, EXIT on this thread throws RecoverableExit instead of ending the process: a
+// precompile tool (PipelineCache::WarmSeeds) compiling inputs the game may never use skips them.
+struct RecoverableExit {
+	std::string message;
+};
+class RecoverableExitScope {
+public:
+	RecoverableExitScope();
+	~RecoverableExitScope();
+	RecoverableExitScope(const RecoverableExitScope&)            = delete;
+	RecoverableExitScope& operator=(const RecoverableExitScope&) = delete;
+};
 
 } // namespace Common
 

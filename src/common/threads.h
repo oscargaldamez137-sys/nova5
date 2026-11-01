@@ -31,7 +31,10 @@ public:
 	// The id is unique and can't be reused by another thread.
 	[[nodiscard]] int GetUniqueId() const;
 
+	static void Sleep(uint32_t millis);
 	static void SleepMicro(uint32_t micros);
+	// Idle workers must yield CPU time even for a short delay.
+	static void SleepMicroWithoutSpinning(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
 
@@ -76,6 +79,7 @@ public:
 	void Signal();
 	void SignalAll();
 
+	static void SignalThread(int thread_id);
 	static void SetWaitPollCallback(wait_poll_func_t callback);
 
 	KYTY_CLASS_NO_COPY(CondVar);

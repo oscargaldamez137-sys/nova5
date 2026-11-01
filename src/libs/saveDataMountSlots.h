@@ -1,7 +1,7 @@
-#include "common/hostPath.h"
 #ifndef EMULATOR_INCLUDE_EMULATOR_LIBS_SAVEDATAMOUNTSLOTS_H_
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_SAVEDATAMOUNTSLOTS_H_
 
+#include "common/hostPath.h"
 #include <array>
 #include <filesystem>
 #include <optional>
@@ -23,7 +23,9 @@ public:
 			const auto& mounted = m_directories[index];
 			if (mounted.has_value()) {
 				std::error_code error;
-				if (*mounted == directory || std::filesystem::equivalent(Common::NativeHostPath(*mounted), Common::NativeHostPath(directory), error)) {
+				if (*mounted == directory ||
+				    std::filesystem::equivalent(Common::NativeHostPath(*mounted),
+				                                Common::NativeHostPath(directory), error)) {
 					return BUSY;
 				}
 			}
@@ -38,8 +40,12 @@ public:
 		m_directories[slot] = directory;
 	}
 
+	[[nodiscard]] bool IsMounted(size_t slot) const {
+		return slot < m_directories.size() && m_directories[slot].has_value();
+	}
+
 	[[nodiscard]] const std::filesystem::path& Directory(size_t slot) const {
-		return *m_directories[slot];
+		return m_directories.at(slot).value();
 	}
 
 	void Release(size_t slot) {

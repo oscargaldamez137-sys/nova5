@@ -1,23 +1,21 @@
 #include "common/archive.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/magicEnum.h"
 #include "common/stringUtils.h"
-#include "common/stallDump.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
+#include "local-platform.h"
 
-#include <algorithm>
 #include <charconv>
 #include <cstdio>
-#include <filesystem>
-#include <string_view>
-#include <vector>
+#include <cstdlib>
 #include <fmt/format.h>
-#include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;
@@ -32,8 +30,12 @@ static std::string GetBuildString() {
 #else
 	std::string type = "????";
 #endif
+#if defined(KYTY_STEAM_DECK)
+	type += " (Steam Deck)";
+#endif
 
-	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
+	std::string compiler =
+	    Debug::GetCompiler() + "-" + Debug::GetLinker() + "-" + Debug::GetBitness();
 
 	std::string str =
 	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
@@ -46,68 +48,68 @@ static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
 	::printf("Nova5Emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
+	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive (.zar) to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
-	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
-	::printf(
-	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
-	    "                                       <dir>, or license only without <dir>. Repeatable.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Nova5.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
-	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
-	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
-	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
-	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
-	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
 	::printf(
-	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Fifo.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
-	::printf(
-	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
-	::printf("  --no-splash                          Disable the startup splash screen.\n");
-	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
-	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
-	::printf("  --network-connected                  Use the host local network.\n");
-	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
+	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
+	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
-	::printf("  --shader-validation                  Enable shader validation.\n");
-	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
-	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
-	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
+	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
-	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
+	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
-	::printf("  --profile                            Enable the Tracy profiler.\n");
-	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
-	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
-	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
-	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
-	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
+	::printf("  --profiler-direction <value>         None or Network.\n");
+	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
-	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
-	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
+	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
-	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --amd-cpu                           Missing CPU extensions + precise VRSQRTPS.\n");
+	::printf("  --no-amd-cpu                        Disable load-time CPU fixes (A/B only).\n");
+	::printf("  Default: fix missing SSE4a/RDPID/CLWB per CPUID; keep native VRSQRTPS.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --addcont <LABEL[=DIR]>              Additional content; repeatable.\n"
+	         "  --addcont-dir <dir>                  Scan additional content for this title.\n"
+	         "  --guest-exec <path> [args...]         Guest executable; remaining arguments go to guest.\n"
+	         "  --controller-color <#RRGGBB>         Override controller LED.\n"
+	         "  --controller-volume <0-100>          Controller speaker volume; default 50.\n"
+	         "  --controller-vibration <0-100>       Vibration intensity; default 100.\n"
+	         "  --keyboard-player <0>                Share player 1 (players 1-4 pending multiplayer port).\n"
+	         "  --mic <device name>                  Capture microphone; omitted: silence.\n"
+	         "  --hide-cursor                        Hide the cursor over the window.\n"
+	         "  --no-splash                          Disable startup progress window.\n"
+	         "  --network-connected                 Report host network connectivity (not PSN).\n"
+	         "  --profile                           Enable Tracy network profiling.\n"
+	         "  --perf-overlay                      Performance HUD; toggle with F2, cycle with F8.\n"
+	         "  --shader-cache                      Persistent shaders (already on in unified core).\n"
+	         "  --readback-tiled-images              Read back small writable tiled images.\n"
+	         "  --sync-raw-image-buffers              Synchronize raw buffer reads with image writes.\n"
+	         "  --skip-notice-screen                 Guest notice-screen skip flag.\n"
+	         "  --no-trophy-notifications            Disable trophy notifications.\n"
+	         "  --trophy-duration <seconds>          Trophy toast duration; clamped to 5-10.\n"
+	         "  --vr, --tessellation, --occlusion-queries: subsystem ports pending; rejected.\n"
+	         "  Boolean options accept either a bare flag or an explicit true/false.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -118,6 +120,22 @@ static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
 	index++;
 	out = argv[index];
 	return true;
+}
+
+static bool ParseBool(const std::string& value, bool& out) {
+	if (Common::EqualNoCase(value, "true") || value == "1" || Common::EqualNoCase(value, "yes") ||
+	    Common::EqualNoCase(value, "on")) {
+		out = true;
+		return true;
+	}
+
+	if (Common::EqualNoCase(value, "false") || value == "0" || Common::EqualNoCase(value, "no") ||
+	    Common::EqualNoCase(value, "off")) {
+		out = false;
+		return true;
+	}
+
+	return false;
 }
 
 template <typename E>
@@ -142,40 +160,6 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 	return true;
 }
 
-static bool ParseUint32(const std::string& value, uint32_t& out) {
-	uint32_t number   = 0;
-	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
-	if (error != std::errc {} || end != value.data() + value.size()) {
-		return false;
-	}
-	out = number;
-	return true;
-}
-
-static bool ParseControllerColor(const std::string& value, Config::ControllerColor& out) {
-	if (value.size() != 7 || value[0] != '#') {
-		return false;
-	}
-	uint32_t rgb = 0;
-	auto [end, error] = std::from_chars(value.data() + 1, value.data() + value.size(), rgb, 16);
-	if (error != std::errc {} || end != value.data() + value.size()) {
-		return false;
-	}
-	out = {static_cast<uint8_t>(rgb >> 16), static_cast<uint8_t>(rgb >> 8),
-	       static_cast<uint8_t>(rgb)};
-	return true;
-}
-
-static bool ParseInt32(const std::string& value, int32_t& out) {
-	int32_t number    = 0;
-	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
-	if (error != std::errc {} || end != value.data() + value.size()) {
-		return false;
-	}
-	out = number;
-	return true;
-}
-
 static bool ParseUserId(const std::string& value, int32_t& out) {
 	int32_t user_id   = 0;
 	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), user_id);
@@ -186,45 +170,6 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 	out = user_id;
 	return true;
 }
-
-using Config::ConfigOptions;
-
-struct Flag {
-	std::string_view name;
-	bool ConfigOptions::* field;
-	bool                  value = true;
-};
-
-static constexpr Flag FLAGS[] = {
-    {"--rd", &ConfigOptions::renderdoc_enabled},
-    {"--fullscreen", &ConfigOptions::fullscreen_enabled},
-    {"--hdr", &ConfigOptions::hdr_enabled},
-    {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
-    {"--no-splash", &ConfigOptions::splash_enabled, false},
-    {"--vr", &ConfigOptions::vr_enabled},
-    {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
-    {"--network-connected", &ConfigOptions::network_connected},
-    {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
-    {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
-    {"--shader-validation", &ConfigOptions::shader_validation_enabled},
-    {"--shader-cache", &ConfigOptions::shader_cache_enabled},
-    {"--tessellation", &ConfigOptions::tessellation_enabled},
-    {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
-    {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
-    {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
-    {"--profile", &ConfigOptions::profiler_enabled},
-    {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
-    {"--readback-linear-images", &ConfigOptions::readback_linear_images},
-    {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
-    {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
-    {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
-    {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
-    {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
-    {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-    {"--redzone", &ConfigOptions::red_zone_protection_enabled},
-#endif
-};
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
@@ -238,12 +183,82 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
-		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
-			options.config.*flag->field = flag->value;
+		// Nova5's launcher emits bare flags; run-windows also supports explicit booleans.
+		struct Flag { const char* name; bool Config::ConfigOptions::*field; bool value; };
+		static constexpr Flag flags[] {
+		    {"--hide-cursor", &Config::ConfigOptions::hide_cursor_enabled, true},
+		    {"--no-splash", &Config::ConfigOptions::splash_enabled, false},
+		    {"--network-connected", &Config::ConfigOptions::network_connected, true},
+		    {"--perf-overlay", &Config::ConfigOptions::perf_overlay_enabled, true},
+		    {"--shader-cache", &Config::ConfigOptions::shader_cache_enabled, true},
+		    {"--skip-notice-screen", &Config::ConfigOptions::skip_notice_screen, true},
+		    {"--readback-linear-images", &Config::ConfigOptions::readback_linear_images, true},
+		    {"--readback-tiled-images", &Config::ConfigOptions::readback_tiled_images, true},
+		    {"--sync-raw-image-buffers", &Config::ConfigOptions::sync_raw_image_buffers, true},
+		    {"--no-trophy-notifications", &Config::ConfigOptions::trophy_enabled, false},
+		    {"--vulkan-validation", &Config::ConfigOptions::vulkan_validation_enabled, true},
+		    {"--gpu-assisted-validation", &Config::ConfigOptions::gpu_assisted_validation_enabled, true},
+		    {"--shader-validation", &Config::ConfigOptions::shader_validation_enabled, true},
+		    {"--command-buffer-dump", &Config::ConfigOptions::command_buffer_dump_enabled, true},
+		    {"--graphics-debug-dump", &Config::ConfigOptions::graphics_debug_dump_enabled, true},
+		    {"--spirv-debug-printf", &Config::ConfigOptions::spirv_debug_printf_enabled, true},
+		};
+		bool handled = false;
+		for (const auto& flag: flags) {
+			if (arg != flag.name) continue;
+			bool enabled = true;
+			if (i + 1 < argc && ParseBool(argv[i + 1], enabled)) ++i;
+			options.config.*(flag.field) = enabled ? flag.value : !flag.value;
+			handled = true;
+			break;
+		}
+		if (handled) continue;
+		if (arg == "--profile") {
+			options.config.profiler_direction = Config::ProfilerDirection::Network;
+			continue;
+		}
+		// Nova5.ini can hold these on from the previous engine: the game still starts, without them (said in the log).
+		if (arg == "--tessellation" || arg == "--occlusion-queries") {
+			::printf("Nova5: %s is not available in this engine yet; the game runs without it.\n", arg.c_str());
+			continue;
+		}
+		if (arg == "--vr") {
+			::printf("Nova5 unified: %s requires a subsystem not yet ported; refusing to ignore it.\n", arg.c_str());
+			return false;
+		}
+
+		if (arg == "--rd") {
+			options.config.renderdoc_enabled = true;
 			continue;
 		}
 
-		if (!arg.starts_with("--")) {
+		if (arg == "--fullscreen") {
+			options.config.fullscreen_enabled = true;
+			continue;
+		}
+
+		if (arg == "--hdr") {
+			options.config.hdr_enabled = true;
+			continue;
+		}
+
+		if (arg == "--playgo-hack") {
+			options.config.playgo_hack_enabled = true;
+			continue;
+		}
+		if (arg == "--amd-cpu" || arg == "--no-amd-cpu") {
+			options.config.guest_cpu_mode = arg == "--amd-cpu" ? Config::GuestCpuMode::Full : Config::GuestCpuMode::Off;
+			continue;
+		}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (arg == "--redzone") {
+			options.config.red_zone_protection_enabled = true;
+			continue;
+		}
+#endif
+
+		if (!Common::StartsWith(arg, "--")) {
 			::printf("game input must be provided with --game\n");
 			return false;
 		}
@@ -253,82 +268,86 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			return false;
 		}
 
-		if (arg == "--game") {
+		if (arg == "--guest-exec") {
+			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.guest_arguments.clear();
+			while (++i < argc) options.config.guest_arguments.emplace_back(argv[i]);
+			break;
+		} else if (arg == "--addcont-dir") {
+			if (!options.addcont_dir.empty()) return false;
+			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--addcont") {
+			auto entry = Common::ParseAddContent(value);
+			if (!entry) { ::printf("invalid additional content: %s\n", value.c_str()); return false; }
+			options.addcont.push_back(std::move(*entry));
+		} else if (arg == "--mic") {
+			options.config.audio_input_device = value;
+		} else if (arg == "--controller-color") {
+			uint32_t rgb = 0;
+			if (value.size() != 7 || value[0] != '#') return false;
+			auto [end, error] = std::from_chars(value.data() + 1, value.data() + 7, rgb, 16);
+			if (error != std::errc{} || end != value.data() + 7) return false;
+			options.config.controller_color = Config::ControllerColor {uint8_t(rgb >> 16), uint8_t(rgb >> 8), uint8_t(rgb)};
+		} else if (arg == "--controller-volume" || arg == "--controller-vibration" ||
+		           arg == "--keyboard-player" || arg == "--trophy-duration") {
+			uint32_t number = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+			const auto max = arg == "--keyboard-player" ? 4u : arg == "--trophy-duration" ? UINT32_MAX : 100u;
+			if (error != std::errc{} || end != value.data() + value.size() || number > max) {
+				::printf("invalid value for %s: %s\n", arg.c_str(), value.c_str()); return false;
+			}
+			if (arg == "--controller-volume") options.config.controller_speaker_volume = number;
+			if (arg == "--controller-vibration") options.config.controller_vibration_intensity = number;
+			if (arg == "--keyboard-player") options.config.keyboard_player = number;
+			if (arg == "--keyboard-player" && number != 0) {
+				::printf("Nova5 unified: dedicated keyboard players require the multiplayer port; use 0 to share player 1.\n");
+				return false;
+			}
+			if (arg == "--trophy-duration") options.config.trophy_duration_seconds = number;
+		} else if (arg == "--game") {
 			if (!options.app0_dir.empty()) {
 				::printf("--game can only be specified once\n");
 				return false;
 			}
 
-			value           = Common::FixFilenameSlash(value);
-			const auto path = Common::PathFromUtf8(value);
-
-			if (Common::File::IsDirectoryExisting(path)) {
-				options.app0_dir = path;
+			value = Common::FixFilenameSlash(value);
+			if (Common::File::IsDirectoryExisting(value)) {
+				options.app0_dir = value;
 				options.elf      = "/app0/eboot.bin";
-			} else if (Common::IsSupportedArchive(path) && Common::File::IsFileExisting(path)) {
-				const auto root = Common::MakeArchivePath(path);
+			} else if (Common::IsSupportedArchive(value) && Common::File::IsFileExisting(value)) {
+				// A game folder packed into a ZArchive: mounted read-only, read without extracting it.
+				const auto root = Common::MakeArchivePath(value);
 				if (!Common::File::IsFileExisting(root / "eboot.bin")) {
-					::printf("Archive does not contain eboot.bin: %s\n", value.c_str());
+					::printf("Not a game archive (no eboot.bin at its root, or not a ZArchive): %s\n", value.c_str());
 					return false;
 				}
 				options.app0_dir = root;
 				options.elf      = "/app0/eboot.bin";
-			} else if (Common::File::IsFileExisting(path)) {
-				options.app0_dir = path.parent_path();
-
+			} else if (Common::File::IsFileExisting(value)) {
+				options.app0_dir = Common::DirectoryWithoutFilename(value);
 				if (options.app0_dir.empty()) {
 					options.app0_dir = ".";
 				}
-
-				options.elf = std::filesystem::path("/app0") / path.filename();
+				options.elf = "/app0/" + Common::FilenameWithoutDirectory(value);
 			} else {
-				::printf("--game must point to an existing directory, ELF, or archive: %s\n",
-				         value.c_str());
+				::printf("--game must point to an existing directory, ELF, or .zar: %s\n", value.c_str());
 				return false;
 			}
-		} else if (arg == "--guest-exec") {
-			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
-			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
-			break;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
 				return false;
 			}
 			value = Common::FixFilenameSlash(value);
-			const auto path = Common::PathFromUtf8(value);
-
-			if (!Common::File::IsFileExisting(path)) {
+			if (!Common::File::IsFileExisting(value)) {
 				::printf("--game-patch must point to an existing file: %s\n", value.c_str());
 				return false;
 			}
-			options.game_patch = path;
-		} else if (arg == "--addcont-dir") {
-			if (!options.addcont_dir.empty()) {
-				::printf("--addcont-dir can only be specified once\n");
-				return false;
-			}
-			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
-		} else if (arg == "--addcont") {
-			auto entry = Common::ParseAddContent(value);
-			if (!entry) {
-				::printf("--addcont needs <16-character A-Z/0-9 label>[=<existing folder>]: %s\n",
-				         value.c_str());
-				return false;
-			}
-			options.addcont.push_back(std::move(*entry));
+			options.game_patch = value;
 		} else if (arg == "--screen-width") {
-			if (!ParseUint32(value, options.config.screen_width) ||
-			    options.config.screen_width == 0) {
-				::printf("invalid screen width: %s\n", value.c_str());
-				return false;
-			}
+			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {
-			if (!ParseUint32(value, options.config.screen_height) ||
-			    options.config.screen_height == 0) {
-				::printf("invalid screen height: %s\n", value.c_str());
-				return false;
-			}
+			options.config.screen_height = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--user-name") {
 			if (value.empty() || value.size() > Config::MAX_USER_NAME_LENGTH) {
 				::printf("invalid user name: must contain 1-%zu bytes\n",
@@ -341,56 +360,35 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid user ID: %s\n", value.c_str());
 				return false;
 			}
-		} else if (arg == "--mic") {
-			options.config.audio_input_device = value;
-		} else if (arg == "--controller-color") {
-			Config::ControllerColor color {};
-			if (!ParseControllerColor(value, color)) {
-				::printf("invalid controller color (expected #RRGGBB): %s\n", value.c_str());
-				return false;
-			}
-			options.config.controller_color = color;
-		} else if (arg == "--controller-volume") {
-			if (!ParseUint32(value, options.config.controller_speaker_volume) ||
-			    options.config.controller_speaker_volume > 100) {
-				::printf("invalid controller volume: %s\n", value.c_str());
-				return false;
-			}
-		} else if (arg == "--controller-vibration") {
-			if (!ParseUint32(value, options.config.controller_vibration_intensity) ||
-			    options.config.controller_vibration_intensity > 100) {
-				::printf("invalid controller vibration intensity: %s\n", value.c_str());
-				return false;
-			}
-		} else if (arg == "--keyboard-player") {
-			if (!ParseUint32(value, options.config.keyboard_player) ||
-			    options.config.keyboard_player > static_cast<uint32_t>(Config::MAX_PLAYERS)) {
-				::printf("invalid keyboard player: %s\n", value.c_str());
-				return false;
-			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu") {
-			if (!ParseInt32(value, options.config.gpu_index)) {
-				::printf("invalid gpu index: %s\n", value.c_str());
-				return false;
-			}
+			options.config.gpu_index = Common::ToInt32(value);
 		} else if (arg == "--vblank-frequency") {
-			if (!ParseUint32(value, options.config.vblank_frequency)) {
-				::printf("invalid vblank frequency: %s\n", value.c_str());
-				return false;
-			}
-		} else if (arg == "--trophy-duration") {
-			if (!ParseUint32(value, options.config.trophy_duration_seconds)) {
-				::printf("invalid trophy duration: %s\n", value.c_str());
-				return false;
-			}
+			const int32_t vblank_frequency = Common::ToInt32(value);
+			options.config.vblank_frequency =
+			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--vulkan-validation") {
+			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-assisted-validation") {
+			if (!ParseBool(value, options.config.gpu_assisted_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--shader-validation") {
+			if (!ParseBool(value, options.config.shader_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-optimization-type") {
@@ -404,23 +402,49 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--shader-log-folder") {
-			options.config.shader_log_folder = Common::PathFromUtf8(value);
+			options.config.shader_log_folder = value;
+		} else if (arg == "--command-buffer-dump") {
+			if (!ParseBool(value, options.config.command_buffer_dump_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--command-buffer-dump-folder") {
-			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
+			options.config.command_buffer_dump_folder = value;
+		} else if (arg == "--graphics-debug-dump") {
+			if (!ParseBool(value, options.config.graphics_debug_dump_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--printf-direction") {
 			if (!ParseEnum(value, options.config.printf_direction)) {
 				::printf("invalid printf direction: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--printf-output-file") {
-			options.config.printf_output_file = Common::PathFromUtf8(value);
+			options.config.printf_output_file = value;
+		} else if (arg == "--profiler-direction") {
+			if (!ParseEnum(value, options.config.profiler_direction)) {
+				::printf("invalid profiler direction: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--spirv-debug-printf") {
+			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--readback-linear-images") {
+			if (!ParseBool(value, options.config.readback_linear_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
-				::printf("invalid keymap: %s\n", value.c_str());
-				return false;
+				// (Skipped as hostInput.cpp skips a mapping it cannot use: the game still starts.)
+				::printf("Input mapping skipped: %s (not <control>=<key>)\n", value.c_str());
+			} else {
+				options.config.keymap.push_back(value);
 			}
-			options.config.keymap.push_back(value);
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
@@ -434,9 +458,35 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#ifndef NOVA5_ARGS_TEST
 static int Main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	LocalPlatform::ReleaseRedirectedConsole();
+	LocalPlatform::AsyncStdout();
+	Common::SetExitDrain(LocalPlatform::DrainStdout);
+	// (Registered first, run last: the game's window closes with quick_exit.)
+	std::atexit(LocalPlatform::DrainStdout);
+	std::at_quick_exit(LocalPlatform::DrainStdout);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// AMD on Linux (RADV): the transfer-only queue family, which RADV shows only when asked to, carries the readbacks of
+	// GPU work already done (KYTY_READBACK_QUEUE); without it each waited behind the whole graphics queue. Walking at 1-1
+	// on an RX 9070 XT: 44.2 -> 56.3 fps and the 0.1% lows 20 -> 27-29 (dreamerk24m); an RX 9060 XT +19% at the lowest
+	// preset (the2ndday; issue #80). Asked for before the driver loads (Mesa 26 reads RADV_EXPERIMENTAL, older Mesa
+	// RADV_PERFTEST; other drivers neither), unless the variable is set already. KYTY_RADV_TRANSFER_QUEUE=0: not asked.
+	if (const char* ask = std::getenv("KYTY_RADV_TRANSFER_QUEUE"); ask == nullptr || ask[0] != '0') {
+		setenv("RADV_EXPERIMENTAL", "transfer_queue", 0);
+		setenv("RADV_PERFTEST", "transfer_queue", 0);
+	}
+#endif
 	VirtualMemory::Init();
 	InitializeThreads();
+	// KYTY_ALLOC_TRACE=<sizes> (diagnostics, e.g. "112,64,16-256" or "1048576-33554432;2888": ',' or ';' between, sizes
+	// of 1 MiB and more as up to 16 ranges): the stacks of heap blocks of those sizes from the start (live `alloctrace
+	// dump <path>` writes the live ones); the live `alloctrace start` misses what loading made.
+	if (const char* sizes = std::getenv("KYTY_ALLOC_TRACE"); sizes != nullptr && *sizes != '\0')
+		std::printf("Allocation trace from start-up (%s): %s\n", sizes,
+		            LocalPlatform::StartAllocTrace(sizes) ? "on" : "unavailable");
 
 	RunOptions options;
 	bool       show_help = false;
@@ -456,39 +506,25 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
-	Common::StallDump::Initialize();
+	LocalPlatform::StartHeapTrimmer();
 	Run(options);
 
 	return 0;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-
 int wmain(int argc, wchar_t* argv[]) {
-    std::vector<std::string> utf8_args;
-    utf8_args.reserve(static_cast<size_t>(argc));
-
-    for (int index = 0; index < argc; index++) {
-        const std::wstring_view wide(argv[index]);
-        const std::u16string utf16(wide.begin(), wide.end());
-
-        utf8_args.push_back(Common::Utf16ToUtf8(utf16));
-    }
-
-    std::vector<char*> utf8_argv;
-    utf8_argv.reserve(utf8_args.size());
-
-    for (auto& argument: utf8_args) {
-        utf8_argv.push_back(argument.data());
-    }
-
-    return Main(argc, utf8_argv.data());
+	std::vector<std::string> arguments;
+	arguments.reserve(argc);
+	for (int i = 0; i < argc; ++i) {
+		const std::wstring_view wide(argv[i]);
+		arguments.push_back(Common::Utf16ToUtf8(std::u16string(wide.begin(), wide.end())));
+	}
+	std::vector<char*> pointers;
+	for (auto& argument: arguments) pointers.push_back(argument.data());
+	return Main(argc, pointers.data());
 }
-
 #else
-
-int main(int argc, char* argv[]) {
-    return Main(argc, argv);
-}
-
+int main(int argc, char* argv[]) { return Main(argc, argv); }
 #endif
+#endif // NOVA5_ARGS_TEST

@@ -16,9 +16,7 @@ struct Lifecycle {
 
 namespace Net {
 
-struct NetEtherAddr {
-	uint8_t data[6] = {0};
-};
+struct NetEtherAddr;
 
 union NetEpollData {
 	void*    ptr;
@@ -43,7 +41,6 @@ int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
 int KYTY_SYSV_ABI NetResolverDestroy(int rid);
-int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
@@ -136,16 +133,6 @@ int KYTY_SYSV_ABI HttpSetSendTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetRecvTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetAutoRedirect(int id, int enable);
 int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable);
-int KYTY_SYSV_ABI HttpSetRedirectCallback(int id, void* cbfunc, void* user_arg);
-int KYTY_SYSV_ABI HttpSetCookieRecvCallback(int id, void* cbfunc, void* user_arg);
-int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* cbfunc, void* user_arg);
-int KYTY_SYSV_ABI HttpSetInflateGZIPEnabled(int id, int is_enable);
-int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int is_enabled);
-int KYTY_SYSV_ABI HttpsLoadCert(int http_ctx_id, int ca_cert_num, const void** ca_list,
-                                const void* cert, const void* priv_key);
-int KYTY_SYSV_ABI HttpsUnloadCert(int http_ctx_id);
-int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int32_t* err_num, uint32_t* detail);
-int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* err_num);
 
 } // namespace Http
 
@@ -180,14 +167,11 @@ struct NpCreateAsyncRequestParameter;
 struct NpCheckPremiumParameter;
 struct NpCheckPremiumResult;
 
-using NpStateCallbackA = KYTY_SYSV_ABI void (*)(int user_id, uint32_t state, void* userdata);
-
 int KYTY_SYSV_ABI  NpCheckCallback();
 int KYTY_SYSV_ABI  NpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret* title_secret);
 int KYTY_SYSV_ABI  NpSetContentRestriction(const NpContentRestriction* restriction);
 int KYTY_SYSV_ABI  NpRegisterStateCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpUnregisterStateCallback();
-int KYTY_SYSV_ABI  NpRegisterStateCallbackA(NpStateCallbackA callback, void* userdata);
 void KYTY_SYSV_ABI NpRegisterGamePresenceCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpRegisterPlusEventCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpRegisterPremiumEventCallback(void* callback, void* userdata);
@@ -197,7 +181,6 @@ int KYTY_SYSV_ABI  NpGetOnlineId(int user_id, NpOnlineId* online_id);
 int KYTY_SYSV_ABI  NpGetAccountIdA(int user_id, uint64_t* account_id);
 int KYTY_SYSV_ABI  NpGetAccountCountryA(int user_id, void* country_code);
 int KYTY_SYSV_ABI  NpGetAccountAge(int req_id, int user_id, uint8_t* age);
-int KYTY_SYSV_ABI  NpGetAccountLanguage2(int req_id, int user_id, void* language_code);
 int KYTY_SYSV_ABI  NpCreateRequest();
 int KYTY_SYSV_ABI  NpCreateAsyncRequest(const NpCreateAsyncRequestParameter* param);
 int KYTY_SYSV_ABI  NpDeleteRequest(int req_id);

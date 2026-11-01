@@ -1,6 +1,5 @@
 #include "common/abi.h"
 #include "graphics/presentation/videoOut.h"
-#include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -10,13 +9,30 @@ namespace LibGen5 {
 
 LIB_VERSION("VideoOut", 1, "VideoOut", 1, 1);
 
+// From Nova5 (upstream): the guest only asks for WQHD output detection; the fixed host output ignores it.
+static KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int /*handle*/) {
+	return 0;
+}
+
+namespace VrrStatus {
+// From Nova5 (upstream 30a4673c), libVideoOutVrrStatus: fixed refresh, so no VRR state to report.
+LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+
+static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
+	return 0;
+}
+
+LIB_DEFINE(InitVideoOutVrrStatus_1) {
+	LIB_FUNC("kP2L8t3j-aM", VideoOutVrrStatus_kP2L8t3j_aM);
+}
+} // namespace VrrStatus
+
 LIB_DEFINE(InitVideoOut_1) {
+	VrrStatus::InitVideoOutVrrStatus_1(s);
 	PRINT_NAME_ENABLE(true);
 
 	LIB_FUNC("Up36PTk687E", VideoOut::VideoOutOpen);
 	LIB_FUNC("uquVH4-Du78", VideoOut::VideoOutClose);
-	LIB_FUNC("WkYtyOg30do", VideoOut::VideoOutSetFlipMaster);
-	LIB_FUNC("MBlv8YWoyOk", VideoOut::VideoOutAddBufferAttributeOption);
 	LIB_FUNC("PjS5uASwcV8", VideoOut::VideoOutSetBufferAttribute2);
 	LIB_FUNC("rKBUtgRrtbk", VideoOut::VideoOutRegisterBuffers2);
 	LIB_FUNC("HuViW4HnrOw", VideoOut::VideoOutSubmitChangeBufferAttribute2);
@@ -39,8 +55,6 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("Mt4QHHkxkOc", VideoOut::VideoOutGetEventCount);
 	LIB_FUNC("j6RaAUlaLv0", VideoOut::VideoOutWaitVblank);
 	LIB_FUNC("utPrVdxio-8", VideoOut::VideoOutGetOutputStatus);
-	LIB_FUNC("5tRaBjtdTzY", VideoOut::VideoOutVrrPegToFixedRate);
-	LIB_FUNC("T4ucGB8CsnM", VideoOut::VideoOutVrrUnpegFromFixedRate);
 	LIB_FUNC("+I4K03i3EL0", VideoOut::VideoOutInitializeOutputOptions);
 	LIB_FUNC("Nv8c-Kb+DUM", VideoOut::VideoOutIsOutputSupported);
 	LIB_FUNC("w0hLuNarQxY", VideoOut::VideoOutConfigureOutput);
@@ -48,7 +62,7 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
-	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
+	LIB_FUNC("w7Ipp9Xl7hg", VideoOutAllowOutputResolutionWqhdDetection);
 }
 
 } // namespace LibGen5

@@ -1,0 +1,23 @@
+{
+  "environment": {},
+  "command": [
+    "--",
+    "kyty_emulator.exe",
+    "--screen-width",
+    "2560",
+    "--screen-height",
+    "1440",
+    "--console-language",
+    "1",
+    "--shader-validation",
+    "false",
+    "--shader-log-direction",
+    "Silent",
+    "--printf-direction",
+    "Silent",
+    "--vblank-frequency",
+    "60",
+    "--present-mode",
+    "Immediate"
+  ]
+}

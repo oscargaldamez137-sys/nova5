@@ -1,10 +1,10 @@
 #include "emulator.h"
+#include "common/termination.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
-#include "common/gpuThreadSampler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -12,7 +12,6 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
-#include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -23,8 +22,8 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
-#include "loader/additionalContent.h"
 #include "loader/runtimeLinker.h"
+#include "loader/additionalContent.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
@@ -88,6 +87,43 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_DownloadData/" + title_id, "/download0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
+	MountOrCreateDir("_DevLog/" + title_id, "/devlog");
+}
+
+static bool ClearDirectoryContents(const std::filesystem::path& dir) {
+	bool ok = true;
+
+	for (const auto& entry: Common::File::GetDirEntries(dir)) {
+		if (entry.name == "." || entry.name == "..") {
+			continue;
+		}
+
+		auto path = dir / entry.name;
+
+		if (entry.is_file) {
+			Common::File::RemoveReadonly(path);
+			ok = Common::File::DeleteFile(path) && ok;
+		} else {
+			ok = ClearDirectoryContents(path) && ok;
+			ok = Common::File::DeleteDirectory(path) && ok;
+		}
+	}
+
+	return ok;
+}
+
+static void ClearDebugTextureFolder() {
+	const std::string debug_texture_folder = "_Textures";
+
+	if (!Common::File::IsDirectoryExisting(debug_texture_folder)) {
+		Common::File::CreateDirectories(debug_texture_folder);
+		return;
+	}
+
+	if (!ClearDirectoryContents(debug_texture_folder)) {
+		LOGF_COLOR(Log::Color::BrightYellow, "TextureDump: failed to completely clear %s\n",
+		           debug_texture_folder.c_str());
+	}
 }
 
 static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& param_json,
@@ -96,6 +132,9 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
+	std::printf("[NOVA5_COMPAT] Trophy persistence and notifications are not ported yet; "
+	            "requested notifications=%s duration=%u s.\n",
+	            Config::TrophyEnabled() ? "on" : "off", Config::GetTrophyDurationSeconds());
 	subsystems.Initialize<Log::Lifecycle>();
 
 	if (Common::File::IsFileExisting(param_json)) {
@@ -104,9 +143,6 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		    flexible_memory_size != 0) {
 			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 		}
-	}
-	if (cfg.splash_enabled) {
-		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
@@ -147,7 +183,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
-	Common::GpuThreadSampler::StopAndFlush();
+	Common::Termination::Report("quick_exit", 0, 0, false, "WindowRun returned; caches saved");
 	std::quick_exit(0);
 }
 
@@ -164,19 +200,9 @@ void Run(const RunOptions& options) {
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 
+	ClearDebugTextureFolder();
+
 	PrintSystemInfo();
-	std::string title_id;
-	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
-	if (title_id.empty()) {
-		std::string content_id;
-		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) &&
-		    content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
-			title_id = content_id.substr(7, 9);
-		}
-	}
-	if (!title_id.empty()) {
-		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
-	}
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
@@ -189,8 +215,10 @@ void Run(const RunOptions& options) {
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	MountSandboxDirs();
-
+	std::string title_id;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
 	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
+
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 

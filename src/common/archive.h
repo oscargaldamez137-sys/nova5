@@ -5,8 +5,8 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace Common {
@@ -21,6 +21,8 @@ public:
 	[[nodiscard]] uint64_t Tell() const;
 	bool                   Seek(uint64_t offset);
 	void                   Read(void* data, uint32_t size, uint32_t* bytes_read);
+	// A read at `offset` that leaves the position alone: any number of threads can share the file.
+	uint32_t ReadAt(uint64_t offset, void* data, uint32_t size) const;
 
 	KYTY_CLASS_NO_COPY(ArchiveFile);
 
@@ -45,12 +47,6 @@ private:
 // Retain this handle while a mount or metadata scan is active to reuse the index and block cache.
 // Accepts either a host archive filename or a virtual path inside the archive.
 [[nodiscard]] std::shared_ptr<ArchiveReader> OpenArchive(const std::filesystem::path& path);
-
-// Packs a host directory into a new ZArchive outside it. progress gets 0 < done <= total and
-// returns false to cancel. A failed or cancelled pack removes the partial archive.
-[[nodiscard]] bool PackArchive(const std::filesystem::path& directory,
-                               const std::filesystem::path& archive,
-                               const std::function<bool(uint64_t done, uint64_t total)>& progress);
 
 } // namespace Common
 

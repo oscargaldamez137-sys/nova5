@@ -19,10 +19,6 @@ class File;
 
 namespace Libs::Graphics::Pm4 {
 
-constexpr uint32_t PacketSizeDw(uint32_t header) {
-	return (header & 0x3fffff00u) == 0x3fff1000u ? 1u : KYTY_PM4_LEN(header);
-}
-
 constexpr uint32_t IT_NOP                       = 0x10;
 constexpr uint32_t IT_SET_BASE                  = 0x11;
 constexpr uint32_t IT_CLEAR_STATE               = 0x12;
@@ -40,6 +36,7 @@ constexpr uint32_t IT_INDEX_TYPE                = 0x2A;
 constexpr uint32_t IT_DRAW_INDIRECT_MULTI       = 0x2C;
 constexpr uint32_t IT_DRAW_INDEX_AUTO           = 0x2D;
 constexpr uint32_t IT_NUM_INSTANCES             = 0x2F;
+constexpr uint32_t IT_INDIRECT_BUFFER_CNST      = 0x33;
 constexpr uint32_t IT_DRAW_INDEX_OFFSET_2       = 0x35;
 constexpr uint32_t IT_WRITE_DATA                = 0x37;
 constexpr uint32_t IT_MEM_SEMAPHORE             = 0x39;
@@ -52,6 +49,8 @@ constexpr uint32_t IT_CP_DMA                    = 0x41;
 constexpr uint32_t IT_PFP_SYNC_ME               = 0x42;
 constexpr uint32_t IT_SURFACE_SYNC              = 0x43;
 constexpr uint32_t IT_EVENT_WRITE               = 0x46;
+constexpr uint32_t IT_EVENT_WRITE_EOP           = 0x47;
+constexpr uint32_t IT_EVENT_WRITE_EOS           = 0x48;
 constexpr uint32_t IT_RELEASE_MEM               = 0x49;
 constexpr uint32_t IT_DMA_DATA                  = 0x50;
 constexpr uint32_t IT_ACQUIRE_MEM               = 0x58;
@@ -64,6 +63,12 @@ constexpr uint32_t IT_SET_SH_REG                = 0x76;
 constexpr uint32_t IT_SET_QUEUE_REG             = 0x78;
 constexpr uint32_t IT_SET_UCONFIG_REG           = 0x79;
 constexpr uint32_t IT_SET_UCONFIG_REG_INDEX     = 0x7A;
+constexpr uint32_t IT_WRITE_CONST_RAM           = 0x81;
+constexpr uint32_t IT_DUMP_CONST_RAM            = 0x83;
+constexpr uint32_t IT_INCREMENT_CE_COUNTER      = 0x84;
+constexpr uint32_t IT_INCREMENT_DE_COUNTER      = 0x85;
+constexpr uint32_t IT_WAIT_ON_CE_COUNTER        = 0x86;
+constexpr uint32_t IT_WAIT_ON_DE_COUNTER_DIFF   = 0x88;
 constexpr uint32_t IT_DISPATCH_DRAW             = 0x8D;
 constexpr uint32_t IT_GET_LOD_STATS             = 0x8E;
 constexpr uint32_t IT_WAIT_REG_MEM_64           = 0x93;
@@ -77,10 +82,14 @@ constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_DISPATCH_RESET = 0x09;
 constexpr uint32_t R_PUSH_MARKER    = 0x0B;
 constexpr uint32_t R_POP_MARKER     = 0x0C;
+constexpr uint32_t R_ACQUIRE_MEM    = 0x14;
 constexpr uint32_t R_WRITE_DATA     = 0x15;
 constexpr uint32_t R_FLIP           = 0x17;
+constexpr uint32_t R_RELEASE_MEM    = 0x18;
 constexpr uint32_t R_DMA_DATA       = 0x19;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
+// Sony's PSSR dispatch (libs/libPsml.cpp; graphics/guest_gpu/superResolution.h).
+constexpr uint32_t R_SUPER_RESOLUTION = 0x1B;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 
@@ -539,8 +548,6 @@ constexpr uint32_t VGT_SHADER_STAGES_EN                                = 0x2D5;
 constexpr uint32_t VGT_LS_HS_CONFIG                                    = 0x2D6;
 constexpr uint32_t VGT_TF_PARAM                                        = 0x2DB;
 constexpr uint32_t DB_ALPHA_TO_MASK                                    = 0x2DC;
-constexpr uint32_t DB_ALPHA_TO_MASK_ALPHA_TO_MASK_ENABLE_SHIFT         = 0;
-constexpr uint32_t DB_ALPHA_TO_MASK_ALPHA_TO_MASK_ENABLE_MASK          = 0x1;
 constexpr uint32_t PA_SU_POLY_OFFSET_DB_FMT_CNTL                       = 0x2DE;
 constexpr uint32_t PA_SU_POLY_OFFSET_DB_FMT_CNTL_NEG_NUM_DB_BITS_SHIFT = 0;
 constexpr uint32_t PA_SU_POLY_OFFSET_DB_FMT_CNTL_NEG_NUM_DB_BITS_MASK  = 0xFF;
@@ -692,8 +699,6 @@ constexpr uint32_t CX_NUM = 0x3FF + 1;
 
 /* Shader registers */
 
-constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_PS = 0x2;
-constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_PS = 0x3;
 constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;
 constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_PS    = 0x7;
 constexpr uint32_t SPI_SHADER_PGM_LO_PS              = 0x8;
@@ -907,7 +912,6 @@ constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_MASK    = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT = 31;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK  = 0x1;
 
-constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;
 
@@ -984,12 +988,6 @@ constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR2_SHIFT = 1;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR2_MASK  = 0x1;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR3_SHIFT = 2;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR3_MASK  = 0x1;
-
-constexpr uint32_t FSR_WINDOW_LEFT           = 0x2BC;
-constexpr uint32_t FSR_CONTROL_POINTS_LEFT_X = 0x2C4;
-constexpr uint32_t FSR_CONTROL_POINTS_LEFT_Y = 0x2CC;
-constexpr uint32_t FSR_ALPHA_LEFT_X          = 0x2E4;
-constexpr uint32_t FSR_ALPHA_LEFT_Y          = 0x2E8;
 
 constexpr uint32_t TA_CS_BC_BASE_ADDR       = 0x380;
 constexpr uint32_t TA_CS_BC_BASE_ADDR_HI    = 0x381;

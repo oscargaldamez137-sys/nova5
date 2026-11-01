@@ -4,7 +4,6 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
-#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -17,11 +16,15 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Block;
 class Inst;
 
+// Whether translations run the IR consistency checks (ValidateProgram, duplicate uses): debug builds, or
+// KYTY_IR_VALIDATE in release. They only ever stop the emulator, and they were a fifth of a release
+// translation's time (the first-encounter hitches).
+bool ValidationEnabled();
+
 class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
-	explicit Value(const Inst* value) = delete;
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);
@@ -123,21 +126,19 @@ public:
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
-	// SRT walker output index, assigned by the resource plan that owns this instruction.
-	[[nodiscard]] uint32_t WalkOutput() const { return walk_output; }
-	void SetWalkOutput(uint32_t index) const { walk_output = index; }
-	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
-	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
-	void SetDefinition(uint32_t half, uint32_t definition) const {
-		definitions[half] = definition;
-	}
-	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
+	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
+	// Invalidate without unlinking the uses: only when every value of the IR is destroyed together.
+	void DropLinks();
+	// Assigned only to the private, immutable clones in ExtractResourcePlan.
+	// Unsealed translation IR uses the pointer-keyed evaluator instead.
+	[[nodiscard]] uint32_t EvaluationIndex() const { return evaluation_index; }
+	void SetEvaluationIndex(uint32_t index) { evaluation_index = index; }
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -155,30 +156,17 @@ public:
 	}
 
 private:
-	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
-
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
-	static constexpr uint8_t InlineArity = 4;
-	static constexpr uint8_t PhiArity = UINT8_MAX;
-
 	ValueOpcode         opcode;
-	uint8_t             num_args;
-	bool                live = false;
-	mutable uint32_t    walk_output = UINT32_MAX;
-	mutable std::array<uint32_t, 2> definitions {};
+	uint32_t            evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	union {
-		std::array<Value, InlineArity> fixed_args {};
-		std::vector<Value> large_args;
-		std::vector<std::pair<Block*, Value>> phi_args;
-	};
+	std::vector<Value>  args;
+	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
 };
-
-static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

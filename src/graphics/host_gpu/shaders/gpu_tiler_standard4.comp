@@ -1,7 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-layout(constant_id = 0) const uint ELEMENT_BYTES = 4u;
-layout(constant_id = 1) const uint TILE = 0u;
+#include "gpu_tiler_variant.inc"
 const uint BLOCK_BYTES = 4096u;
 #include "gpu_tiler_standard.inc"
 uvec3 block_extent() {

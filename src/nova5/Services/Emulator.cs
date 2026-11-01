@@ -63,6 +63,17 @@ public sealed class Emulator
 	{
 		var info = new ProcessStartInfo(ExePath) { WorkingDirectory = BaseDir, UseShellExecute = false };
 		foreach (var arg in Arguments(game)) info.ArgumentList.Add(arg);
+		DemonsSoulsOptions.Apply(game.TitleId, info.Environment, key => Ini.Get(Global, key));
+		// The recording and render threads on the performance cores (run-windows.ps1's "auto"): +2.5 % in Demon's
+		// Souls; an environment that names them, or ds_affinity_enabled=false for Demon's Souls, leaves them to Windows.
+		var affinityOff = game.TitleId == "PPSA01341" && Ini.Get(Global, "ds_affinity_enabled") is { } ds &&
+		                  !DemonsSoulsOptions.Effective(ds, null);
+		if (!affinityOff && !info.Environment.ContainsKey("KYTY_RECORDING_CPUS") &&
+		    CpuSets.PerformanceCpus() is { Length: > 0 } cpus)
+		{
+			info.Environment["KYTY_RECORDING_CPUS"] = cpus;
+			if (!info.Environment.ContainsKey("KYTY_RENDER_CPUS")) info.Environment["KYTY_RENDER_CPUS"] = cpus;
+		}
 		return Process.Start(info) ?? throw new InvalidOperationException("Nova5Emulator did not start");
 	}
 
@@ -92,7 +103,8 @@ public sealed class Emulator
 		Flag(args, "network_connected", "--network-connected");
 		Flag(args, "tessellation_enabled", "--tessellation");
 		Flag(args, "occlusion_queries_enabled", "--occlusion-queries");
-		if (ShaderCache) args.Add("--shader-cache");
+		// (Said either way: the engine's own default is on.)
+		args.AddRange(["--shader-cache", ShaderCache ? "true" : "false"]);
 		args.AddRange(["--vblank-frequency", Get("vblank_frequency", "60")]);
 		args.AddRange(["--console-language", Get("console_language", "1")]);
 		Flag(args, "vulkan_validation_enabled", "--vulkan-validation");
@@ -106,7 +118,8 @@ public sealed class Emulator
 		args.AddRange(["--printf-output-file", Get("printf_output_file", "_nova5.txt")]);
 		Flag(args, "profiler_enabled", "--profile");
 		Flag(args, "amd_cpu_enabled", "--amd-cpu");
-		Flag(args, "red_zone_protection_enabled", "--redzone");
+		// The red zone protection is on unless Nova5.ini turns it off: the engine runs games with it (run-windows.ps1).
+		if (Ini.GetBool(Global, "red_zone_protection_enabled", true)) args.Add("--redzone");
 		Flag(args, "renderdoc_enabled", "--rd");
 		args.AddRange(["--game", game.Eboot]);
 		if (PatchFor(game.TitleId) is { } patch) args.AddRange(["--game-patch", patch]);

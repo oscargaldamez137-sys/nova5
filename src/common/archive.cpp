@@ -1,4 +1,3 @@
-#include "common/hostPath.h"
 #include "common/archive.h"
 
 #include "common/stringUtils.h"
@@ -33,18 +32,21 @@ public:
 		bool     is_file;
 	};
 
-	virtual ~ArchiveReader()                                                       = default;
-	virtual std::optional<Entry>        Find(std::string_view member)              = 0;
-	virtual std::vector<File::DirEntry> List(std::string_view member)              = 0;
-	virtual uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) = 0;
+	// Reads on different lanes run in parallel (each lane its own stream and block cache), those on one lane in turn.
+	static constexpr uint32_t Lanes = 4;
+
+	virtual ~ArchiveReader()                                          = default;
+	virtual std::optional<Entry>        Find(std::string_view member) = 0;
+	virtual std::vector<File::DirEntry> List(std::string_view member) = 0;
+	virtual uint64_t Read(uint32_t lane, uint64_t id, uint64_t offset, uint32_t size, void* data) = 0;
 };
 
 namespace {
 
 class ZArchiveReaderBackend final: public ArchiveReader {
 public:
-	explicit ZArchiveReaderBackend(std::unique_ptr<ZArchiveReader> reader)
-	    : m_reader(std::move(reader)) {}
+	ZArchiveReaderBackend(std::filesystem::path path, std::unique_ptr<ZArchiveReader> reader)
+	    : m_path(std::move(path)), m_reader(std::move(reader)) {}
 
 	std::optional<Entry> Find(std::string_view member) override {
 		const auto node = m_reader->LookUp(member);
@@ -74,18 +76,31 @@ public:
 		return result;
 	}
 
-	uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) override {
-		// ZArchiveReader already serializes access to its stream and decompression cache.
-		return m_reader->ReadFromFile(static_cast<ZArchiveNodeHandle>(id), offset, size, data);
+	uint64_t Read(uint32_t lane, uint64_t id, uint64_t offset, uint32_t size, void* data) override {
+		// ZArchiveReader serializes the calls on its stream and block cache: the lanes after the first read with
+		// readers of their own (opened on a lane's first read; the first one's if that fails).
+		auto* reader = m_reader.get();
+		if (lane != 0 && lane < Lanes) {
+			std::call_once(m_lane_opened[lane], [&] {
+				m_lane_readers[lane].reset(ZArchiveReader::OpenFromFile(m_path));
+			});
+			if (m_lane_readers[lane] != nullptr) {
+				reader = m_lane_readers[lane].get();
+			}
+		}
+		return reader->ReadFromFile(static_cast<ZArchiveNodeHandle>(id), offset, size, data);
 	}
 
 private:
-	std::unique_ptr<ZArchiveReader> m_reader;
+	std::filesystem::path           m_path;
+	std::unique_ptr<ZArchiveReader> m_reader; // lane 0's, and the look-ups'
+	std::unique_ptr<ZArchiveReader> m_lane_readers[Lanes];
+	std::once_flag                  m_lane_opened[Lanes];
 };
 
 std::shared_ptr<ArchiveReader> OpenZArchive(const std::filesystem::path& path) {
-	auto reader = std::unique_ptr<ZArchiveReader>(ZArchiveReader::OpenFromFile(NativeHostPath(path)));
-	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader)) : nullptr;
+	auto reader = std::unique_ptr<ZArchiveReader>(ZArchiveReader::OpenFromFile(path));
+	return reader ? std::make_shared<ZArchiveReaderBackend>(path, std::move(reader)) : nullptr;
 }
 
 struct ArchiveFormat {
@@ -165,80 +180,146 @@ std::optional<ParsedPath> ParsePath(const std::filesystem::path& path) {
 std::mutex                                                              g_readers_mutex;
 std::unordered_map<std::filesystem::path, std::weak_ptr<ArchiveReader>> g_readers;
 
-// Guest stacks can be only 64 KiB. Decompress on an ordinary host stack, then copy into guest
-// memory on the caller so GPU-tracked writes use its fault handler. A single worker bounds host
-// threads and avoids duplicating the archive's own block cache. Requests live on waiting callers.
-class ArchiveIoThread {
+// Guest stacks can be only 64 KiB. Decompress on ordinary host stacks, then copy into guest memory on the caller so
+// GPU-tracked writes use its fault handler. A thread a lane (ArchiveReader::Lanes): a read is split into chunks, which
+// decompress on the lanes in parallel (one lane decompressed about 1 GB/s; a 320 MiB read took 323 ms, and
+// smaller reads waited behind it); a chunk's lane follows its place in the file, so small reads of one region
+// meet the block cache of the lane that read it before. Requests live on waiting callers.
+class ArchiveIo {
 public:
-	static ArchiveIoThread& Instance() {
+	static ArchiveIo& Instance() {
 		// Guest exit can run static destructors while other guest threads are still reading.
-		// Keep the worker alive until process termination, as with the guest threads themselves.
-		static auto* instance = new ArchiveIoThread;
+		// Keep the workers alive until process termination, as with the guest threads themselves.
+		static auto* instance = new ArchiveIo;
 		return *instance;
 	}
 
-	uint64_t Read(ArchiveReader& reader, uint64_t id, uint64_t offset, uint32_t size, void* data) {
-		Request          request {reader, id, offset, size, data};
-		std::unique_lock lock(m_mutex);
-		if (m_last != nullptr) {
-			m_last->next = &request;
-		} else {
-			m_first = &request;
+	// Reads [offset, offset + size) of the member into `data` (copied on this thread): the bytes read.
+	uint32_t Read(ArchiveReader& reader, uint64_t id, uint64_t offset, uint32_t size, uint8_t* data) {
+		constexpr uint32_t                chunk_size = 1u << 20u;
+		constexpr uint32_t                window     = ArchiveReader::Lanes * 2; // chunks in flight
+		thread_local std::vector<uint8_t> buffers;
+		const uint32_t                    chunks = static_cast<uint32_t>((uint64_t {size} + chunk_size - 1) / chunk_size);
+		const uint32_t                    slots  = std::min(window, chunks);
+		const size_t                      needed = slots <= 1 ? size : size_t {slots} * chunk_size;
+		if (buffers.size() < needed) {
+			buffers.resize(needed);
 		}
-		m_last = &request;
-		m_wake.notify_one();
-		request.ready.wait(lock, [&] { return request.done; });
-		return request.result;
+		Batch    batch;
+		Request  requests[window];
+		uint32_t submitted = 0;
+		const auto submit  = [&](uint32_t index) {
+			auto& request  = requests[index % window];
+			request.reader = &reader;
+			request.batch  = &batch;
+			request.id     = id;
+			request.offset = offset + uint64_t {index} * chunk_size;
+			request.size   = std::min(chunk_size, size - index * chunk_size);
+			request.data   = buffers.data() + size_t {index % window} * chunk_size;
+			request.next   = nullptr;
+			request.result = 0;
+			request.done   = false;
+			Submit(LaneOf(id, request.offset), &request);
+		};
+		while (submitted < slots) {
+			submit(submitted++);
+		}
+		uint32_t read  = 0;
+		bool     ended = false;
+		for (uint32_t index = 0; index < submitted; index++) {
+			auto& request = requests[index % window];
+			{
+				std::unique_lock lock(batch.mutex);
+				batch.ready.wait(lock, [&] { return request.done; });
+			}
+			if (!ended) {
+				const auto got = std::min<uint64_t>(request.result, request.size);
+				std::memcpy(data + read, request.data, got);
+				read += static_cast<uint32_t>(got);
+				// A short chunk ends the read (the file's end, or a block that cannot be read).
+				ended = got < request.size;
+			}
+			if (!ended && submitted < chunks) {
+				submit(submitted++);
+			}
+		}
+		return read;
 	}
 
-	KYTY_CLASS_NO_COPY(ArchiveIoThread);
+	KYTY_CLASS_NO_COPY(ArchiveIo);
 
 private:
-	struct Request {
-		ArchiveReader&          reader;
-		uint64_t                id;
-		uint64_t                offset;
-		uint32_t                size;
-		void*                   data;
-		Request*                next   = nullptr;
-		uint64_t                result = 0;
-		bool                    done   = false;
-		std::condition_variable ready {};
+	struct Batch {
+		std::mutex              mutex;
+		std::condition_variable ready;
 	};
 
-	ArchiveIoThread() {
-		std::thread([this] { Loop(); }).detach();
+	struct Request {
+		ArchiveReader* reader = nullptr;
+		Batch*         batch  = nullptr;
+		uint64_t       id     = 0;
+		uint64_t       offset = 0;
+		uint32_t       size   = 0;
+		uint8_t*       data   = nullptr;
+		Request*       next   = nullptr;
+		uint64_t       result = 0;
+		bool           done   = false;
+	};
+
+	struct Lane {
+		std::mutex              mutex;
+		std::condition_variable wake;
+		Request*                first = nullptr;
+		Request*                last  = nullptr;
+	};
+
+	ArchiveIo() {
+		for (uint32_t lane = 0; lane < ArchiveReader::Lanes; lane++) {
+			std::thread([this, lane] { Loop(lane); }).detach();
+		}
 	}
 
-	void Loop() {
+	// The lane of a member's 1 MiB chunk: a file's consecutive chunks on consecutive lanes.
+	static uint32_t LaneOf(uint64_t id, uint64_t offset) {
+		return static_cast<uint32_t>(((id * 0x9E3779B97F4A7C15ull) >> 40u) + (offset >> 20u)) % ArchiveReader::Lanes;
+	}
+
+	void Submit(uint32_t lane, Request* request) {
+		auto&           queue = m_lanes[lane];
+		std::lock_guard lock(queue.mutex);
+		if (queue.last != nullptr) {
+			queue.last->next = request;
+		} else {
+			queue.first = request;
+		}
+		queue.last = request;
+		queue.wake.notify_one();
+	}
+
+	void Loop(uint32_t lane) {
+		auto& queue = m_lanes[lane];
 		for (;;) {
 			Request* request;
 			{
-				std::unique_lock lock(m_mutex);
-				m_wake.wait(lock, [this] { return m_first != nullptr; });
-				request = m_first;
-				m_first = request->next;
-				if (m_first == nullptr) {
-					m_last = nullptr;
+				std::unique_lock lock(queue.mutex);
+				queue.wake.wait(lock, [&] { return queue.first != nullptr; });
+				request     = queue.first;
+				queue.first = request->next;
+				if (queue.first == nullptr) {
+					queue.last = nullptr;
 				}
 			}
-			const auto result =
-			    request->reader.Read(request->id, request->offset, request->size, request->data);
-			{
-				std::lock_guard lock(m_mutex);
-				request->result = result;
-				request->done   = true;
-				// Notify before releasing the mutex: the waiting caller owns the condition
-				// variable.
-				request->ready.notify_one();
-			}
+			const auto result = request->reader->Read(lane, request->id, request->offset, request->size, request->data);
+			auto*      batch  = request->batch;
+			std::lock_guard lock(batch->mutex);
+			request->result = result;
+			request->done   = true;
+			// Notify before releasing the mutex: the waiting caller owns the condition variable.
+			batch->ready.notify_all();
 		}
 	}
 
-	std::mutex              m_mutex;
-	std::condition_variable m_wake;
-	Request*                m_first = nullptr;
-	Request*                m_last  = nullptr;
+	Lane m_lanes[ArchiveReader::Lanes];
 };
 
 } // namespace
@@ -264,42 +345,29 @@ bool ArchiveFile::Seek(uint64_t offset) {
 }
 
 void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
+	const auto read = ReadAt(m_p->position, data, size);
+	m_p->position += read;
+	if (bytes_read != nullptr) {
+		*bytes_read = read;
+	}
+}
+
+uint32_t ArchiveFile::ReadAt(uint64_t offset, void* data, uint32_t size) const {
 #if defined(KYTY_ARCHIVE_PTHREAD_CANCELLATION)
 	// A pending cancellation must not destroy the waiting request or its TLS buffer while the
 	// worker still uses them. Restore the caller's state only after the copy is complete.
 	int cancellation_state = PTHREAD_CANCEL_ENABLE;
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation_state);
 #endif
-	constexpr uint32_t                chunk_size = 1u << 20u;
-	thread_local std::vector<uint8_t> chunk;
-	uint32_t                          read = 0;
-	if (data != nullptr && size != 0 && m_p->position < Size()) {
-		const auto requested =
-		    static_cast<uint32_t>(std::min<uint64_t>(size, Size() - m_p->position));
-		if (chunk.size() < std::min(chunk_size, requested)) {
-			chunk.resize(std::min(chunk_size, requested));
-		}
-		while (read < requested) {
-			const auto step = std::min(chunk_size, requested - read);
-			const auto got  = ArchiveIoThread::Instance().Read(*m_p->reader, m_p->entry.id,
-			                                                   m_p->position, step, chunk.data());
-			if (got == 0 || got > step) {
-				break;
-			}
-			std::memcpy(static_cast<uint8_t*>(data) + read, chunk.data(), got);
-			read += static_cast<uint32_t>(got);
-			m_p->position += got;
-			if (got < step) {
-				break;
-			}
-		}
-	}
-	if (bytes_read != nullptr) {
-		*bytes_read = read;
+	uint32_t read = 0;
+	if (data != nullptr && size != 0 && offset < Size()) {
+		const auto requested = static_cast<uint32_t>(std::min<uint64_t>(size, Size() - offset));
+		read = ArchiveIo::Instance().Read(*m_p->reader, m_p->entry.id, offset, requested, static_cast<uint8_t*>(data));
 	}
 #if defined(KYTY_ARCHIVE_PTHREAD_CANCELLATION)
 	pthread_setcancelstate(cancellation_state, nullptr);
 #endif
+	return read;
 }
 
 std::filesystem::path MakeArchivePath(const std::filesystem::path& archive,

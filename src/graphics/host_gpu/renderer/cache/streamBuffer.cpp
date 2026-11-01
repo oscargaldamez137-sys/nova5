@@ -1,39 +1,146 @@
-#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
-#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
-#include "common/submitProfile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "device-fault.h"
+#include "local/resource-provenance.h"
 
-#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <mutex>
 #include <numeric>
+#include <thread>
+#include <vector>
 #include <vk_mem_alloc.h>
+
+extern "C" {
+// KYTY_BUFFER_RECLAIM: 1: a retired buffer's memory is freed on a worker thread. Freeing a
+// dedicated allocation is a kernel call (~0.1 ms on Windows) the render thread paid for every
+// such buffer the cache retired while the game streams. VMA synchronizes internally, and a buffer
+// is destroyed only after the GPU is done with it.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode {1};
+}
 
 namespace Libs::Graphics {
 
 namespace {
 
+bool UseStatsOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STAGING_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+class BufferReclaimer {
+public:
+	~BufferReclaimer() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) m_thread.join();
+	}
+	void Push(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) m_thread = std::thread([this] { Run(); });
+			m_pending.push_back({allocator, buffer, allocation});
+		}
+		m_wake.notify_one();
+	}
+	// Returns once every pushed buffer is destroyed (before the allocator goes away).
+	void Flush() {
+		Release();
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_pending.empty() && !m_busy; });
+	}
+	// BufferCache::Defragment: no memory is freed here while a pass over the game buffers' pool is open; what is pushed
+	// meanwhile waits for its end. A pass names allocations of erased buffers waiting here, and VMA reads its moves till
+	// the pass ends: freed meanwhile, they were read freed (8 GB GPUs: access violations in vmaGetAllocationInfo from
+	// Defragment, its block gone, 10-23). False while frees are queued or run: the pass waits for a later flip. (Begun
+	// over them, a pass lists allocations of erased buffers, which Defragment can only ignore: each takes a move of the
+	// pass's 64, and VMA counts its block as one it cannot empty.)
+	bool TryHold() {
+		const std::unique_lock freeing(m_free_mutex, std::try_to_lock);
+		if (!freeing.owns_lock()) return false;
+		{
+			const std::lock_guard lock(m_mutex);
+			if (!m_pending.empty() || m_busy) return false;
+		}
+		m_hold = true;
+		return true;
+	}
+	void Release() {
+		std::vector<Item> held;
+		{
+			const std::lock_guard freeing(m_free_mutex);
+			m_hold = false;
+			held.swap(m_held);
+		}
+		if (held.empty()) return;
+		{
+			const std::lock_guard lock(m_mutex);
+			m_pending.insert(m_pending.end(), held.begin(), held.end());
+		}
+		m_wake.notify_one();
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkBuffer      buffer;
+		VmaAllocation allocation;
+	};
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_pending.empty(); });
+			if (m_pending.empty() && m_stop) return;
+			batch.swap(m_pending);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) {
+				const std::lock_guard freeing(m_free_mutex);
+				if (m_hold && item.allocation != nullptr) {
+					m_held.push_back(item);
+					continue;
+				}
+				vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			}
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+	std::mutex              m_mutex;
+	std::condition_variable m_wake, m_idle;
+	std::vector<Item>       m_pending;
+	bool                    m_busy = false, m_stop = false;
+	std::thread             m_thread;
+	std::mutex              m_free_mutex; // (held over each free: TryHold)
+	std::vector<Item>       m_held;
+	bool                    m_hold = false;
+};
+
+BufferReclaimer& Reclaimer() {
+	static BufferReclaimer reclaimer;
+	return reclaimer;
+}
+
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
-
-// Read once on the import/probe path, never while the experiment's gate is off.
-// -1 preserves the existing cached preference; -2 rejects an invalid override.
-int RequestedHostImportType() {
-	static const int requested = [] {
-		const auto* value = std::getenv("KYTY_HOST_IMPORT_TYPE");
-		if (!value || !*value) return -1;
-		if (std::strcmp(value, "2") == 0) return 2;
-		if (std::strcmp(value, "3") == 0) return 3;
-		std::fprintf(stderr, "[GUEST_HOST_IMPORT] INERT: invalid KYTY_HOST_IMPORT_TYPE (expected 2 or 3)\n");
-		return -2;
-	}();
-	return requested;
-}
 
 [[nodiscard]] VmaAllocationCreateFlags AllocationFlags(MemoryUsage usage) {
 	switch (usage) {
@@ -63,12 +170,43 @@ int RequestedHostImportType() {
 		result = value;
 		return true;
 	}
-	const auto aligned = Common::AlignUp(value, alignment);
-	if (aligned < value) {
+	const auto remainder = value % alignment;
+	if (remainder == 0) {
+		result = value;
+		return true;
+	}
+	const auto increment = alignment - remainder;
+	if (value > std::numeric_limits<uint64_t>::max() - increment) {
 		return false;
 	}
-	result = aligned;
+	result = value + increment;
 	return true;
+}
+
+// KYTY_TEST_BUFFER_SPILL_MB: the least size of the next buffer made in system memory (0: none; Buffer::Buffer).
+std::atomic<uint64_t> g_forced_spill_bytes {[] {
+	const char* value = std::getenv("KYTY_TEST_BUFFER_SPILL_MB");
+	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull; // ("-1": ULLONG_MAX, off)
+	return mib < (uint64_t {1} << 44u) ? mib << 20u : uint64_t {0};
+}()};
+
+// KYTY_TEST_BUFFER_FAIL_MB: the least size of the next buffer whose first 5 tries fail (0: none; Buffer::Buffer).
+std::atomic<uint64_t> g_forced_failure_bytes {[] {
+	const char* value = std::getenv("KYTY_TEST_BUFFER_FAIL_MB");
+	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+	return mib < (uint64_t {1} << 44u) ? mib << 20u : uint64_t {0};
+}()};
+
+[[nodiscard]] bool TakeAtLeast(std::atomic<uint64_t>& least_bytes, uint64_t size) {
+	auto least = least_bytes.load(std::memory_order_relaxed);
+	while (least != 0 && size >= least) {
+		if (least_bytes.compare_exchange_weak(least, 0, std::memory_order_relaxed)) return true;
+	}
+	return false;
+}
+
+[[nodiscard]] bool TakeForcedSpill(uint64_t size) {
+	return TakeAtLeast(g_forced_spill_bytes, size);
 }
 
 } // namespace
@@ -83,25 +221,82 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// KYTY_READBACK_QUEUE: the transfer queue reads guest buffers and writes download buffers.
+	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families;
+	}
 
-	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// A buffer with device addresses is placed in VMA's blocks as any other (the allocator is made with buffer device
+	// addresses; VMA itself gives a big one its own memory). Each its own allocation, as before, cost a kernel call:
+	// ~100 us a buffer (2.4 us placed), 8400 buffers while a save loads and 100-400 in a frame where the game streams
+	// a new area.
+	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// On a GPU short of video memory a GPU buffer asks for video memory whatever VMA's budget says, and goes elsewhere
+	// only when the driver has none: NVIDIA counts what its system memory type holds, the textures put there
+	// (GraphicContext::CreateImage), under the video memory heap's usage, so the budget sent buffers to system memory
+	// while there was room (Shrine of Storms with 8 GB: 2 buffers, 140 MB).
+	const bool ignore_budget = usage == MemoryUsage::DeviceLocal && graphics.small_video_memory;
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags = (ignore_budget ? VmaAllocationCreateFlags {} : VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
+	                        AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+	// KYTY_TEST_BUFFER_SPILL_MB=<n> (a test): the first game buffer (device-local, with device addresses and a guest
+	// address) of at least n MiB is made in the memory types without video memory, as one is when video memory is
+	// full, so that its move back can be watched (BufferCache::MoveSpilledBufferBack). (A GPU without such types: no
+	// change.)
+	const bool forced_spill =
+	    usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && TakeForcedSpill(size);
+	if (forced_spill) {
+		const auto& memory = graphics.physical_device_memory_properties;
+		for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) allocation_info.memoryTypeBits |= 1u << i;
+		}
+		allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	}
+
+	// A game buffer goes in the game buffers' pool (graphicContext.h), with no room there where VMA puts it.
+	if (usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && !forced_spill)
+		allocation_info.pool = graphics.game_buffer_pool;
+
+	// KYTY_TEST_BUFFER_FAIL_MB=<n> (a test): the first game buffer of at least n MiB fails its first 5 tries, as when
+	// memory runs short, so that the retry (GraphicContext::RetryAllocation) can be watched.
+	int forced_failures =
+	    usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && TakeAtLeast(g_forced_failure_bytes, size) ? 5 : 0;
+
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+	const auto        create        = [&] {
+		if (forced_failures > 0) {
+			forced_failures--;
+			return false;
+		}
+		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
+	};
+	bool created = create();
+	if (!created && allocation_info.pool != nullptr) {
+		allocation_info.pool = nullptr;
+		created              = create();
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// Over the video memory budget VMA places it in system memory; when even that fails, without
+	// the images kept for reuse and over budget; then again for a while (issue #228).
+	if (!created) {
+		graphics.TrimImagePool();
+		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		if (!create()) {
+			graphics.ReportMemoryFallback("a buffer could not be created", size);
+			(void)graphics.RetryAllocation("a buffer", size, create);
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -109,225 +304,76 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		DeviceFault::NoteCreated(m_device_address, size, cpu_address);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+		m_in_system_memory = true;
+		graphics.ReportMemoryFallback(forced_spill ? "a GPU buffer is in system memory (KYTY_TEST_BUFFER_SPILL_MB)"
+		                                           : "a GPU buffer is in system memory",
+		                              size);
+	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
+               uint64_t size, VmaAllocation allocation)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
+      m_size(size) {
+	EXIT_IF(graphics.allocator == nullptr || size == 0 || allocation == nullptr);
+	// (As the constructor above makes one: the same requirements, those the destination was reserved with.)
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
+	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families;
+	}
+	const auto native_device = static_cast<VkDevice>(graphics.device);
+	const auto raw           = static_cast<VkBufferCreateInfo>(buffer_info);
+	VkBuffer   native_buffer = VK_NULL_HANDLE;
+	EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer(native_device, &raw, nullptr, &native_buffer) != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(vmaBindBufferMemory(graphics.allocator, allocation, native_buffer) != VK_SUCCESS);
+	m_buffer     = native_buffer;
+	m_allocation = allocation;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+		DeviceFault::NoteCreated(m_device_address, size, cpu_address);
+	}
+}
+
 Buffer::~Buffer() {
-	if (m_host_import) {
-		if (m_buffer) m_graphics->device.destroyBuffer(m_buffer);
-		if (m_import_memory) m_graphics->device.freeMemory(m_import_memory);
-		return;
-	}
+	DeviceFault::NoteDestroyed(m_device_address);
 	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {
+			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);
+		} else {
+			vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		}
 	}
 }
 
-Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t address, uint64_t size)
-    : m_host_import(true), m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Upload),
-      m_cpu_address(address), m_size(size), m_coherent(true) {}
-
-std::unique_ptr<Buffer> Buffer::ImportHost(GraphicContext& graphics, CommandScheduler& scheduler,
-    uint64_t address, void* pointer, uint64_t size, Common::SubmitProfile::Extra& failure) {
-	using Extra = Common::SubmitProfile::Extra;
-	failure = Extra::HostImportFallbackUnsupported;
-	if (!graphics.guest_host_import_enabled || !VULKAN_HPP_DEFAULT_DISPATCHER.vkGetMemoryHostPointerPropertiesEXT) return {};
-	failure = Extra::HostImportFallbackAlignment;
-	const auto alignment = graphics.host_import_alignment;
-	if (!pointer || !size || !alignment || (reinterpret_cast<uintptr_t>(pointer) % alignment) || size % alignment) return {};
-	constexpr auto handle = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
-	constexpr auto usage = vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eStorageBuffer |
-	                       vk::BufferUsageFlagBits::eTransferSrc;
-	vk::PhysicalDeviceExternalBufferInfo external_info {}; external_info.handleType = handle; external_info.usage = usage;
-	vk::ExternalBufferProperties external {};
-	graphics.physical_device.getExternalBufferProperties(&external_info, &external);
-	failure = Extra::HostImportFallbackType;
-	if (!(external.externalMemoryProperties.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eImportable)) return {};
-	vk::MemoryHostPointerPropertiesEXT host {};
-	if (graphics.device.getMemoryHostPointerPropertiesEXT(handle, pointer, &host) != vk::Result::eSuccess) return {};
-	graphics.host_import_type_bits = host.memoryTypeBits;
-	auto result = std::unique_ptr<Buffer>(new Buffer(graphics, scheduler, address, size));
-	vk::ExternalMemoryBufferCreateInfo external_create {}; external_create.handleTypes = handle;
-	vk::BufferCreateInfo create {}; create.pNext = &external_create; create.size = size; create.usage = usage;
-	failure = Extra::HostImportFallbackAllocation;
-	if (graphics.device.createBuffer(&create, nullptr, &result->m_buffer) != vk::Result::eSuccess) return {};
-	vk::MemoryRequirements requirements {};
-	graphics.device.getBufferMemoryRequirements(result->m_buffer, &requirements);
-	failure = Extra::HostImportFallbackAlignment;
-	if (requirements.size != size) return {}; // Dedicated allocation, no padding outside the leased span.
-	const auto bits = requirements.memoryTypeBits & host.memoryTypeBits;
-	uint32_t type = UINT32_MAX;
-	graphics.host_import_accepted_type_bits = 0;
-	constexpr auto coherent = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
-	for (uint32_t i = 0; i < graphics.physical_device_memory_properties.memoryTypeCount; ++i) {
-		const auto flags = graphics.physical_device_memory_properties.memoryTypes[i].propertyFlags;
-		if (!(bits & (1u << i)) || (flags & coherent) != coherent) continue;
-		graphics.host_import_accepted_type_bits |= 1u << i;
-		if (type == UINT32_MAX || (flags & vk::MemoryPropertyFlagBits::eHostCached)) type = i;
-	}
-	failure = Extra::HostImportFallbackType;
-	const int requested = RequestedHostImportType();
-	if (requested >= 0) {
-		// Validate against BOTH the host pointer and this VkBuffer's requirements,
-		// including HOST_VISIBLE|HOST_COHERENT. Never silently pick another type.
-		type = (graphics.host_import_accepted_type_bits & (1u << requested)) ? static_cast<uint32_t>(requested) : UINT32_MAX;
-	} else if (requested == -2) {
-		type = UINT32_MAX;
-	}
-	if (type == UINT32_MAX) return {};
-	vk::MemoryDedicatedAllocateInfo dedicated {}; dedicated.buffer = result->m_buffer;
-	vk::ImportMemoryHostPointerInfoEXT import {}; import.pNext = &dedicated; import.handleType = handle; import.pHostPointer = pointer;
-	vk::MemoryAllocateFlagsInfo flags {}; flags.pNext = &import; flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
-	vk::MemoryAllocateInfo allocate {}; allocate.pNext = &flags; allocate.allocationSize = size; allocate.memoryTypeIndex = type;
-	failure = Extra::HostImportFallbackAllocation;
-	if (graphics.device.allocateMemory(&allocate, nullptr, &result->m_import_memory) != vk::Result::eSuccess ||
-	    graphics.device.bindBufferMemory(result->m_buffer, result->m_import_memory, 0) != vk::Result::eSuccess) return {};
-	vk::BufferDeviceAddressInfo bda {}; bda.buffer = result->m_buffer;
-	result->m_device_address = graphics.device.getBufferAddress(bda);
-	if (!result->m_device_address) return {};
-	graphics.host_import_memory_type = type;
-	result->m_mapped = {static_cast<uint8_t*>(pointer), static_cast<size_t>(size)};
-	return result;
+void FlushBufferReclaimer() {
+	Reclaimer().Flush();
 }
 
-namespace {
-// Runs at the first B boundary, on an independent command pool. Two CPU
-// writes through the guest-like view must be seen by BDA reads of the RW alias.
-bool ProbeImportedBda(GraphicContext& graphics, Buffer& imported, void* writer) {
-	using namespace spv;
-	ShaderRecompiler::Spirv::Builder b;
-	b.RequireCapability(CapabilityShader);
-	b.RequireCapability(CapabilityInt64);
-	b.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
-	b.RequireExtension("SPV_KHR_physical_storage_buffer");
-	b.AddMemoryModel(AddressingModelPhysicalStorageBuffer64, MemoryModelGLSL450);
-	const auto u32 = b.Type(OpTypeInt, 32u, 0u), u64 = b.Type(OpTypeInt, 64u, 0u);
-	const auto void_type = b.Type(OpTypeVoid), fn = b.Type(OpTypeFunction, void_type);
-	const auto params = b.DecoratedType(OpTypeStruct,
-	    {{OpDecorate, {DecorationBlock}}, {OpMemberDecorate, {0u, DecorationOffset, 0u}},
-	     {OpMemberDecorate, {1u, DecorationOffset, 8u}}}, u64, u64);
-	const auto push_ptr = b.Type(OpTypePointer, StorageClassPushConstant, u64);
-	const auto phys_ptr = b.Type(OpTypePointer, StorageClassPhysicalStorageBuffer, u32);
-	const auto push = b.DefineGlobalVariable(b.Type(OpTypePointer, StorageClassPushConstant, params), StorageClassPushConstant);
-	const auto entry = b.AllocateId();
-	b.AddEntryPoint(ExecutionModelGLCompute, entry, "main", {});
-	b.AddExecutionMode(entry, ExecutionModeLocalSize, 1u, 1u, 1u);
-	b.AddFunction(OpFunction, void_type, entry, FunctionControlMaskNone, fn);
-	b.AddFunction(OpLabel, b.AllocateId());
-	std::array<uint32_t, 2> pointers {};
-	for (uint32_t i = 0; i < 2; ++i) {
-		const auto member = b.AllocateId(), address = b.AllocateId();
-		pointers[i] = b.AllocateId();
-		b.AddFunction(OpAccessChain, push_ptr, member, push, b.Constant(OpConstant, u32, i));
-		b.AddFunction(OpLoad, u64, address, member);
-		b.AddFunction(OpConvertUToPtr, phys_ptr, pointers[i], address);
-	}
-	const auto value = b.AllocateId();
-	b.AddFunction(OpLoad, u32, value, pointers[0], MemoryAccessAlignedMask, 4u);
-	b.AddFunction(OpStore, pointers[1], value, MemoryAccessAlignedMask, 4u);
-	b.AddFunction(OpReturn);
-	b.AddFunction(OpFunctionEnd);
-	struct Objects {
-		vk::Device device;
-		vk::ShaderModule module {}; vk::PipelineLayout layout {}; vk::Pipeline pipeline {};
-		vk::CommandPool pool {}; vk::Fence fence {};
-		~Objects() {
-			if (fence) device.destroyFence(fence);
-			if (pool) device.destroyCommandPool(pool);
-			if (pipeline) device.destroyPipeline(pipeline);
-			if (layout) device.destroyPipelineLayout(layout);
-			if (module) device.destroyShaderModule(module);
-		}
-	} objects {graphics.device};
-	const auto code = b.Build();
-	vk::ShaderModuleCreateInfo shader {}; shader.codeSize = code.size() * sizeof(uint32_t); shader.pCode = code.data();
-	if (graphics.device.createShaderModule(&shader, nullptr, &objects.module) != vk::Result::eSuccess) return false;
-	const vk::PushConstantRange range {vk::ShaderStageFlagBits::eCompute, 0, 16};
-	vk::PipelineLayoutCreateInfo layout {}; layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &range;
-	if (graphics.device.createPipelineLayout(&layout, nullptr, &objects.layout) != vk::Result::eSuccess) return false;
-	vk::ComputePipelineCreateInfo pipeline {}; pipeline.layout = objects.layout;
-	pipeline.stage.stage = vk::ShaderStageFlagBits::eCompute; pipeline.stage.module = objects.module; pipeline.stage.pName = "main";
-	if (graphics.device.createComputePipelines(nullptr, 1, &pipeline, nullptr, &objects.pipeline) != vk::Result::eSuccess) return false;
-	vk::CommandPoolCreateInfo pool {}; pool.queueFamilyIndex = graphics.queue_family;
-	pool.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-	if (graphics.device.createCommandPool(&pool, nullptr, &objects.pool) != vk::Result::eSuccess) return false;
-	vk::CommandBufferAllocateInfo allocate {}; allocate.commandPool = objects.pool;
-	allocate.level = vk::CommandBufferLevel::ePrimary; allocate.commandBufferCount = 1;
-	vk::CommandBuffer command {};
-	if (graphics.device.allocateCommandBuffers(&allocate, &command) != vk::Result::eSuccess) return false;
-	vk::FenceCreateInfo fence {};
-	if (graphics.device.createFence(&fence, nullptr, &objects.fence) != vk::Result::eSuccess) return false;
-	for (const uint32_t pattern: {0x13579bdfu, 0xe2468ac0u}) {
-		std::memcpy(writer, &pattern, sizeof(pattern));
-		vk::CommandBufferBeginInfo begin {}; begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-		if (command.begin(&begin) != vk::Result::eSuccess) return false;
-		const std::array<vk::DeviceAddress, 2> addresses {imported.BufferDeviceAddress(), imported.BufferDeviceAddress() + imported.Size() - 4};
-		command.bindPipeline(vk::PipelineBindPoint::eCompute, objects.pipeline);
-		command.pushConstants(objects.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(addresses), addresses.data());
-		command.dispatch(1, 1, 1);
-		vk::MemoryBarrier barrier {}; barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite; barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
-		if (command.end() != vk::Result::eSuccess) return false;
-		vk::SubmitInfo submit {}; submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
-		{
-			Common::LockGuard queue_lock(graphics.queue_mutex);
-			if (graphics.queue.submit(1, &submit, objects.fence) != vk::Result::eSuccess) return false;
-		}
-		if (graphics.device.waitForFences(1, &objects.fence, true, UINT64_MAX) != vk::Result::eSuccess) return false;
-		uint32_t read = 0;
-		std::memcpy(&read, imported.Mapped().data() + imported.Size() - 4, sizeof(read));
-		if (read != pattern) return false;
-		if (graphics.device.resetFences(1, &objects.fence) != vk::Result::eSuccess || command.reset({}) != vk::Result::eSuccess) return false;
-	}
-	return true;
+bool HoldBufferFrees() {
+	return Reclaimer().TryHold();
 }
-} // namespace
 
-void Buffer::ProbeHostImport(GraphicContext& graphics, CommandScheduler& scheduler) {
-	if (!Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::GuestHostImport)) return;
-	bool accepted = false;
-	Common::SubmitProfile::Extra failure = Common::SubmitProfile::Extra::HostImportFallbackUnsupported;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (graphics.guest_host_import_enabled && graphics.host_import_alignment) {
-		failure = Common::SubmitProfile::Extra::HostImportFallbackAllocation;
-		const auto size = Common::AlignUp(uint64_t {65536}, graphics.host_import_alignment);
-		const auto mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
-		    static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
-		if (mapping) {
-			auto* pointer = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
-			if (pointer) {
-				auto* writer = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
-				{
-					auto imported = ImportHost(graphics, scheduler, 0, pointer, size, failure);
-					if (imported) failure = Common::SubmitProfile::Extra::HostImportFallbackProbe;
-					accepted = imported && writer && ProbeImportedBda(graphics, *imported, writer);
-				}
-				if (writer) UnmapViewOfFile(writer);
-				UnmapViewOfFile(pointer);
-			}
-			CloseHandle(mapping);
-		}
-	}
-#endif
-	const int requested = RequestedHostImportType();
-	const char* requested_name = requested == -1 ? "default" : requested == 2 ? "2" : requested == 3 ? "3" : "invalid";
-	const uint32_t selected_flags = graphics.host_import_memory_type < graphics.physical_device_memory_properties.memoryTypeCount ?
-	    static_cast<uint32_t>(graphics.physical_device_memory_properties.memoryTypes[graphics.host_import_memory_type].propertyFlags) : 0;
-	std::fprintf(stderr, "[GUEST_HOST_IMPORT] extension=%u support=%u host_pointer_type_bits=0x%x accepted_type_bits=0x%x selected_type=%u requested_type=%s selected_flags=0x%x alignment=%llu bda_alias_probe=%s%s\n",
-	    unsigned(graphics.guest_host_import_enabled), unsigned(accepted), graphics.host_import_type_bits,
-	    graphics.host_import_accepted_type_bits, graphics.host_import_memory_type, requested_name, selected_flags,
-	    static_cast<unsigned long long>(graphics.host_import_alignment),
-	    accepted ? "pass" : "fail", accepted ? "" : " INERT: compatibility probe unavailable/failed");
-	if (!accepted) std::fprintf(stderr, "[GUEST_HOST_IMPORT] fallback=%s\n", Common::SubmitProfile::ExtraNames[static_cast<size_t>(failure)]);
-	graphics.guest_host_import_enabled = accepted;
+void ReleaseBufferFrees() {
+	Reclaimer().Release();
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
@@ -337,6 +383,12 @@ vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
 
 bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
 	return address >= m_cpu_address && size <= Size() && address - m_cpu_address <= Size() - size;
+}
+
+void Buffer::Write(uint64_t offset, const void* source, uint64_t size) {
+	EXIT_IF(source == nullptr || m_mapped.empty() || offset > Size() || size > Size() - offset);
+	std::memcpy(m_mapped.data() + offset, source, static_cast<size_t>(size));
+	Flush(offset, size);
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
@@ -349,7 +401,7 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
@@ -375,6 +427,16 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 	return barrier;
 }
 
+// Records device-to-device owner changes as well as guest copies. Never reads guest memory.
+static void TraceBufferCopy(CommandScheduler& scheduler, const Buffer& destination, const Buffer& source, uint64_t source_offset,
+                            uint64_t destination_offset, uint64_t size, const char* kind) {
+	if (!ResourceProvenance::Enabled() || destination.CpuAddress() == 0) return;
+	auto e = ResourceProvenance::BufferEvent(scheduler, destination, destination_offset, size, kind);
+	e.source_buffer = ResourceProvenance::HandleId(source.Handle()); e.source_offset = source_offset;
+	e.source = source.CpuAddress() ? source.CpuAddress() + source_offset : 0;
+	ResourceProvenance::Cache(e);
+}
+
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
@@ -387,6 +449,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
+	written_serial = Scheduler().CommandSerial();
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
@@ -397,12 +460,11 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Commands();
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
+	const auto native = command.Handle();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
+	TraceBufferCopy(Scheduler(), *this, source, source_offset, destination_offset, size, "device-copy");
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
@@ -412,9 +474,26 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_after | destination_after) & host_access)) {
 		after_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+}
+
+void Buffer::CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+                       uint64_t destination_offset, uint64_t size) {
+	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
+	    destination_offset > Size() || size > Size() - destination_offset) {
+		EXIT("Buffer: invalid copy range\n");
+	}
+	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
+	    destination_offset < source_offset + size) {
+		EXIT("Buffer: overlapping self-copy\n");
+	}
+	written_serial = Scheduler().CommandSerial();
+	command.EndRendering();
+	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	TraceBufferCopy(Scheduler(), *this, source, source_offset, destination_offset, size, "device-copy-run");
+	command.CopyRunHandle(source.Handle(), source_offset, Handle(), destination_offset, size)
+	    .copyBuffer(source.Handle(), Handle(), 1, &copy);
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
@@ -422,28 +501,26 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}
 	auto& command = Scheduler().Current();
+	written_serial = Scheduler().CommandSerial();
 	command.EndRendering();
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Commands();
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
+	const auto native = command.Handle();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	native.fillBuffer(Handle(), offset, size, value);
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
-	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+                           uint64_t size, vk::BufferUsageFlags flags)
+    : Buffer(graphics, scheduler, usage, 0, flags, size),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
@@ -473,6 +550,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 		return {nullptr, 0};
 	}
 	if (mapped_size > Size()) {
+		NoteRefusal(mapped_size);
 		return {nullptr, 0};
 	}
 
@@ -493,6 +571,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
 	                           allow_wait, wait_cursor, wait_bound)) {
+		NoteRefusal(mapped_size);
 		return {nullptr, 0};
 	}
 
@@ -505,7 +584,81 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
+	if (UseStatsOn() && Usage() == MemoryUsage::Upload) NoteUse(mapped_size, wrap);
 	return {Mapped().data() + m_offset, m_offset};
+}
+
+// The bytes the GPU may still read: the reservations of ticks not done, a suffix of the last lap's
+// watches (the earlier ones are done: ticks rise) and of this lap's, and the one just made.
+uint64_t StreamBuffer::InFlight() {
+	const auto first_busy = [this](const std::vector<Watch>& watches, size_t count) {
+		size_t low = 0, high = count;
+		while (low < high) {
+			const size_t middle = (low + high) / 2;
+			if (Scheduler().IsFree(watches[middle].tick)) {
+				low = middle + 1;
+			} else {
+				high = middle;
+			}
+		}
+		return low;
+	};
+	const auto busy_bytes = [&](const std::vector<Watch>& watches, size_t count) -> uint64_t {
+		const size_t first = first_busy(watches, count);
+		if (first >= count) return 0;
+		return watches[count - 1].upper_bound - (first == 0 ? 0 : watches[first - 1].upper_bound);
+	};
+	uint64_t bytes = m_mapped_size;
+	if (m_invalidation_mark.has_value())
+		bytes += busy_bytes(m_previous_watches, *m_invalidation_mark);
+	return bytes + busy_bytes(m_current_watches, m_current_watch_cursor);
+}
+
+void StreamBuffer::NoteRefusal(uint64_t size) {
+	if (!UseStatsOn() || Usage() != MemoryUsage::Upload) return;
+	m_use.refused++;
+	m_use.refused_bytes += size;
+}
+
+void StreamBuffer::NoteBypass(uint64_t size) {
+	if (!UseStatsOn() || Usage() != MemoryUsage::Upload) return;
+	m_use.bypassed++;
+	m_use.bypassed_bytes += size;
+}
+
+void StreamBuffer::NoteUse(uint64_t size, bool wrap) {
+	using Clock    = std::chrono::steady_clock;
+	const auto now = Clock::now();
+	if (m_use.maps == 0) m_use.since = m_use.second = now;
+	m_use.maps++;
+	m_use.bytes += size;
+	m_use.laps += wrap ? 1 : 0;
+	m_use.largest   = std::max(m_use.largest, size);
+	m_use.in_flight = std::max(m_use.in_flight, InFlight());
+	if (now - m_use.second >= std::chrono::seconds(1)) {
+		m_use.busiest      = std::max(m_use.busiest, m_use.second_bytes);
+		m_use.second_bytes = 0;
+		m_use.second       = now;
+	}
+	m_use.second_bytes += size;
+	if (now - m_use.since < std::chrono::seconds(10)) return;
+	m_use.busiest        = std::max(m_use.busiest, m_use.second_bytes);
+	constexpr double mib = 1024.0 * 1024.0;
+	std::printf(
+	    "Upload ring %.0f MiB: %.0f MiB in %.0f s (%llu reservations, largest %.1f MiB, busiest "
+	    "second %.0f MiB), %llu laps, most in flight %.1f MiB, %llu waits for the GPU (%.1f ms), "
+	    "%llu refused (%.0f MiB), %llu around the ring (%.0f MiB)\n",
+	    static_cast<double>(Size()) / mib, static_cast<double>(m_use.bytes) / mib,
+	    std::chrono::duration<double>(now - m_use.since).count(),
+	    static_cast<unsigned long long>(m_use.maps), static_cast<double>(m_use.largest) / mib,
+	    static_cast<double>(m_use.busiest) / mib, static_cast<unsigned long long>(m_use.laps),
+	    static_cast<double>(m_use.in_flight) / mib, static_cast<unsigned long long>(m_use.waits),
+	    static_cast<double>(m_use.wait_us) / 1000.0, static_cast<unsigned long long>(m_use.refused),
+	    static_cast<double>(m_use.refused_bytes) / mib,
+	    static_cast<unsigned long long>(m_use.bypassed),
+	    static_cast<double>(m_use.bypassed_bytes) / mib);
+	std::fflush(stdout);
+	m_use = {};
 }
 
 void StreamBuffer::Commit() {
@@ -545,12 +698,20 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 	}
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
-		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
+		const bool  busy  = !Scheduler().IsFree(watch.tick);
+		if (busy && !allow_wait) {
 			return false;
 		}
-		{
-			Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::StreamWrap);
-			Scheduler().Wait(watch.tick);
+		const bool timed = busy && UseStatsOn() && Usage() == MemoryUsage::Upload;
+		const auto start =
+		    timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		Scheduler().Wait(watch.tick);
+		if (timed) {
+			m_use.waits++;
+			m_use.wait_us +=
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                              std::chrono::steady_clock::now() - start)
+				                          .count());
 		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);

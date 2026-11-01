@@ -22,77 +22,6 @@
 
 namespace Loader::X64InstructionEmulator {
 
-static ReadAccess DecodeReadAccess(std::span<const uint8_t> code,
-                                  const Common::HostException::ExceptionInfo& context,
-                                  ZydisDecodedInstruction& instruction,
-                                  ZydisDecodedOperand* operands) {
-	ZydisDecoder decoder;
-	ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-	if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code.data(), code.size(), &instruction, operands)) ||
-	    instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY) return {};
-	// Limit classification to fixed-width loads. In particular, REP and AVX-512
-	// masks require more than the GPR context and must remain unknown.
-	switch (instruction.mnemonic) {
-		case ZYDIS_MNEMONIC_MOV: case ZYDIS_MNEMONIC_MOVZX: case ZYDIS_MNEMONIC_MOVSX:
-		case ZYDIS_MNEMONIC_MOVSXD: case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS:
-		case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPD: case ZYDIS_MNEMONIC_MOVDQA:
-		case ZYDIS_MNEMONIC_MOVDQU: case ZYDIS_MNEMONIC_MOVSS: case ZYDIS_MNEMONIC_MOVSD:
-		case ZYDIS_MNEMONIC_MOVD: case ZYDIS_MNEMONIC_MOVQ: break;
-		default: return {};
-	}
-	const ZydisDecodedOperand* memory = nullptr;
-	for (uint8_t i = 0; i < instruction.operand_count; ++i) {
-		const auto& operand = operands[i];
-		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
-		if (memory != nullptr || operand.mem.type != ZYDIS_MEMOP_TYPE_MEM ||
-		    !(operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) ||
-		    (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) ||
-		    operand.mem.segment == ZYDIS_REGISTER_FS || operand.mem.segment == ZYDIS_REGISTER_GS ||
-		    operand.size == 0 || operand.size % 8 != 0) return {};
-		memory = &operand;
-	}
-	if (memory == nullptr) return {};
-	bool valid = true;
-	auto reg = [&](ZydisRegister name) -> uint64_t {
-		if (name == ZYDIS_REGISTER_NONE) return 0;
-		switch (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, name)) {
-			case ZYDIS_REGISTER_RAX: return context.rax;
-			case ZYDIS_REGISTER_RBX: return context.rbx;
-			case ZYDIS_REGISTER_RCX: return context.rcx;
-			case ZYDIS_REGISTER_RDX: return context.rdx;
-			case ZYDIS_REGISTER_RSI: return context.rsi;
-			case ZYDIS_REGISTER_RDI: return context.rdi;
-			case ZYDIS_REGISTER_RBP: return context.rbp;
-			case ZYDIS_REGISTER_RSP: return context.rsp;
-			case ZYDIS_REGISTER_R8: return context.r8;
-			case ZYDIS_REGISTER_R9: return context.r9;
-			case ZYDIS_REGISTER_R10: return context.r10;
-			case ZYDIS_REGISTER_R11: return context.r11;
-			case ZYDIS_REGISTER_R12: return context.r12;
-			case ZYDIS_REGISTER_R13: return context.r13;
-			case ZYDIS_REGISTER_R14: return context.r14;
-			case ZYDIS_REGISTER_R15: return context.r15;
-			case ZYDIS_REGISTER_RIP: return context.exception_address + instruction.length;
-			default: valid = false; return 0;
-		}
-	};
-	auto address = reg(memory->mem.base) + reg(memory->mem.index) * memory->mem.scale +
-	               static_cast<uint64_t>(memory->mem.disp.value);
-	if (instruction.address_width == 32) address = static_cast<uint32_t>(address);
-	else if (instruction.address_width != 64) return {};
-	const uint64_t size = memory->size / 8;
-	if (!valid || address > UINT64_MAX - size || context.access_violation_vaddr < address ||
-	    context.access_violation_vaddr - address >= size) return {};
-	return {address, size};
-}
-
-ReadAccess DescribeReadAccess(std::span<const uint8_t> code,
-                              const Common::HostException::ExceptionInfo& context) {
-	ZydisDecodedInstruction instruction {};
-	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT] {};
-	return DecodeReadAccess(code, context, instruction, operands);
-}
-
 static uint64_t ExtractBitField(uint64_t value, uint32_t length, uint32_t index) {
 	length &= 0x3fu;
 	index &= 0x3fu;
@@ -894,82 +823,21 @@ bool TryEmulate(void* native_context) {
 	       TryEmulateCpuExtensions(context);
 }
 
-bool TryEmulateRead(std::span<const uint8_t> code,
-                    const Common::HostException::ExceptionInfo& info, ReadMemory read) {
-	if (info.native_context == nullptr || read == nullptr ||
-	    info.type != Common::HostException::ExceptionType::AccessViolation ||
-	    info.access_violation_type != Common::HostException::AccessViolationType::Read) return false;
-	ZydisDecodedInstruction instruction {};
-	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT] {};
-	const auto access = DecodeReadAccess(code, info, instruction, operands);
-	if (access.size == 0 || access.size > 16 || access.size > 4096 - (access.address & 4095) ||
-	    instruction.operand_count_visible != 2 || operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-	    operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
-	Context context {static_cast<decltype(Context::native)>(info.native_context)};
-	if (context.Rip() != info.exception_address) return false;
-	const auto reg = operands[0].reg.value;
-	const auto reg_class = ZydisRegisterGetClass(reg);
-	const auto dest_bits = operands[0].size;
-	const bool xmm = reg_class == ZYDIS_REGCLASS_XMM;
-	const auto largest = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
-	const auto index = ZydisRegisterGetId(xmm ? reg : largest);
-	if (index < 0 || index >= 16) return false;
-	if (xmm) {
-		if (context.Xmm(index) == nullptr) return false;
-		switch (instruction.mnemonic) {
-			case ZYDIS_MNEMONIC_MOVD: case ZYDIS_MNEMONIC_MOVSS:
-				if (access.size != 4) return false; break;
-			case ZYDIS_MNEMONIC_MOVQ: case ZYDIS_MNEMONIC_MOVSD:
-				if (access.size != 8) return false; break;
-			case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVAPS:
-			case ZYDIS_MNEMONIC_MOVUPD: case ZYDIS_MNEMONIC_MOVAPD:
-			case ZYDIS_MNEMONIC_MOVDQU: case ZYDIS_MNEMONIC_MOVDQA:
-				if (access.size != 16) return false; break;
-			default: return false;
-		}
-		if ((instruction.mnemonic == ZYDIS_MNEMONIC_MOVAPS ||
-		     instruction.mnemonic == ZYDIS_MNEMONIC_MOVAPD ||
-		     instruction.mnemonic == ZYDIS_MNEMONIC_MOVDQA) && (access.address & 15) != 0) return false;
-	} else {
-		if (reg_class != ZYDIS_REGCLASS_GPR8 && reg_class != ZYDIS_REGCLASS_GPR16 &&
-		    reg_class != ZYDIS_REGCLASS_GPR32 && reg_class != ZYDIS_REGCLASS_GPR64) return false;
-		if (instruction.mnemonic != ZYDIS_MNEMONIC_MOV && instruction.mnemonic != ZYDIS_MNEMONIC_MOVZX &&
-		    instruction.mnemonic != ZYDIS_MNEMONIC_MOVSX && instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD)
-			return false;
-		if (access.size > 8 || dest_bits < access.size * 8) return false;
-	}
-	// Validate everything before invoking the reader. It may refuse dirty or
-	// unavailable backing; neither rejection nor a partial copy can change registers.
-	alignas(16) uint8_t value[16] {};
-	if (!read(access.address, value, access.size)) return false;
-	if (xmm) {
-		// Legacy memory forms of MOVD/Q/SS/SD clear the rest of XMM, while
-		// MOVUPS/APD/DQU etc replace all 128 bits. All preserve upper YMM/ZMM.
-		std::memcpy(context.Xmm(index), value, sizeof(value));
-	} else {
-		uint64_t result = 0;
-		std::memcpy(&result, value, access.size);
-		if ((instruction.mnemonic == ZYDIS_MNEMONIC_MOVSX || instruction.mnemonic == ZYDIS_MNEMONIC_MOVSXD) &&
-		    access.size < 8 && (result & (uint64_t {1} << (access.size * 8 - 1))) != 0)
-			result |= UINT64_MAX << (access.size * 8);
-		if (dest_bits == 64) context.Gpr(index) = result;
-		else if (dest_bits == 32) context.Gpr(index) = static_cast<uint32_t>(result);
-		else {
-			const auto shift = reg == ZYDIS_REGISTER_AH || reg == ZYDIS_REGISTER_CH ||
-			                   reg == ZYDIS_REGISTER_DH || reg == ZYDIS_REGISTER_BH ? 8u : 0u;
-			const auto mask = (uint64_t {1} << dest_bits) - 1;
-			context.Gpr(index) = (static_cast<uint64_t>(context.Gpr(index)) & ~(mask << shift)) |
-			                     ((result & mask) << shift);
-		}
-	}
-	context.Advance(instruction.length); // MOV loads leave flags unchanged.
+bool TrySkipDebugBreak(void* native_context) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto& rip = static_cast<PCONTEXT>(native_context)->Rip;
+#elif !defined(__APPLE__)
+	auto& rip = static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs[REG_RIP];
+#else
+	uint64_t rip = 0;
+	(void)native_context;
+	return false;
+#endif
+	const auto* code = reinterpret_cast<const uint8_t*>(rip);
+	if (code == nullptr || code[0] != 0xcd || code[1] != 0x41) return false;
+	rip += 2;
 	return true;
 }
 
-void SkipLoad(void* native_context, size_t length) {
-	Context context {static_cast<decltype(Context::native)>(native_context)};
-	context.Gpr(0) = 0;
-	context.Advance(length);
-}
 
 } // namespace Loader::X64InstructionEmulator

@@ -1,10 +1,9 @@
-#define KYTY_STALL_HLE
-#include "common/hostPath.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/emulatorConfig.h"
+#include "common/hostPath.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -12,14 +11,20 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
+#include "libs/saveDataBackup.h"
+#include "libs/saveDataCapacity.h"
+#include "libs/saveDataInfo.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <fstream>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace Libs {
@@ -257,7 +262,7 @@ static constexpr uint32_t SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC = 1u;
 
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
-static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
+static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
 
 static constexpr size_t   SAVE_DATA_MEMORY_MAX_SIZE      = 32 * 1024 * 1024;
@@ -271,6 +276,7 @@ struct SaveDataMemory {
 };
 
 static std::map<std::filesystem::path, SaveDataMemory> g_save_data_memory;
+
 static int32_t                   g_next_transaction_resource = 1;
 static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
@@ -298,14 +304,19 @@ static std::string get_title_id() {
 
 	return title_id;
 }
-
 static std::string memory_dir_name(uint32_t slot_id) {
 	return "sce_sdmemory" + (slot_id == 0 ? std::string() : std::to_string(slot_id));
 }
 
+// Same user mapping as nova5 Config::GetPlayerUserId / IsGuestUserId. The unified
+// controller layer currently exposes only player 1, but saved guest profiles must remain accessible.
+static bool is_guest_user(int32_t user_id) {
+	const int64_t delta = static_cast<int64_t>(user_id) - Config::GetUserId();
+	return delta > 0 && delta <= 3 * 0x100 && delta % 0x100 == 0;
+}
 static std::filesystem::path save_user_directory(std::string_view title_id, int32_t user_id) {
 	auto directory = std::filesystem::path(SAVE_DATA_DIR);
-	if (Config::IsGuestUserId(user_id)) {
+	if (is_guest_user(user_id)) {
 		directory /= std::filesystem::path("[users]") / std::to_string(user_id);
 	}
 	return directory / title_id;
@@ -326,13 +337,20 @@ static std::filesystem::path memory_directory(int32_t user_id, uint32_t slot_id)
 	return save_directory(get_title_id(), memory_dir_name(slot_id), user_id);
 }
 
+
+static bool is_memory_directory(std::string_view name) {
+	for (uint32_t slot = 0; slot < 4; ++slot) {
+		if (name == memory_dir_name(slot)) return true;
+	}
+	return false;
+}
+
 static bool valid_memory_range(const SaveDataMemoryData& data, size_t size) {
 	return data.buf != nullptr && data.offset >= 0 && static_cast<uint64_t>(data.offset) <= size &&
 	       data.buf_size <= size - static_cast<size_t>(data.offset);
 }
 
-// Replacing a flushed temporary file protects the
-// previous save if writing fails or the emulator exits partway through an update.
+// Flush a sibling temporary, then replace without deleting the previous save first.
 static int write_save_file(const std::filesystem::path& path, const void* data, uint32_t size) {
 	auto temporary = path;
 	temporary += ".tmp";
@@ -358,21 +376,6 @@ static int write_save_file(const std::filesystem::path& path, const void* data, 
 	return SAVE_DATA_ERROR_INTERNAL;
 }
 
-static int read_save_blocks(const std::filesystem::path& directory, uint64_t* blocks) {
-	Common::File file(directory / "sce_sys" / "blocks.bin", Common::File::Mode::Read);
-	if (file.IsInvalid() || file.Size() != sizeof(*blocks)) {
-		return SAVE_DATA_ERROR_BROKEN;
-	}
-	uint64_t value = 0;
-	uint32_t read = 0;
-	file.Read(&value, sizeof(value), &read);
-	if (read != sizeof(value) || value < SAVE_DATA_BLOCKS_MIN || value > SAVE_DATA_BLOCKS_MAX) {
-		return SAVE_DATA_ERROR_BROKEN;
-	}
-	*blocks = value;
-	return OK;
-}
-
 static int read_save_param(const std::filesystem::path& path, SaveDataParam* param) {
 	std::error_code error;
 	const bool exists = std::filesystem::exists(Common::NativeHostPath(path), error);
@@ -393,41 +396,6 @@ static int read_save_param(const std::filesystem::path& path, SaveDataParam* par
 	uint32_t read = 0;
 	file.Read(param, sizeof(*param), &read);
 	return read == sizeof(*param) ? OK : SAVE_DATA_ERROR_BROKEN;
-}
-
-static std::filesystem::path save_param_path(const std::filesystem::path& directory) {
-	return directory / "sce_sys" / "param.bin";
-}
-
-static int64_t newest_save_time(const std::filesystem::path& directory) {
-	int64_t mtime = 0;
-	std::error_code error;
-	for (std::filesystem::recursive_directory_iterator it(
-	         Common::NativeHostPath(directory), std::filesystem::directory_options::skip_permission_denied, error),
-	     end;
-	     it != end; it.increment(error)) {
-		if (error) {
-			error.clear();
-			continue;
-		}
-		if (it->is_regular_file(error) && !error) {
-			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
-			if (!time.IsInvalid()) {
-				mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
-			}
-		}
-		error.clear();
-	}
-	return mtime;
-}
-
-static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
-	*param = {};
-	const int status = read_save_param(save_param_path(directory), param);
-	if (status == OK) {
-		param->mtime = newest_save_time(directory);
-	}
-	return status;
 }
 
 static int save_memory(const std::filesystem::path& directory, const SaveDataMemory& memory) {
@@ -472,7 +440,9 @@ static int load_memory(const std::filesystem::path& directory, SaveDataMemory* m
 		return SAVE_DATA_ERROR_BROKEN;
 	}
 	file.Close();
-	return read_save_param(directory / "param.bin", &memory->param);
+	const int status = read_save_param(directory / "param.bin", &memory->param);
+	// Older/raw memory.dat exports have no display metadata. Never hide their progress.
+	return status == SAVE_DATA_ERROR_NOT_FOUND ? OK : status;
 }
 
 static void queue_save_data_event(uint32_t type, int32_t user_id,
@@ -522,6 +492,157 @@ static bool dir_name_match(const char* str, const char* pattern) {
 	return *str == '\0' && *pattern == '\0';
 }
 
+static std::filesystem::path save_param_path(const std::filesystem::path& directory) {
+	return directory / "sce_sys" / "param.bin";
+}
+
+// Fork metadata was shared by all users. It can only be attributed to the old
+// primary-user path; never borrow it for a distinct [users]/<id> save.
+static std::filesystem::path legacy_metadata(const std::filesystem::path& directory,
+                                            bool capacity) {
+	if (directory.parent_path().parent_path() != std::filesystem::path(SAVE_DATA_DIR)) return {};
+	return std::filesystem::path(SAVE_DATA_DIR) / (capacity ? ".kyty-capacity" : ".kyty-param") /
+	       directory.parent_path().filename() /
+	       (directory.filename().string() + (capacity ? ".blocks" : ".param"));
+}
+
+static int64_t newest_save_time(const std::filesystem::path& directory) {
+	int64_t mtime = 0;
+	std::error_code error;
+	for (std::filesystem::recursive_directory_iterator it(Common::NativeHostPath(directory),
+	         std::filesystem::directory_options::skip_permission_denied, error), end;
+	     it != end; it.increment(error)) {
+		if (error) { error.clear(); continue; }
+		if (it->is_regular_file(error) && !error) {
+			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
+			if (!time.IsInvalid()) mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
+		}
+		error.clear();
+	}
+	return mtime;
+}
+
+static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
+	*param = {};
+	int status = read_save_param(save_param_path(directory), param);
+	if (status == SAVE_DATA_ERROR_NOT_FOUND) {
+		const auto legacy = legacy_metadata(directory, false);
+		std::error_code error;
+		const bool exists = !legacy.empty() && std::filesystem::exists(Common::NativeHostPath(legacy), error);
+		if (error) return SAVE_DATA_ERROR_INTERNAL;
+		if (exists) {
+			// Exact old StoredParam layout, without the trailing mtime/reserved fields.
+			constexpr uint32_t size = 128 + 128 + 1024 + sizeof(uint32_t);
+			static_assert(offsetof(SaveDataParam, user_param) + sizeof(uint32_t) == size);
+			Common::File file(legacy, Common::File::Mode::Read);
+			if (file.IsInvalid()) return SAVE_DATA_ERROR_INTERNAL;
+			if (file.Size() != size) return SAVE_DATA_ERROR_BROKEN;
+			uint32_t read = 0;
+			file.Read(param, size, &read);
+			if (read != size) return SAVE_DATA_ERROR_BROKEN;
+		}
+		// Old saves may predate the fork's optional metadata bookkeeping.
+		status = OK;
+	}
+	if (status == OK) param->mtime = newest_save_time(directory);
+	return status;
+}
+
+static int read_save_blocks(const std::filesystem::path& directory, uint64_t* blocks) {
+	const auto path = directory / "sce_sys" / "blocks.bin";
+	std::error_code error;
+	const bool exists = std::filesystem::exists(Common::NativeHostPath(path), error);
+	if (error) return SAVE_DATA_ERROR_INTERNAL;
+	if (exists) {
+		Common::File file(path, Common::File::Mode::Read);
+		if (file.IsInvalid()) return SAVE_DATA_ERROR_INTERNAL;
+		if (file.Size() != sizeof(*blocks)) return SAVE_DATA_ERROR_BROKEN;
+		uint32_t read = 0;
+		file.Read(blocks, sizeof(*blocks), &read);
+		return read == sizeof(*blocks) && *blocks >= SAVE_DATA_BLOCKS_MIN &&
+		       *blocks <= SAVE_DATA_BLOCKS_MAX ? OK : SAVE_DATA_ERROR_BROKEN;
+	}
+	const auto legacy = legacy_metadata(directory, true);
+	const bool has_legacy = !legacy.empty() && std::filesystem::exists(Common::NativeHostPath(legacy), error);
+	if (error) return SAVE_DATA_ERROR_INTERNAL;
+	if (has_legacy) {
+		std::ifstream file(Common::NativeHostPath(legacy));
+		if (!(file >> *blocks) || *blocks < SAVE_DATA_BLOCKS_MIN || *blocks > SAVE_DATA_BLOCKS_MAX)
+			return SAVE_DATA_ERROR_BROKEN;
+		return OK;
+	}
+	// A canonical save with a missing allocation is damaged, not a legacy save.
+	if (std::filesystem::exists(Common::NativeHostPath(save_param_path(directory)), error))
+		return SAVE_DATA_ERROR_BROKEN;
+	if (error) return SAVE_DATA_ERROR_INTERNAL;
+	const auto capacity = ReadSaveDataCapacity(directory, {});
+	if (!capacity) return SAVE_DATA_ERROR_INTERNAL;
+	*blocks = capacity->blocks;
+	return *blocks <= SAVE_DATA_BLOCKS_MAX ? OK : SAVE_DATA_ERROR_BROKEN;
+}
+
+// Upgrade only missing metadata; never rewrite payloads or replace a broken
+// canonical file with an older fork sidecar. Downgrading Nova5 can read the result.
+static int ensure_save_metadata(const std::filesystem::path& directory) {
+	uint64_t blocks = 0;
+	SaveDataParam param {};
+	int status = read_save_blocks(directory, &blocks);
+	if (status != OK) return status;
+	status = load_save_param(directory, &param);
+	if (status != OK) return status;
+	std::error_code error;
+	std::optional<std::filesystem::file_time_type> previous_time;
+	for (std::filesystem::recursive_directory_iterator it(Common::NativeHostPath(directory), error), end;
+	     !error && it != end; it.increment(error)) {
+		if (it->is_regular_file(error)) {
+			const auto time = it->last_write_time(error);
+			if (!error && (!previous_time || time > *previous_time)) previous_time = time;
+		}
+	}
+	if (error) return SAVE_DATA_ERROR_INTERNAL;
+	std::filesystem::create_directories(Common::NativeHostPath(directory / "sce_sys"), error);
+	if (error) return SAVE_DATA_ERROR_INTERNAL;
+	for (bool capacity : {true, false}) {
+		const auto path = capacity ? directory / "sce_sys" / "blocks.bin" : save_param_path(directory);
+		const bool exists = std::filesystem::exists(Common::NativeHostPath(path), error);
+		if (error) return SAVE_DATA_ERROR_INTERNAL;
+		if (!exists) {
+			status = capacity ? write_save_file(path, &blocks, sizeof(blocks)) :
+			                    write_save_file(path, &param, sizeof(param));
+			if (status != OK) return status;
+			// Migration is not a new save: preserve DS Continue's ordering by mtime.
+			if (previous_time) {
+				std::filesystem::last_write_time(Common::NativeHostPath(path), *previous_time, error);
+				if (error) return SAVE_DATA_ERROR_INTERNAL;
+			}
+		}
+	}
+	return OK;
+}
+
+static void keep_safe(const std::filesystem::path& directory) {
+	// Extra filesystem walks/copies are opt-in. There is deliberately no automatic Restore.
+	const char* option = std::getenv("KYTY_SAVE_BACKUPS");
+	if (option == nullptr || std::strcmp(option, "1") != 0 ||
+	    is_memory_directory(directory.filename().string()) ||
+	    is_memory_directory(directory.parent_path().filename().string())) return;
+	const auto relative = directory.lexically_relative(SAVE_DATA_DIR);
+	const auto root = std::filesystem::path(SAVE_DATA_DIR) / ".kyty-backup" / relative;
+	const Backup::SlotFiles files {directory, {}, {}};
+	Backup::FlushSlot(files);
+	Backup::Make(files, root, std::time(nullptr));
+}
+
+SaveSlotInfo GetSaveSlotInfo(std::string_view dir_name, int32_t user_id, std::string_view title_id) {
+	if (!valid_path_component(dir_name) || (!title_id.empty() && !valid_path_component(title_id))) return {};
+	Common::LockGuard lock(g_mount_mutex);
+	SaveDataParam param {};
+	if (load_save_param(save_directory(title_id.empty() ? get_title_id() : title_id, dir_name, user_id), &param) != OK) return {};
+	return {std::string(param.title, strnlen(param.title, sizeof(param.title))),
+	        std::string(param.sub_title, strnlen(param.sub_title, sizeof(param.sub_title))),
+	        std::string(param.detail, strnlen(param.detail, sizeof(param.detail))), param.mtime};
+}
+
 static int mount_save_data(int slot, const std::filesystem::path& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
@@ -549,8 +670,8 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 	if (!g_mount_slots.Empty()) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
-	g_save_data_events.clear();
 	g_save_data_memory.clear();
+	g_save_data_events.clear();
 
 	return OK;
 }
@@ -606,15 +727,13 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	result->pad2 = 0;
 
 	Common::LockGuard lock(g_mount_mutex);
-	const std::string title_id = cond->title_id != nullptr ? cond->title_id->data : get_title_id();
-	const auto        root     = save_user_directory(title_id, cond->user_id);
+	const auto root = save_user_directory(cond->title_id ? cond->title_id->data : get_title_id(), cond->user_id);
 	std::vector<std::string> dir_list;
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
-			    !entry.name.starts_with("sce_") && valid_path_component(entry.name) &&
-			    Common::File::IsFileExisting(save_param_path(root / entry.name))) {
+			    !Common::StartsWith(entry.name, "sce_") && valid_path_component(entry.name)) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -624,42 +743,84 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
-	});
-
-	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
+	// Sorted by the key the game asks for, ties by name. Games pick the slot to continue from this order or from
+	// the reported times (Demon's Souls' Continue: the newest PlayerProfile); sorting by name only made it load
+	// PlayerProfile0 whichever character was played last (issue #26).
+	struct Slot {
+		std::string name;
+		int64_t     mtime;
+		uint64_t    blocks;
+		uint64_t    free_blocks;
+		bool        capacity;
+		SaveDataParam param;
+	};
+	std::vector<Slot> slots;
+	for (const auto& name: dir_list) {
+		const auto directory = std::filesystem::path(root) / name;
+		uint64_t blocks = 0;
+		SaveDataParam param {};
+		const int param_status = load_save_param(directory, &param);
+		const int capacity_status = read_save_blocks(directory, &blocks);
+		if (param_status != OK) return param_status;
+		if (capacity_status != OK) return capacity_status;
+		slots.push_back({name, param.mtime, blocks, blocks, true, param});
+	}
+	std::sort(slots.begin(), slots.end(), [key = cond->key](const Slot& a, const Slot& b) {
+		uint64_t va = 0;
+		uint64_t vb = 0;
+		switch (key) {
+			case SaveDataSortKey::Mtime:
+				va = static_cast<uint64_t>(a.mtime);
+				vb = static_cast<uint64_t>(b.mtime);
+				break;
+			case SaveDataSortKey::Blocks:
+				va = a.blocks;
+				vb = b.blocks;
+				break;
+			case SaveDataSortKey::FreeBlocks:
+				va = a.free_blocks;
+				vb = b.free_blocks;
+				break;
+			case SaveDataSortKey::UserParam:
+				va = a.param.user_param;
+				vb = b.param.user_param;
+				break;
+			default: break; // DirName
 		}
-		dir_list = reversed;
+		return va != vb ? va < vb : std::strcmp(a.name.c_str(), b.name.c_str()) < 0;
+	});
+	if (cond->order == SaveDataSortOrder::Descent) {
+		std::reverse(slots.begin(), slots.end());
 	}
 
-	auto max_count =
-	    (result->dir_names_num < dir_list.size() ? result->dir_names_num : dir_list.size());
+	auto max_count = (result->dir_names_num < slots.size() ? result->dir_names_num : slots.size());
 
-	result->hit_num = static_cast<uint32_t>(dir_list.size());
+	result->hit_num = static_cast<uint32_t>(slots.size());
 	result->set_num = static_cast<uint32_t>(max_count);
 
+	std::printf("SaveData: search %s by key %" PRIu32 "%s: %zu slots, first %s\n",
+	            cond->dir_name != nullptr && cond->dir_name->data[0] != '\0' ? cond->dir_name->data : "<all>",
+	            static_cast<uint32_t>(cond->key), cond->order == SaveDataSortOrder::Descent ? " descending" : "",
+	            slots.size(), slots.empty() ? "-" : slots.front().name.c_str());
+
 	for (size_t i = 0; i < max_count; i++) {
+		const auto& slot = slots[i];
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
-		              dir_list[i].c_str());
+		              slot.name.c_str());
 		if (result->params != nullptr) {
-			const int status = load_save_param(root / dir_list[i], &result->params[i]);
-			if (status != OK) {
-				return status;
-			}
+			auto& param = result->params[i];
+			param       = {};
+			std::memcpy(param.title, slot.param.title, sizeof(param.title));
+			std::memcpy(param.sub_title, slot.param.sub_title, sizeof(param.sub_title));
+			std::memcpy(param.detail, slot.param.detail, sizeof(param.detail));
+			param.user_param = slot.param.user_param;
+			param.mtime      = slot.mtime;
 		}
 		if (result->infos != nullptr) {
-			auto& info = result->infos[i];
-			info = {};
-			const int status = read_save_blocks(root / dir_list[i], &info.blocks);
-			if (status != OK) {
-				return status;
-			}
-			// Host-directory saves report their allocation as free space.
-			info.free_blocks = info.blocks;
+			result->infos[i] = {};
+			if (!slot.capacity) { return SAVE_DATA_ERROR_INTERNAL; }
+			result->infos[i].blocks      = slot.blocks;
+			result->infos[i].free_blocks = slot.free_blocks;
 		}
 	}
 
@@ -743,6 +904,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		created = true;
 	}
 
+	if (!created && !is_memory_directory(dir_name)) {
+		const int status = ensure_save_metadata(mount_dir);
+		if (status != OK) return status;
+	}
 	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
 }
 
@@ -944,6 +1109,10 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
+	if (!is_memory_directory(dir_name)) {
+		const int status = ensure_save_metadata(mount_dir);
+		if (status != OK) return status;
+	}
 	return mount_save_data(slot, mount_dir, 0, mount_result);
 }
 
@@ -969,6 +1138,7 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}
 	LibKernel::FileSystem::Umount(point);
+	keep_safe(g_mount_slots.Directory(static_cast<size_t>(slot)));
 	g_mount_slots.Release(static_cast<size_t>(slot));
 
 	return OK;
@@ -1001,8 +1171,11 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	     "\t commit_mode = %" PRIu32 "\n",
 	     param->resource, param->commit_mode);
 
+	Common::LockGuard lock(g_mount_mutex);
+	for (size_t slot = 0; slot < SaveDataMountSlots::COUNT; ++slot) {
+		if (g_mount_slots.IsMounted(slot)) keep_safe(g_mount_slots.Directory(slot));
+	}
 	if ((param->commit_mode & SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC) != 0) {
-		Common::LockGuard lock(g_mount_mutex);
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END, 0, nullptr, nullptr);
 	}
 
@@ -1036,6 +1209,13 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	std::error_code error;
 	std::filesystem::remove_all(Common::NativeHostPath(dir), error);
 	Common::ReportHostFileError("SaveData.remove_all", dir, error);
+	if (!error && !is_memory_directory(del->dir_name->data)) {
+		for (bool capacity : {false, true}) {
+			const auto legacy = legacy_metadata(dir, capacity);
+			if (!legacy.empty()) std::filesystem::remove(Common::NativeHostPath(legacy), error);
+			if (error) return SAVE_DATA_ERROR_INTERNAL;
+		}
+	}
 
 	return error ? SAVE_DATA_ERROR_INTERNAL : OK;
 }
@@ -1171,14 +1351,11 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
-	Common::LockGuard lock(g_mount_mutex);
 	if (g_save_data_events.empty()) {
-		Common::StallDump::Note("SaveData.no_event");
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
 	*event = g_save_data_events.front();
-	Common::StallDump::Note("SaveData.event", event->type, static_cast<uint32_t>(event->error_code));
 	g_save_data_events.pop_front();
 
 	LOGF("\t type       = %" PRIu32 "\n"
@@ -1197,9 +1374,11 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 
 	LOGF("\t backup = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(backup));
 
-	if (backup == nullptr || backup->dir_name == nullptr) {
+	if (backup == nullptr || backup->dir_name == nullptr || !valid_path_component(backup->dir_name->data) ||
+	    (backup->title_id != nullptr && !valid_path_component(backup->title_id->data))) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
+	if (backup->user_id < 0) return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
 
 	LOGF("\t user_id = %" PRId32 "\n"
 	     "\t title_id = %.10s\n"
@@ -1208,6 +1387,8 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	     backup->dir_name->data);
 
 	Common::LockGuard lock(g_mount_mutex);
+	keep_safe(save_directory(backup->title_id ? backup->title_id->data : get_title_id(),
+	                         backup->dir_name->data, backup->user_id));
 	queue_save_data_event(SAVE_DATA_EVENT_TYPE_BACKUP_END, backup->user_id, backup->title_id,
 	                      backup->dir_name);
 

@@ -2,48 +2,10 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(cpuinfo)
 
+# The Windows guest red-zone patcher needs a decoder/encoder and a small
+# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 include(FetchContent)
 
-# The Bluetooth DualSense transports speaker audio as fixed-size Opus packets.
-set(kyty_build_testing_saved "${BUILD_TESTING}")
-set(BUILD_TESTING OFF)
-set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
-set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
-set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
-if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
-	# Opus assumes MSVC accepts SSE4.1 intrinsics without per-file flags, but
-	# clang-cl rejects them in its baseline x64 files. Its AVX2 dispatch also
-	# depends on the SSE4.1 declarations, so retain the x64 SSE2 baseline only.
-	set(OPUS_X86_MAY_HAVE_SSE4_1 OFF CACHE BOOL "" FORCE)
-	set(OPUS_X86_MAY_HAVE_AVX2 OFF CACHE BOOL "" FORCE)
-endif()
-FetchContent_Declare(opus
-	GIT_REPOSITORY https://github.com/xiph/opus.git
-	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6
-	GIT_SHALLOW FALSE)
-FetchContent_MakeAvailable(opus)
-set(BUILD_TESTING "${kyty_build_testing_saved}")
-install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
-
-# Headsets are driven through OpenXR. Only the static loader is built; the runtime that serves it
-# (for example SteamVR, Monado or Virtual Desktop) comes from the user's system.
-set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
-set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(openxr
-	GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
-	GIT_TAG f2448a8797c85814aa892efc1ab8707900fbcc78 # release-1.1.63
-	GIT_SHALLOW FALSE)
-FetchContent_MakeAvailable(openxr)
-# Keep the loader's headers and library out of the installed package.
-set_property(DIRECTORY "${openxr_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
-# The loader uses exceptions internally.
-if(NOT KYTY_CLANG_CL)
-	target_compile_options(openxr_loader PRIVATE -fexceptions)
-endif()
-install(FILES "${openxr_SOURCE_DIR}/LICENSE" DESTINATION "licenses/openxr")
-
-# The guest instruction patcher needs a decoder/encoder and a small
-# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
 	xbyak
@@ -65,11 +27,9 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(xbyak zydis)
-target_compile_definitions(xbyak INTERFACE XBYAK_NO_EXCEPTION)
 
-# ZArchive provides random-access reads for compressed game dumps. Build only
-# the reader/writer library and its zstd dependency; the command-line tool is
-# not part of KytyPS5's runtime distribution.
+# ZArchive (.zar): random-access reads of compressed game dumps (upstream's pinned revisions and reader patch). The
+# library and its zstd dependency; zarchive_tool (not built by default) packs a game folder into a .zar.
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
@@ -94,6 +54,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(zstd zarchive_source)
 
+# Opus: the DualSense's Bluetooth link carries the pad speaker as Opus packets inside HID reports (there is no
+# USB audio endpoint over Bluetooth), so src/libs/dualSenseBluetooth.cpp encodes them with this.
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	opus
+	GIT_REPOSITORY https://github.com/xiph/opus.git
+	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6 # v1.5.2
+	GIT_SHALLOW FALSE
+)
+FetchContent_MakeAvailable(opus)
+
 add_library(zarchive STATIC
 	"${zarchive_source_SOURCE_DIR}/src/zarchivereader.cpp"
 	"${zarchive_source_SOURCE_DIR}/src/zarchivewriter.cpp"
@@ -110,12 +82,29 @@ else()
 	target_compile_options(zarchive PRIVATE -w)
 endif()
 
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-if(APPLE)
-	# SDL's built-in iconv fallback does not support CP932.
-	set(SDL_SYSTEM_ICONV ON CACHE BOOL "Use system iconv for CP932 conversion" FORCE)
+add_executable(zarchive_tool EXCLUDE_FROM_ALL "${zarchive_source_SOURCE_DIR}/src/main.cpp")
+target_link_libraries(zarchive_tool PRIVATE zarchive)
+target_compile_features(zarchive_tool PRIVATE cxx_std_20)
+set_target_properties(zarchive_tool PROPERTIES OUTPUT_NAME zarchive)
+if(MSVC)
+	target_compile_options(zarchive_tool PRIVATE /W0)
+else()
+	target_compile_options(zarchive_tool PRIVATE -w)
 endif()
-add_subdirectory(SDL3)
+
+set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+add_subdirectory(SDL2)
+# SDL without its C library (SDL_LIBC off, its MSVC default) is compiled with /Gs1048576: no stack probe for a frame
+# under 1 MiB, as it has no __chkstk of its own. Each SDL function carries that probe size, and one that ThinLTO inlines
+# into the emulator's code hands it to the caller (LLVM's adjustCallerStackProbeSize, for a caller without its own):
+# the caller's frame then skips the stack's guard page. The DualSense Bluetooth sender thread's 16 KiB frame did, and
+# the process ended at start-up with 0xC0000005 and no word in the log (the fault cannot be delivered on that stack).
+# The emulator links the C runtime, whose __chkstk serves SDL too.
+if(MSVC AND NOT SDL_LIBC AND TARGET SDL2-static)
+	get_target_property(sdl_compile_options SDL2-static COMPILE_OPTIONS)
+	list(REMOVE_ITEM sdl_compile_options "/Gs1048576")
+	set_target_properties(SDL2-static PROPERTIES COMPILE_OPTIONS "${sdl_compile_options}")
+endif()
 
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)
@@ -154,6 +143,11 @@ add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
 
 add_subdirectory(xxHash/build/cmake)
 
+# AMD FidelityFX SDK 1.1.4 sources (FSR 3 upscaling, and frame interpolation on Linux) for Linux and Windows builds.
+if (LINUX OR WIN32)
+	add_subdirectory(fidelityfx)
+endif()
+
 set(FMT_DOC OFF CACHE BOOL "" FORCE)
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
 set(FMT_MODULE OFF CACHE BOOL "" FORCE)
@@ -172,9 +166,6 @@ set(SPDLOG_BUILD_WARNINGS OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 set(SPDLOG_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
-if(WIN32)
-	set(SPDLOG_WCHAR_FILENAMES ON CACHE BOOL "" FORCE)
-endif()
 add_subdirectory(spdlog EXCLUDE_FROM_ALL)
 
 if (NOT TARGET FFmpeg::ffmpeg)
@@ -198,15 +189,18 @@ if (NOT TARGET FFmpeg::ffmpeg)
 endif()
 
 file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
-add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
+# Its decinit.c from overrides/: the shared tables initialized once (the submodule stays at an upstream commit).
+list(FILTER LIBATRAC9_SOURCES EXCLUDE REGEX "/decinit\\.c$")
+add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES} overrides/LibAtrac9/decinit.c)
 target_include_directories(LibAtrac9 PUBLIC LibAtrac9/C/src)
+find_package(Threads REQUIRED)
+target_link_libraries(LibAtrac9 PRIVATE Threads::Threads)
 if(MSVC)
 	target_compile_options(LibAtrac9 PRIVATE /W0)
 endif()
 
 set(TRACY_STATIC ON CACHE BOOL "" FORCE)
 set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
-set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
 set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
 set(TRACY_DELAYED_INIT ON CACHE BOOL "" FORCE)
 set(TRACY_MANUAL_LIFETIME ON CACHE BOOL "" FORCE)

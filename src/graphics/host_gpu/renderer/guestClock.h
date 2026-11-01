@@ -12,7 +12,7 @@ class CommandScheduler;
 class CommandBuffer;
 class RenderContext;
 
-// Native EOP reference clocks by default (no-gpu-timestamps opts out).
+// Port of Nova5 native EOP reference clocks. KYTY_GPU_TIMESTAMPS=0 opts out.
 // Stage one covers reference clocks only. Completion labels retain
 // their existing semantics. All state, including publication, belongs to the
 // GPU command lane (normal scheduler completions, not the priority thread).
@@ -22,8 +22,9 @@ public:
 	~GuestClock();
 	GuestClock(const GuestClock&) = delete;
 	GuestClock& operator=(const GuestClock&) = delete;
-	void OnBegin(CommandScheduler& scheduler, const CommandBuffer& command);
+	void OnBegin(CommandScheduler& scheduler, CommandBuffer& command);
 	bool Record(uint64_t address);
+	static bool Enabled();
 	// Called before immediate PM4 writes even after native clocks are disabled.
 	void Cancel(uint64_t address, uint64_t size);
 	bool HasPending() const { return m_pending != 0; }
@@ -57,5 +58,6 @@ private:
 	uint32_t m_next = 0, m_pending = 0;
 	int32_t m_active = -1;
 	bool m_unavailable = false;
+	uint64_t m_recorded = 0, m_published = 0, m_late = 0, m_conflicts = 0, m_failed = 0, m_fallback = 0;
 };
 } // namespace Libs::Graphics

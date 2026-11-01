@@ -1,6 +1,6 @@
 #include "graphics/host_gpu/memoryTracker.h"
+#include "live-counters.h"
 
-#include "common/alignment.h"
 #include "common/assert.h"
 
 namespace Libs::Graphics {
@@ -9,6 +9,9 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	for (size_t i = 0; i < REGION_COUNT; i++) {
+		m_regions[i].store(nullptr, std::memory_order_relaxed);
+	}
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -32,8 +35,8 @@ void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr,
 void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                               const char* operation) {
 	ValidateRange(vaddr, size);
-	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
 		const bool has_dirty_bytes = dirty.Intersects(page, TRACKER_PAGE_SIZE);
 		if (IsRegionGpuModified(page, TRACKER_PAGE_SIZE) != has_dirty_bytes) {
@@ -66,28 +69,83 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+// The bit queries read under the region lock's sequence (TrackingSpinLock::ReadShared): every
+// change of the bits holds the lock.
+template <typename Query>
+static bool QueryRegion(RegionManager* manager, Query&& query) {
+	return manager->lock.ReadShared(query);
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); });
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Gpu>(offset, bytes); });
 	});
 }
 
-void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size, Common::BufferUploadProfile::Cause cause) {
+bool MemoryTracker::IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [cause](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes, cause);
+	// (Missing regions were never tracked: all CPU-dirty.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu, true>(offset, bytes); });
 	});
+}
+
+bool MemoryTracker::IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// Missing regions start CPU-dirty, so they must also participate in this test.
+	return !Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Gpu, true>(offset, bytes); });
+	});
+}
+
+bool MemoryTracker::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
+                                                std::unique_lock<TrackingSpinLock>* handoff) noexcept {
+	CheckNotInUploadCallback();
+	if (!GuestRange {begin, size}.Valid() || size <= TRACKER_PAGE_SIZE ||
+	    begin % TRACKER_PAGE_SIZE || size % TRACKER_PAGE_SIZE || fault < begin ||
+	    fault - begin >= size ||
+	    begin / TRACKER_REGION_SIZE != (begin + size - 1) / TRACKER_REGION_SIZE)
+		return false;
+	auto* manager = m_regions[begin / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+	if (!manager) return false;
+	std::scoped_lock lock(manager->lock);
+	if (handoff != nullptr) handoff->unlock();
+	if (manager->IsModified<DirtySource::Gpu>(begin - manager->GetCpuAddr(), size)) return false;
+	// The GPU ownership check and permission change share one region lock.
+	manager->ChangeState<DirtySource::Cpu, true>(begin, size);
+	LiveCounters::Add(LiveCounters::WindowPages, size / TRACKER_PAGE_SIZE);
+	LiveCounters::AddGranule(begin, LiveCounters::GWindowPages, size / TRACKER_PAGE_SIZE);
+	return true;
+}
+
+void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+bool MemoryTracker::MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	if (IsRegionGpuModified(vaddr, size)) return false;
+	// (Untracked regions are all CPU-dirty; a page the GPU marks meanwhile is the GPU thread's, which calls this.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return !manager->MarkCpuDirtyKeepProtection(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+void MemoryTracker::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) { manager->NoteHostWrite(); });
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -126,8 +184,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes,
-		    Common::BufferUploadProfile::Cause::Untrack);
+		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 

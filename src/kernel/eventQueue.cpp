@@ -1,16 +1,15 @@
-#include "common/stallDump.h"
 #include "kernel/eventQueue.h"
+#include "live-trace.h"
+#include "time-census.h"
 
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/frameTimeline.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
-#include "kernel/pthread.h"
 
 #include <algorithm>
 #include <chrono>
@@ -124,9 +123,6 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 				event.event = event.pending_events.front();
 				event.pending_events.pop_front();
 				event.triggered = true;
-			} else {
-				// A persistent level is delivered again by the next wait, not this batch.
-				break;
 			}
 
 			if (ret >= num) {
@@ -144,13 +140,7 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
 	for (auto& event: m_events) {
-		if (event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
-			if (event.event.filter == KERNEL_EVFILT_TIMER) {
-				const auto count = event.interval_ns == 0 ? !event.triggered :
-				    1 + (now_ns - event.deadline_ns) / event.interval_ns;
-				event.event.data += static_cast<intptr_t>(count);
-				event.deadline_ns += count * event.interval_ns;
-			}
+		if (!event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
 			event.triggered = true;
 		}
 	}
@@ -221,9 +211,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		                       return e.event.ident == ident && e.event.filter == filter;
 	                       });
 	if (it != m_events.end()) {
-		TriggerExpiredTimers(MonotonicTimeNs());
 		it->deadline_ns = event.deadline_ns;
-		it->interval_ns = event.interval_ns;
 		it->event.udata = event.event.udata;
 		for (auto& pending: it->pending_events) {
 			pending.udata = event.event.udata;
@@ -254,9 +242,6 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 			event.triggered = true;
 		}
 
-		Common::FrameTimeline::Current(Common::FrameTimeline::Kind::EventTrigger, 0,
-		    static_cast<uint64_t>(m_handle), ident, static_cast<uint64_t>(static_cast<int64_t>(filter)),
-		    static_cast<uint64_t>(event.pending_events.empty() ? event.event.data : event.pending_events.back().data));
 		m_cond_var.Signal();
 
 		return OK;
@@ -402,8 +387,8 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
-	Common::StallDump::Scope stall_wait(__func__, static_cast<uintptr_t>(eq), true);
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(WaitEqueue, timo != nullptr ? static_cast<uint64_t>(*timo) : ~uint64_t {0});
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {
@@ -419,14 +404,6 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	}
 
 	EXIT_NOT_IMPLEMENTED(out == nullptr);
-	if (Common::FrameTimeline::Recording()) {
-		if (Common::FrameTimeline::NeedsName()) {
-			char name[32] {};
-			if (PthreadGetname(PthreadSelfOrNull(), name) == OK) Common::FrameTimeline::Name(name);
-		}
-		Common::FrameTimeline::Event(Common::FrameTimeline::Kind::EqueueBegin, 0, 0, 0,
-		    static_cast<uint64_t>(eq), timo ? *timo : UINT64_MAX, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-	}
 
 	LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64 ", ev = 0x%016" PRIx64
 	     ", num = %d, timo = %s, thread_id = %d\n",
@@ -435,6 +412,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	LiveTrace::Event(LiveTrace::EqueueWait, 1, timo == nullptr ? ~0ull : *timo);
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -447,15 +425,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		}
 	}
 
-	Common::FrameTimeline::Event(Common::FrameTimeline::Kind::EqueueEnd, 0, 0, 0,
-	    static_cast<uint64_t>(eq), static_cast<uint64_t>(*out));
-	if (Common::FrameTimeline::Recording() && *out > 0) {
-		for (int i = 0; i < std::min(*out, num); ++i) {
-			Common::FrameTimeline::Event(Common::FrameTimeline::Kind::EqueueEvent, 0, 0, 0,
-			    static_cast<uint64_t>(eq), ev[i].ident, static_cast<uint64_t>(static_cast<int64_t>(ev[i].filter)),
-			    static_cast<uint64_t>(ev[i].data));
-		}
-	}
+	LiveTrace::Event(LiveTrace::EqueueWait, 0, *out > 0 ? (uint64_t {static_cast<uint32_t>(*out)} << 32u) | static_cast<uint32_t>(ev[0].ident) : 0);
+
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -510,7 +481,6 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 }
 
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
-	Common::StallDump::Scope stall_signal(__func__, static_cast<uintptr_t>(eq));
 	PRINT_NAME();
 
 	LOGF("\t user event trigger: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
@@ -547,22 +517,6 @@ int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
 }
 
-static int AddTimerEvent(KernelEqueue eq, int id, uint64_t delay_ns, bool periodic, void* udata) {
-	const auto now_ns = MonotonicTimeNs();
-	KernelEqueueEvent event {};
-	event.deadline_ns  = delay_ns <= UINT64_MAX - now_ns ? now_ns + delay_ns : UINT64_MAX;
-	event.interval_ns  = periodic ? delay_ns : 0;
-	event.event.ident  = static_cast<uintptr_t>(id);
-	event.event.filter = periodic ? KERNEL_EVFILT_TIMER : KERNEL_EVFILT_HRTIMER;
-	event.event.flags  = EV_ADD | (periodic ? EV_CLEAR : EV_ONESHOT);
-	event.event.udata  = udata;
-	return KernelAddEvent(eq, event);
-}
-
-int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec, void* udata) {
-	return AddTimerEvent(eq, id, static_cast<uint64_t>(usec) * 1000, true, udata);
-}
-
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata) {
 	if (ts == nullptr) {
@@ -576,7 +530,17 @@ int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTim
 
 	const auto delay_ns =
 	    static_cast<uint64_t>(ts->tv_sec) * 1000000000ull + static_cast<uint64_t>(ts->tv_nsec);
-	return AddTimerEvent(eq, id, delay_ns, false, udata);
+	const auto now_ns = MonotonicTimeNs();
+
+	KernelEqueueEvent event {};
+	event.deadline_ns  = delay_ns <= UINT64_MAX - now_ns ? now_ns + delay_ns : UINT64_MAX;
+	event.event.ident  = static_cast<uintptr_t>(id);
+	event.event.filter = KERNEL_EVFILT_HRTIMER;
+	event.event.flags  = EV_ADD | EV_ONESHOT;
+	event.event.fflags = 0;
+	event.event.data   = 0;
+	event.event.udata  = udata;
+	return KernelAddEvent(eq, event);
 }
 
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id) {
@@ -592,7 +556,7 @@ int KYTY_SYSV_ABI KernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
 	if (eq != KERNEL_EQUEUE_INVALID) {
 		KernelEqueueEvent event {};
 		event.event.ident         = static_cast<uintptr_t>(id);
-		event.event.filter        = KERNEL_EVFILT_AMPR;
+		event.event.filter        = KERNEL_EVFILT_USER;
 		event.event.flags         = EV_ADD | EV_CLEAR;
 		event.event.fflags        = 0;
 		event.event.data          = 0;
@@ -620,7 +584,7 @@ int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id) {
 	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	if (eq != KERNEL_EQUEUE_INVALID) {
-		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_AMPR);
+		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
 	}
 
 	return OK;

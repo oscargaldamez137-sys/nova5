@@ -5,8 +5,6 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
-#include <array>
-
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
@@ -460,9 +458,6 @@ struct PsShaderResource2 {
 
 struct PsStageRegisters {
 	uint64_t          data_addr = 0;
-	uint64_t          user_data_addr = 0;
-	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
-	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
@@ -503,8 +498,7 @@ struct LsStageRegisters {
 };
 
 struct HsStageRegisters {
-	uint64_t          data_addr      = 0;
-	uint64_t          user_data_addr = 0;
+	uint64_t          data_addr = 0;
 	HsShaderResource1 rsrc1;
 	HsShaderResource2 rsrc2;
 };
@@ -558,8 +552,6 @@ struct ShaderRegisters {
 	uint32_t m_vgtGsMaxVertOut        = 0;
 	uint32_t m_vgtGsOutPrimType       = 0;
 	uint32_t m_vgtPrimitiveIdEn       = 0;
-	uint32_t m_vgtDrawPayloadCntl     = 0;
-	uint32_t m_paClObjprimIdCntl      = 0;
 	uint32_t m_vgtReuseOff            = 0;
 	uint32_t m_vgtTessDistribution    = 0;
 	uint32_t m_vgtLsHsConfig          = 0;
@@ -576,12 +568,6 @@ struct ShaderRegisters {
 	uint32_t m_paScShaderControl = 0;
 
 	DepthShaderControl db_shader_control;
-	bool               alpha_to_mask_enable = false;
-
-	// DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE overrides DB_ALPHA_TO_MASK per shader.
-	[[nodiscard]] bool AlphaToMask() const {
-		return alpha_to_mask_enable && !db_shader_control.alpha_to_mask_disable;
-	}
 
 	[[nodiscard]] uint32_t GetExportCount() const {
 		return 1u + ((m_spiVsOutConfig >> 1u) & 0x1Fu);
@@ -597,10 +583,14 @@ struct ShaderRegisters {
 	}
 };
 
+enum class UserSgprType { Unknown, Region, Vsharp };
+
 struct UserSgprInfo {
 	static constexpr int SGPRS_MAX = 32;
 
-	uint32_t value[SGPRS_MAX] = {0};
+	uint32_t     value[SGPRS_MAX] = {0};
+	UserSgprType type[SGPRS_MAX]  = {};
+	uint32_t     count            = 0;
 };
 
 struct VertexShaderInfo {
@@ -610,6 +600,9 @@ struct VertexShaderInfo {
 	GsStageRegisters gs_regs;
 	UserSgprInfo     hs_user_sgpr;
 	UserSgprInfo     gs_user_sgpr;
+	// The GS user SGPR the CP writes the draw's start instance into: an indirect draw's
+	// START_INST_LOC (-1: none).
+	int32_t start_instance_user_sgpr = -1;
 };
 
 struct PixelShaderInfo {
@@ -685,10 +678,6 @@ public:
 
 	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; }
 	[[nodiscard]] uint32_t GetRenderTargetMask() const { return m_render_target_mask; }
-	[[nodiscard]] bool HasObjectPrimitiveIdOutput() const {
-		return (m_sh_regs.m_vgtDrawPayloadCntl & 1u) != 0 &&
-		       (m_render_target_mask & 0xf0000000u) != 0;
-	}
 
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
 	[[nodiscard]] uint32_t GetShaderStages() const { return m_shader_stages; }
@@ -828,11 +817,6 @@ public:
 	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
-	// PA_CL_UCP_0_X..PA_CL_UCP_5_W as raw float bits, four per plane.
-	[[nodiscard]] const std::array<uint32_t, 24>& GetUserClipPlanes() const {
-		return m_user_clip_planes;
-	}
-	void SetUserClipPlane(uint32_t index, uint32_t value) { m_user_clip_planes[index] = value; }
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
 	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
@@ -892,8 +876,6 @@ public:
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
 	void SetPrimitiveIdEn(uint32_t value) { m_sh_regs.m_vgtPrimitiveIdEn = value; }
-	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
-	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
 	void SetReuseOff(uint32_t value) { m_sh_regs.m_vgtReuseOff = value; }
 	void SetTessDistribution(uint32_t value) { m_sh_regs.m_vgtTessDistribution = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }
@@ -917,7 +899,6 @@ public:
 	void SetDepthShaderControl(const DepthShaderControl& value) {
 		m_sh_regs.db_shader_control = value;
 	}
-	void SetAlphaToMaskEnable(bool value) { m_sh_regs.alpha_to_mask_enable = value; }
 
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
 
@@ -933,8 +914,6 @@ private:
 	ClipControl     m_clip_control;
 	ColorControl    m_color_control;
 	ScanModeControl m_scan_mode_control;
-
-	std::array<uint32_t, 24> m_user_clip_planes {};
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;
@@ -957,12 +936,6 @@ private:
 	EqaaControl m_eqaa_control;
 
 	ShaderRegisters m_sh_regs;
-};
-
-struct FsrView {
-	uint32_t control_points[2][4] {};
-	uint32_t alphas[2][2] {};
-	uint32_t window[2] {};
 };
 
 class UserConfig {
@@ -994,17 +967,8 @@ public:
 	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
 	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }
 	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
-	void SetFsrControlPoint(uint32_t axis, uint32_t index, uint32_t value) {
-		m_fsr_view.control_points[axis][index] = value;
-	}
-	void SetFsrAlpha(uint32_t axis, uint32_t index, uint32_t value) {
-		m_fsr_view.alphas[axis][index] = value;
-	}
-	void SetFsrWindow(uint32_t index, uint32_t value) { m_fsr_view.window[index] = value; }
-	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
-	FsrView m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;
@@ -1027,47 +991,56 @@ public:
 	void SetEsShaderBase(uint64_t addr) { m_vs.es_regs.data_addr = addr; }
 	void SetLsShaderBase(uint64_t addr) { m_vs.ls_regs.data_addr = addr; }
 	void SetHsShaderBase(uint64_t addr) { m_vs.hs_regs.data_addr = addr; }
-	void SetHsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_vs.hs_regs.user_data_addr, word, value);
-	}
 	void SetHsShaderResource1(const HsShaderResource1& rsrc1) { m_vs.hs_regs.rsrc1 = rsrc1; }
 	void SetHsShaderResource2(const HsShaderResource2& rsrc2) { m_vs.hs_regs.rsrc2 = rsrc2; }
 	void SetGsShaderBase(uint64_t addr) { m_vs.gs_regs.data_addr = addr; }
 	void SetGsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_vs.gs_regs.user_data_addr, word, value);
+		const auto shift   = word * 32u;
+		auto&      address = m_vs.gs_regs.user_data_addr;
+		address = (address & ~(uint64_t {0xffffffffu} << shift)) |
+		          (static_cast<uint64_t>(value) << shift);
 	}
 	void SetGsShaderResource1(const GsShaderResource1& rsrc1) { m_vs.gs_regs.rsrc1 = rsrc1; }
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
-	void SetPsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_ps.ps_regs.user_data_addr, word, value);
-	}
-	void SetPsAuxiliaryTableAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_ps.ps_regs.auxiliary_table_addr, word, value);
-	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
 
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
 	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }
 
-	void SetPsUserSgpr(uint32_t id, uint32_t value) { m_ps.ps_user_sgpr.value[id] = value; }
-	void SetCsUserSgpr(uint32_t id, uint32_t value) { m_cs.cs_user_sgpr.value[id] = value; }
-	void SetHsUserSgpr(uint32_t id, uint32_t value) { m_vs.hs_user_sgpr.value[id] = value; }
-	void SetGsUserSgpr(uint32_t id, uint32_t value) { m_vs.gs_user_sgpr.value[id] = value; }
+	void SetPsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_ps.ps_user_sgpr.value[id] = value;
+		m_ps.ps_user_sgpr.type[id]  = type;
+		m_ps.ps_user_sgpr.count =
+		    ((id + 1) > m_ps.ps_user_sgpr.count ? (id + 1) : m_ps.ps_user_sgpr.count);
+	}
+	void SetCsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_cs.cs_user_sgpr.value[id] = value;
+		m_cs.cs_user_sgpr.type[id]  = type;
+		m_cs.cs_user_sgpr.count =
+		    ((id + 1) > m_cs.cs_user_sgpr.count ? (id + 1) : m_cs.cs_user_sgpr.count);
+	}
+	void SetHsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_vs.hs_user_sgpr.value[id] = value;
+		m_vs.hs_user_sgpr.type[id]  = type;
+		m_vs.hs_user_sgpr.count =
+		    ((id + 1) > m_vs.hs_user_sgpr.count ? (id + 1) : m_vs.hs_user_sgpr.count);
+	}
+	void SetGsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_vs.gs_user_sgpr.value[id] = value;
+		m_vs.gs_user_sgpr.type[id]  = type;
+		m_vs.gs_user_sgpr.count =
+		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
+	}
+	void SetStartInstanceUserSgpr(int32_t id) { m_vs.start_instance_user_sgpr = id; }
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }
 	[[nodiscard]] const ComputeShaderInfo& GetCs() const { return m_cs; }
 
 private:
-	static void SetUserDataAddressWord(uint64_t& address, uint32_t word, uint32_t value) {
-		const auto shift = word * 32u;
-		address = (address & ~(uint64_t {0xffffffffu} << shift)) |
-		          (static_cast<uint64_t>(value) << shift);
-	}
-
 	VertexShaderInfo  m_vs;
 	PixelShaderInfo   m_ps;
 	ComputeShaderInfo m_cs;

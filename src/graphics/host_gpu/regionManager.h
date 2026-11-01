@@ -2,23 +2,15 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
-#include "common/alignment.h"
-#include "common/bufferUploadProfile.h"
-#include "common/submitProfile.h"
+#include "live-counters.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <atomic>
+#include <immintrin.h>
 #include <mutex>
-#include <memory>
-#include <type_traits>
 #include <utility>
-
-#if defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(__x86_64__)
-#include <xmmintrin.h>
-#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -27,10 +19,11 @@
 #include <windows.h>
 #undef min
 #undef max
-#undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
+#include <sched.h>
 #elif defined(__linux__)
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -39,39 +32,77 @@ namespace Libs::Graphics {
 
 class TrackingSpinLock final {
 public:
-	explicit TrackingSpinLock(Common::SubmitProfile::Diagnostics::Metric metric =
-	                              Common::SubmitProfile::Diagnostics::Metric::TrackingLock): m_metric(metric) {}
 	void lock() noexcept {
-		Common::SubmitProfile::Diagnostics::LockTimer timer(m_metric);
 		const auto thread = CurrentThread();
+		if (m_owner.load(std::memory_order_relaxed) == thread) {
+			EXIT("recursive region tracking lock\n");
+		}
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
+			if (m_owner.load(std::memory_order_relaxed) == thread) {
+				EXIT("recursive region tracking lock while contended\n");
+			}
+			// Wait with plain loads: repeated locked writes would keep the line away from the
+			// owner and slow the very critical section being waited for. Past a short spin the
+			// waiter yields its CPU: guest threads streaming textures fault into the texture
+			// cache at once, and pure spinners starved a descheduled owner (the render thread,
+			// 100+ ms frames with its samples parked inside the critical section).
+			do {
+				if (++spins < 512) {
+					_mm_pause();
+				} else {
+					YieldCpu();
+				}
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
-		timer.Acquired();
+		// Odd while held: ReadShared retries a read that overlapped a holder.
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 	}
 	void unlock() noexcept {
-		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
+		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
+			EXIT("region tracking lock released by non-owner\n");
+		}
+		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
+	}
+	[[nodiscard]] bool OwnedByCurrentThread() const noexcept { return m_owner.load(std::memory_order_relaxed) == CurrentThread(); }
+	// A read of state only holders of this lock write, without taking it: valid when no holder
+	// was inside while it ran (the sequence even and unchanged), else done again under the lock.
+	// The query then costs no locked instruction and leaves the lock's line to the writers.
+	template <typename Read>
+	auto ReadShared(Read&& read) {
+		const auto before = m_seq.load(std::memory_order_acquire);
+		if ((before & 1u) == 0) {
+			auto result = read();
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (m_seq.load(std::memory_order_relaxed) == before) return result;
+		}
+		lock();
+		auto result = read();
+		unlock();
+		return result;
+	}
+
+	static void YieldCpu() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		SwitchToThread();
+#else
+		sched_yield();
+#endif
 	}
 
 private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		// TEB ClientId.UniqueThread, what GetCurrentThreadId returns: one load instead of a
+		// call into kernel32 on every lock and unlock.
+		return static_cast<uint32_t>(__readgsqword(0x48));
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
-		static thread_local const uint32_t tid =
-		    static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
-		return tid;
+		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
 #elif defined(__linux__)
 		static thread_local const uint32_t tid = static_cast<uint32_t>(::syscall(SYS_gettid));
 		return tid;
@@ -82,10 +113,18 @@ private:
 
 	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
 	std::atomic_uint32_t m_owner {0};
-	Common::SubmitProfile::Diagnostics::Metric m_metric;
+	std::atomic_uint32_t m_seq {0};
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+
+// Advances whenever pages become CPU-dirty (ChangeState<Cpu, true>, a new region's pages). A region's LastDirtyClock is
+// the value of its last such change: the CPU-dirty pages of a region whose clock is not above a value read earlier were
+// dirty all the time since (nothing made them clean: see CommandScheduler::UploadPrologue).
+inline std::atomic<uint64_t> g_cpu_dirty_clock {1};
+[[nodiscard]] inline uint64_t NextCpuDirtyClock() noexcept {
+	return g_cpu_dirty_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
 
 class RegionManager final {
 public:
@@ -97,158 +136,49 @@ public:
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
-		if (Common::BufferUploadProfile::Enabled()) {
-			m_upload_causes = std::make_unique<UploadCauses>();
-			m_upload_causes->fill(Common::BufferUploadProfile::Cause::Initial);
-		}
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
-	void ObserveHotFault(uint64_t offset) {
-		const auto page = offset / TRACKER_PAGE_SIZE;
-		if (!m_hot || !m_hot->has_observed || !m_hot->observed.Get(page)) return;
-		++m_hot->faults[page];
-		if (m_coarsen && m_coarsen->capture) {
-			auto& s = m_coarsen->stats;
-			++s.faults;
-			if (m_coarsen->seen_frame.Get(page)) ++s.repeat; else ++s.unique;
-			if (m_coarsen->reprotected.Get(page)) ++s.refault_upload;
-			m_coarsen->seen_frame.Set(page);
-			m_coarsen->reprotected.Unset(page);
-			m_coarsen->extra_dirty.Unset(page); // Actual write evidence for this page.
-		}
+	// See g_cpu_dirty_clock.
+	[[nodiscard]] uint64_t LastDirtyClock() const noexcept { return m_last_dirty.load(std::memory_order_acquire); }
+	[[nodiscard]] uint64_t CpuModificationEpoch() const {
+		// Pages marked clean whose write protection is still queued can change unseen:
+		// nothing is provable until the worker applied it (and moved the epoch).
+		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
+		return m_cpu_epoch.load(std::memory_order_acquire);
 	}
-	uint64_t TakeHotFaults(uint64_t offset, uint64_t size, bool observe) {
-		const auto [first, last] = GetPageRange(m_cpu_addr + offset, size);
-		if (!m_hot && observe) m_hot = std::make_unique<HotState>();
-		if (!m_hot) return 0;
-		uint64_t count = 0;
-		for (size_t i = first; i < last; ++i) count += std::exchange(m_hot->faults[i], 0);
-		if (observe) m_hot->observed.SetRange(first, last); else m_hot->observed.UnsetRange(first, last);
-		m_hot->has_observed = m_hot->observed.Any();
-		return count;
+	// KYTY_ASYNC_REPROTECT: a write protection of pages in this region is queued.
+	void BeginDeferredProtection() noexcept { m_deferred_protects.fetch_add(1, std::memory_order_acq_rel); }
+	[[nodiscard]] bool DeferredProtectionPending() const noexcept {
+		return m_deferred_protects.load(std::memory_order_acquire) != 0;
 	}
-	void ConfigureFaultCoarsening(uint64_t offset, uint64_t size, uint64_t block_size, bool enabled, bool capture = true) {
-		EXIT_IF(block_size != 64 * 1024 && block_size != 256 * 1024 && block_size != 1024 * 1024);
-		if (!m_coarsen) m_coarsen = std::make_unique<CoarsenState>();
-		m_coarsen->block_size = block_size;
-		m_coarsen->capture = capture;
-		const auto [first, last] = GetPageRange(m_cpu_addr + offset, size);
-		m_coarsen->eligible.UnsetRange(first, last);
-		if (enabled) {
-			// Only whole aligned blocks wholly inside this owner/region. Edge
-			// pages retain 4 KiB granularity; neighboring owners never merge.
-			const auto begin = Common::AlignUp(offset, block_size);
-			const auto end = Common::AlignDown(offset + size, block_size);
-			if (begin < end) m_coarsen->eligible.SetRange(begin / TRACKER_PAGE_SIZE, end / TRACKER_PAGE_SIZE);
-		}
+	// The upload worker (or the render thread as a fallback) applies it.
+	void ApplyDeferredProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ReapplyProtection(vaddr, size);
+		m_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
 	}
-	FaultCoarsenStats TakeCoarsenStats(uint64_t epoch = 0) {
-		if (!m_coarsen || !m_coarsen->capture) return {};
-		if (epoch && m_coarsen->report_epoch == epoch) return {};
-		m_coarsen->report_epoch = epoch;
-		m_coarsen->seen_frame.Clear();
-		m_coarsen->reprotected.Clear();
-		return std::exchange(m_coarsen->stats, {});
-	}
-	bool CoarsenFault(uint64_t& offset, uint64_t& size, bool allow) {
-		if (!m_coarsen || size != 1 || !m_coarsen->eligible.Get(offset / TRACKER_PAGE_SIZE) ||
-		    !Common::SubmitProfile::ExperimentActive()) return false;
-		auto& s = m_coarsen->stats;
-		if (!allow) { if (m_coarsen->capture) ++s.reject_readback; return false; }
-		const auto begin = Common::AlignDown(offset, m_coarsen->block_size);
-		const auto bytes = m_coarsen->block_size;
-		if (IsModified<DirtySource::Gpu>(begin, bytes)) { if (m_coarsen->capture) ++s.reject_gpu; return false; }
-		if (HasHostImport(begin, bytes)) { if (m_coarsen->capture) ++s.reject_import; return false; }
-		const auto first = begin / TRACKER_PAGE_SIZE, last = (begin + bytes) / TRACKER_PAGE_SIZE;
-		if (m_page_manager.HasForeignWatchers(m_cpu_addr, first, last, m_writable)) {
-			if (m_coarsen->capture) ++s.reject_watcher;
-			return false;
-		}
-		const auto fault_page = offset / TRACKER_PAGE_SIZE;
-		uint64_t extra = 0;
-		for (auto i = first; m_coarsen->capture && i < last; ++i) {
-			if (m_cpu_dirty.Get(i)) continue;
-			if (i != fault_page) { m_coarsen->extra_dirty.Set(i); extra += TRACKER_PAGE_SIZE; }
-		}
-		if (m_coarsen->capture) { ++s.expanded; s.extra_dirty_upper += extra; }
-		offset = begin; size = bytes;
-		return true;
-	}
-	bool CanUseHot(uint64_t offset, uint64_t size) {
-		const auto [first, last] = GetPageRange(m_cpu_addr + offset, size);
-		return !IsModified<DirtySource::Gpu>(offset, size) && !HasHostImport(offset, size) &&
-		    !m_page_manager.HasForeignWatchers(m_cpu_addr, first, last, m_writable);
-	}
-	void SetHot(uint64_t offset, uint64_t size, bool enabled) {
-		const auto [first, last] = GetPageRange(m_cpu_addr + offset, size);
-		if (enabled) {
-			EXIT_IF(IsModified<DirtySource::Gpu>(offset, size) || HasHostImport(offset, size));
-			if (!m_hot) m_hot = std::make_unique<HotState>();
-			m_hot->pages.SetRange(first, last);
-			m_hot->reprotect.UnsetRange(first, last);
-			m_hot->has_pages = true; m_hot->has_reprotect = m_hot->reprotect.Any();
-			m_cpu_dirty.SetRange(first, last);
-			UpdateProtection<false, false>();
-		} else if (m_hot) {
-			// Keep a forced upload AND re-arm write watching. A fault after this
-			// point returns that page to the ordinary dirty/writable state.
-			const RegionBits retiring(m_hot->pages, first, last);
-			m_cpu_dirty |= retiring;
-			m_hot->reprotect |= retiring;
-			m_hot->pages.UnsetRange(first, last);
-			m_hot->has_pages = m_hot->pages.Any(); m_hot->has_reprotect = m_hot->reprotect.Any();
-			UpdateProtection<true, false>();
-		}
-	}
-	// Accessed under the existing region lock, including publication/removal.
-	// A has no mask: faults neither acquire an import mutex nor search a range map.
-	bool HasHostImport(uint64_t offset, uint64_t size) const {
-		if (!m_host_import) return false;
-		const auto [first, last] = GetPageRange(m_cpu_addr + offset, size);
-		return m_host_import->FirstRangeFrom(first).first < last;
-	}
-	void SetHostImport(uint64_t offset, uint64_t size, bool enabled) {
-		const auto [first, last] = GetPageRange(m_cpu_addr + offset, size);
-		if (enabled) {
-			if (!m_host_import) m_host_import = std::make_unique<RegionBits>();
-			m_host_import->SetRange(first, last);
-		} else if (m_host_import) {
-			m_host_import->UnsetRange(first, last);
-			if (m_host_import->None()) m_host_import.reset();
-		}
-	}
-	template <DirtySource source>
+
+	template <DirtySource source, bool all = false>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		return GetBits<source>().FirstRangeFrom(start).first < end;
+		const auto& bits        = GetBits<source>();
+		if constexpr (all) return bits.AllInRange(start, end);
+		return bits.AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
-	void ChangeState(uint64_t vaddr, uint64_t size,
-	                 Common::BufferUploadProfile::Cause cause = Common::BufferUploadProfile::Cause::Invalidate) {
+	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (m_coarsen && m_coarsen->capture && m_hot && m_hot->has_observed && cause == Common::BufferUploadProfile::Cause::CpuWriteFault) {
-				const RegionBits observed(m_hot->observed, start, end);
-				m_coarsen->stats.dirty_bytes += observed.Count() * TRACKER_PAGE_SIZE;
-				m_coarsen->stats.new_dirty_bytes += (observed & ~m_cpu_dirty).Count() * TRACKER_PAGE_SIZE;
-			}
-			if (m_coarsen && m_coarsen->capture && cause != Common::BufferUploadProfile::Cause::CpuWriteFault)
-				m_coarsen->extra_dirty.UnsetRange(start, end);
-			if (m_hot && m_hot->has_reprotect) {
-				m_hot->reprotect.UnsetRange(start, end); m_hot->has_reprotect = m_hot->reprotect.Any();
-			}
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
-			if (m_upload_causes) std::fill(m_upload_causes->begin() + start, m_upload_causes->begin() + end, cause);
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			EXIT_IF(m_hot && m_hot->has_pages && RegionBits(m_hot->pages, start, end).Any());
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -259,71 +189,99 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			if (m_hot && m_hot->has_pages) m_cpu_dirty |= m_hot->pages;
-			UpdateProtection<!enable, false>();
+			if constexpr (enable) {
+				// Invalidate cached clean proofs before another CPU thread can write
+				// through the relaxed host protection. A cache miss takes this lock.
+				m_cpu_epoch.fetch_add(1, std::memory_order_release);
+				m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+			}
+			UpdateCpuProtection<!enable>(start, end);
 		} else {
-			UpdateProtection<enable, true>();
+			// (GPU-written pages given back to the CPU hold the GPU's bytes now: the epoch moves, NoteHostWrite.)
+			if constexpr (!enable) m_cpu_epoch.fetch_add(1, std::memory_order_release);
+			UpdateGpuProtection<enable>();
 		}
+	}
+
+	// The emulator wrote CPU-dirty pages of the region (their state stays): what a proof by the epoch holds of their
+	// bytes holds no longer (TableXpr::RingCopy's copies of guest-written ranges). The epoch moves as well when pages
+	// become CPU-dirty and when GPU-written pages are given back (their bytes the GPU's): with the guest's writes to
+	// dirty pages it covers every change of the region's bytes the CPU can see but those.
+	void NoteHostWrite() noexcept { m_cpu_epoch.fetch_add(1, std::memory_order_release); }
+
+	// CPU-dirty with the pages' write protection kept: the emulator wrote them through the backing view (no fault
+	// saw it). A page still write-watched stays so (UpdateCpuProtection moves only pages of a change's range, in its
+	// direction): its next upload finds it protected already, and a guest write before that faults once and drops
+	// the watcher as for any dirty page (ChangeState). Returns false (nothing changed) when the GPU wrote a page.
+	[[nodiscard]] bool MarkCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_gpu_dirty.AnyInRange(start, end)) return false;
+		m_cpu_dirty.SetRange(start, end);
+		m_cpu_epoch.fetch_add(1, std::memory_order_release);
+		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		return true;
 	}
 
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		auto&      bits         = GetBits<source>();
-		if (bits.FirstRangeFrom(start).first >= end) {
+		if (!GetBits<source>().AnyInRange(start, end)) return;
+		RegionBits mask(GetBits<source>(), start, end);
+		if constexpr (clear) {
+			GetBits<source>().UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu && clear) {
+			UpdateCpuProtection<true>(start, end);
+			ForEachRange(mask, std::forward<Func>(func));
 			return;
 		}
-		RegionBits mask(bits, start, end);
-		if constexpr (clear) {
-			if constexpr (source == DirtySource::Cpu) {
-				if (m_coarsen && m_coarsen->capture && m_hot && m_hot->has_observed) {
-					const auto observed = mask & m_hot->observed;
-					m_coarsen->stats.upload_bytes += observed.Count() * TRACKER_PAGE_SIZE;
-					m_coarsen->stats.extra_upload_upper += (observed & m_coarsen->extra_dirty).Count() * TRACKER_PAGE_SIZE;
-					m_coarsen->reprotected |= observed & m_coarsen->seen_frame;
-				}
-				if (m_coarsen && m_coarsen->capture) m_coarsen->extra_dirty.UnsetRange(start, end);
-			}
-			bits.UnsetRange(start, end);
-			if constexpr (source == DirtySource::Cpu) {
-				if (m_hot) {
-					if (m_hot->has_pages) bits |= m_hot->pages;
-					if (m_hot->has_reprotect) {
-						m_hot->reprotect.UnsetRange(start, end); m_hot->has_reprotect = m_hot->reprotect.Any();
-					}
-				}
-				UpdateProtection<true, false>();
-			} else {
-				UpdateProtection<false, true>();
-			}
+		if constexpr (source == DirtySource::Gpu && clear) {
+			m_cpu_epoch.fetch_add(1, std::memory_order_release); // (as ChangeState's)
+			UpdateGpuProtection<false>();
 		}
-		for (const auto [first, last]: mask) {
-			if constexpr (source == DirtySource::Cpu &&
-			              std::is_invocable_v<Func&, uint64_t, uint64_t, const Common::BufferUploadProfile::Causes&>) {
-				Common::BufferUploadProfile::Causes causes {};
-				if (m_upload_causes)
-					for (size_t page = first; page < last; ++page)
-						causes[static_cast<size_t>((*m_upload_causes)[page])] += TRACKER_PAGE_SIZE;
-				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE, causes);
-			} else {
-				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
-			}
-		}
+		ForEachRange(mask, std::forward<Func>(func));
 	}
 
-	TrackingSpinLock lock;
+	// Own cache line: guest fault handling updates the epoch and bitmaps below.
+	alignas(64) TrackingSpinLock lock;
 
 private:
-	template <bool track, bool is_read>
-	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : (m_hot && m_hot->has_reprotect ? m_cpu_dirty & ~m_hot->reprotect : m_cpu_dirty);
-		auto&      previous   = is_read ? m_readable : m_writable;
-		auto       mask       = protection ^ previous;
+	// The pages of [start, end) whose write watcher no longer matches their dirty state, in the change's direction:
+	// clean pages without one get it (track), dirty pages with one lose it. (Dirty pages that keep their protection,
+	// MarkCpuDirtyKeepProtection, are left alone by a change that only made other pages clean or dirty.)
+	template <bool track>
+	void UpdateCpuProtection(size_t start, size_t end) {
+		const auto changed = track ? m_writable & ~m_cpu_dirty : m_cpu_dirty & ~m_writable;
+		RegionBits mask(changed, start, end);
 		if (mask.None()) {
 			return;
 		}
-		previous = protection;
-		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
+		m_writable ^= mask;
+		LiveCounters::Add(track ? LiveCounters::Reprotect : LiveCounters::Unprotect);
+		LiveCounters::Add(track ? LiveCounters::ReprotectPages : LiveCounters::UnprotectPages, mask.Count());
+		if (track && LiveCounters::g_granules_on.load(std::memory_order_relaxed)) {
+			for (const auto [start, end]: mask) {
+				LiveCounters::AddGranule(m_cpu_addr + start * TRACKER_PAGE_SIZE, LiveCounters::GReprotectPages, end - start);
+			}
+		}
+		m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask);
+	}
+
+	template <bool track>
+	void UpdateGpuProtection() {
+		auto readable = ~m_gpu_dirty;
+		auto mask     = readable ^ m_readable;
+		m_readable    = readable;
+		if (mask.None()) {
+			return;
+		}
+		if constexpr (track) {
+			m_page_manager.UpdatePageWatchersForRegion<true, true>(m_cpu_addr, mask);
+		} else {
+			m_page_manager.UpdatePageWatchersForRegion<false, true>(m_cpu_addr, mask);
+		}
 	}
 
 	template <DirtySource source>
@@ -354,29 +312,22 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
-	PageManager& m_page_manager;
-	uint64_t     m_cpu_addr = 0;
-	RegionBits   m_cpu_dirty;
-	RegionBits   m_gpu_dirty;
-	RegionBits   m_writable;
-	RegionBits   m_readable;
-	std::unique_ptr<RegionBits> m_host_import;
-	struct HotState {
-		RegionBits pages, reprotect, observed;
-		bool has_pages = false, has_reprotect = false, has_observed = false;
-		std::array<uint64_t, TRACKER_REGION_PAGES> faults {};
-	};
-	std::unique_ptr<HotState> m_hot;
-	struct CoarsenState {
-		bool capture = true;
-		uint64_t block_size = 64 * 1024;
-		uint64_t report_epoch = 0;
-		RegionBits eligible, extra_dirty, seen_frame, reprotected;
-		FaultCoarsenStats stats;
-	};
-	std::unique_ptr<CoarsenState> m_coarsen;
-	using UploadCauses = std::array<Common::BufferUploadProfile::Cause, TRACKER_REGION_SIZE / TRACKER_PAGE_SIZE>;
-	std::unique_ptr<UploadCauses> m_upload_causes;
+	template <typename Func>
+	void ForEachRange(const RegionBits& bits, Func&& func) const {
+		for (const auto [start, end]: bits) {
+			func(m_cpu_addr + start * TRACKER_PAGE_SIZE, (end - start) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	alignas(64) PageManager& m_page_manager;
+	uint64_t              m_cpu_addr = 0;
+	std::atomic<uint64_t> m_cpu_epoch {1};
+	std::atomic<uint64_t> m_last_dirty {NextCpuDirtyClock()}; // (all pages start CPU-dirty)
+	std::atomic<uint32_t> m_deferred_protects {0};
+	RegionBits            m_cpu_dirty;
+	RegionBits            m_gpu_dirty;
+	RegionBits            m_writable;
+	RegionBits            m_readable;
 };
 
 } // namespace Libs::Graphics

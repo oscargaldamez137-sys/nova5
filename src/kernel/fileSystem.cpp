@@ -1,16 +1,12 @@
-#define KYTY_STALL_HLE
 #include "kernel/fileSystem.h"
 
 #include "common/archive.h"
 #include "common/assert.h"
-#include "common/bankIoTrace.h"
 #include "common/common.h"
 #include "common/dateTime.h"
-#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hash.h"
-#include "common/hostPath.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -18,6 +14,8 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/demonsSoulsWarp.h"
+#include "loader/gameArgs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,7 +23,6 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <optional>
 #include <random>
 #include <system_error>
 #include <vector>
@@ -37,26 +34,6 @@ LIB_NAME("libkernel", "libkernel");
 constexpr int      DESCRIPTOR_MIN = 3;
 constexpr uint64_t DIR_BLOCK_SIZE = 512;
 
-static void ReportUnexpectedShortRead(const std::filesystem::path& path, uint64_t position,
-                                      uint64_t requested, uint64_t remaining, uint32_t received) {
-	// EOF and zero-sized requests are normal. Preserve unusual results even when
-	// verbose logging is silent, without changing the bytes returned to the guest.
-	if (received >= std::min(requested, remaining)) {
-		return;
-	}
-	static std::atomic<uint32_t> reports {0};
-	if (reports.load(std::memory_order_relaxed) >= 32) {
-		return;
-	}
-	const auto report = reports.fetch_add(1, std::memory_order_relaxed);
-	if (report < 32) {
-		std::fprintf(stderr, "[FileReadShort] pos=%" PRIu64 " requested=%" PRIu64
-		                     " remaining=%" PRIu64 " read=%u file=%s\n",
-		             position, requested, remaining, received, Common::PathToString(path).c_str());
-		std::fflush(stderr);
-	}
-}
-
 enum class SpecialFile {
 	None,
 	Random,
@@ -65,9 +42,9 @@ enum class SpecialFile {
 class MountPoints {
 public:
 	struct MountPair {
-		std::filesystem::path dir;
-		std::string           point;
-		std::shared_ptr<Common::ArchiveReader> archive;
+		std::filesystem::path                  dir;
+		std::string                            point;
+		std::shared_ptr<Common::ArchiveReader> archive; // A mounted archive stays open (its index and block cache).
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -91,11 +68,9 @@ struct File {
 	std::filesystem::path               real_name;
 	std::atomic_bool                    opened;
 	std::atomic_bool                    directory;
-	std::atomic_bool                    readable;
 	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
-	std::atomic_bool                    close_on_exec;
 	SpecialFile                         special;
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
@@ -122,26 +97,9 @@ private:
 
 static MountPoints*     g_mount_points = nullptr;
 static FileDescriptors* g_files        = nullptr;
-static void StartBankTrace(Common::BankIoTrace& trace, int descriptor) {
-	if (!Common::BankIoTrace::Enabled() || descriptor < DESCRIPTOR_MIN) { return; }
-	const auto* file = g_files->GetFile(descriptor);
-	if (file != nullptr && file->opened) {
-		trace.Start(file->name, Common::Thread::GetThreadIdUnique());
-		if (trace.Active()) { trace.HostPath(Common::PathToString(file->real_name)); }
-	}
-}
 
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
-}
-
-static int MetadataError(const std::error_code& error) {
-	if (error == std::errc::no_such_file_or_directory) { return KERNEL_ERROR_ENOENT; }
-	if (error == std::errc::not_a_directory) { return KERNEL_ERROR_ENOTDIR; }
-	if (error == std::errc::filename_too_long) { return KERNEL_ERROR_ENAMETOOLONG; }
-	if (error == std::errc::permission_denied) { return KERNEL_ERROR_EACCES; }
-	if (error == std::errc::invalid_argument) { return KERNEL_ERROR_EINVAL; }
-	return KERNEL_ERROR_EIO;
 }
 
 static void FillRandomBuffer(void* buf, size_t nbytes) {
@@ -204,7 +162,7 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	    file->dents_offset < file->dirents.size() ? file->dirents.size() - file->dents_offset : 0;
 	const auto bytes = std::min(count, remaining);
 	if (bytes != 0) {
-		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes);
+		Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf), bytes);
 		memcpy(buf, file->dirents.data() + file->dents_offset, bytes);
 		file->dents_offset += bytes;
 	}
@@ -215,13 +173,38 @@ static int PosixToKernel(int posix_errno) {
 	return KERNEL_ERROR_UNKNOWN + posix_errno;
 }
 
+// A guest write the host refused (a create, an open for writing, a write that wrote less): printed, as the game goes on
+// without its data and says nothing (issue #31: progress never saved). The first 32.
+static void ReportWriteFailure(const char* what, const std::filesystem::path& path, uint64_t written = 0,
+                               uint64_t wanted = 0) {
+	const auto                   error = Common::File::TakeLastError();
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+	char sizes[64] = "";
+	if (wanted != 0) {
+		std::snprintf(sizes, sizeof(sizes), " (%llu of %llu bytes)", static_cast<unsigned long long>(written),
+		              static_cast<unsigned long long>(wanted));
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// ERROR_ACCESS_DENIED: Windows Security's Controlled folder access blocks programs it does not know from writing in
+	// Documents, Desktop and other protected folders, a read-only folder or file the same.
+	const char* hint = error == 5 ? ": if the folder is under Documents or Desktop, allow kyty_emulator.exe in Windows "
+	                                "Security > Ransomware protection > Controlled folder access, or move the emulator"
+	                              : "";
+#else
+	const char* hint = "";
+#endif
+	std::printf("FileSystem: %s failed%s: %s: error %u (%s)%s\n", what, sizes, Common::PathToString(path).c_str(), error,
+	            error != 0 ? Common::File::ErrorText(error).c_str() : "unknown", hint);
+	std::fflush(stdout);
+}
+
 int FileDescriptors::CreateDescriptor() {
 	Common::LockGuard lock(m_mutex);
 
 	auto* file        = new File {};
 	file->opened      = false;
 	file->directory   = false;
-	file->readable    = false;
 	file->writable    = false;
 	file->append      = false;
 	file->sync_writes = false;
@@ -298,13 +281,14 @@ void FileDescriptors::CloseAll() {
 void MountPoints::Mount(const std::filesystem::path& folder, const std::string& point) {
 	Common::LockGuard lock(m_mutex);
 
+	auto folder_str = Common::FixDirectorySlash(Common::PathToGenericString(folder));
 	auto point_str  = Common::FixDirectorySlash(point);
 
 	Umount(point_str);
 
 	MountPair p;
-	p.dir   = folder;
-	p.point = point_str;
+	p.dir     = Common::PathFromUtf8(folder_str);
+	p.point   = point_str;
 	p.archive = Common::OpenArchive(folder);
 
 	m_mount_pairs.push_back(std::move(p));
@@ -317,7 +301,7 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 
 	const auto it = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(), [&folder_or_point_str](const MountPair& p) {
-		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) == folder_or_point_str ||
+		    return Common::PathToGenericString(p.dir) == folder_or_point_str ||
 		           p.point == folder_or_point_str;
 	    });
 	if (it != m_mount_pairs.end()) {
@@ -379,32 +363,25 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
-	// Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
-	std::string normalized = Common::FixFilenameSlash(mounted_name);
-	normalized.erase(std::unique(normalized.begin(), normalized.end(),
-	                             [](char a, char b) { return a == '/' && b == '/'; }),
-	                 normalized.end());
-
 	// Match the entire guest path so a mount root works with or without a trailing slash.
-	const auto mounted_path = Common::FixDirectorySlash(normalized);
-	const auto it           = std::find_if(
+	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
+	const auto it = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
-	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
+	    [&mounted_path](const MountPair& p) { return Common::StartsWith(mounted_path, p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
-		auto rel_path = Common::RemoveFirst(normalized, p.point.size());
-		while (rel_path.starts_with('/')) {
+		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
+		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
-
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
-		if (Common::IsArchivePath(p.dir)) {
-			return p.dir / native_rel_path;
+		if (p.archive != nullptr) {
+			return p.dir / native_rel_path; // (archive names compare without case)
 		}
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
+			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
+			         mounted_name.c_str());
 		}
 		return p.dir / native_rel_path;
 #else
@@ -412,8 +389,7 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 #endif
 	}
 
-	// Unmounted guest paths must not fall through to the host filesystem.
-	return {};
+	return mounted_name;
 }
 
 void Initialize() {
@@ -450,21 +426,12 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 	return g_mount_points->ResolvePath(mounted_file_name);
 }
 
-bool IsOpenDescriptor(int d) {
-	const auto* file = g_files->GetFile(d);
-	return file != nullptr && file->opened;
-}
-
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("open", -1, flags, mode);
-	if (Common::BankIoTrace::Enabled() && path != nullptr) {
-		trace.Start(path, Common::Thread::GetThreadIdUnique());
-	}
 
 	if (path == nullptr) {
-		return trace.Result(KERNEL_ERROR_EINVAL);
+		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto flags_u = static_cast<uint32_t>(flags);
@@ -507,12 +474,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
-	file->name          = path;
-	file->readable      = rw_mode != Common::File::Mode::Write;
-	file->writable      = rw_mode != Common::File::Mode::Read;
-	file->append        = append;
-	file->sync_writes   = fsync || sync || dsync;
-	file->close_on_exec = (static_cast<uint32_t>(flags) & 0x00100000u) != 0;
+	file->name        = path;
+	file->writable    = rw_mode != Common::File::Mode::Read;
+	file->append      = append;
+	file->sync_writes = fsync || sync || dsync;
 
 	if (!directory && IsRandomDevice(file->name)) {
 		file->real_name = file->name;
@@ -522,42 +487,35 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		LOGF_COLOR(Log::Color::Green, "\tOpen device: %s, [ok]\n",
 		           Common::PathToString(file->real_name).c_str());
 
-		return trace.Result(descriptor);
+		return descriptor;
 	}
 
 	file->real_name = g_mount_points->ResolvePath(file->name);
-	if (trace.Active()) { trace.HostPath(Common::PathToString(file->real_name)); }
-	if (file->real_name.empty()) {
+
+	if (Common::IsArchivePath(file->real_name) && (rw_mode != Common::File::Mode::Read || trunc || creat)) {
 		g_files->DeleteDescriptor(descriptor);
-		return trace.Result(KERNEL_ERROR_ENOENT);
-	}
-	if (Common::IsArchivePath(file->real_name) &&
-	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
-		g_files->DeleteDescriptor(descriptor);
-		return trace.Result(KERNEL_ERROR_EROFS);
+		return KERNEL_ERROR_EROFS;
 	}
 
 	if (trunc && rw_mode == Common::File::Mode::Read) {
 		g_files->DeleteDescriptor(descriptor);
-		return trace.Result(KERNEL_ERROR_EACCES);
+		return KERNEL_ERROR_EACCES;
 	}
 
-	std::error_code info_error;
-	const auto info = Common::File::GetInfo(file->real_name, &info_error);
-	const bool dir_exist = info && !info->is_file;
+	const auto info       = Common::File::GetInfo(file->real_name);
+	const bool dir_exist  = info && !info->is_file;
 	const bool file_exist = info && info->is_file;
-	if (info) { trace.Context(-1, static_cast<int64_t>(info->size)); }
 
-	// Preserve the metadata error: an overlong or inaccessible path is not ENOENT.
+	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
 		g_files->DeleteDescriptor(descriptor);
-		return trace.Result(MetadataError(info_error));
+		return KERNEL_ERROR_ENOENT;
 	}
 
 	if (directory || dir_exist) {
 		if (!dir_exist) {
 			g_files->DeleteDescriptor(descriptor);
-			return trace.Result(KERNEL_ERROR_ENOTDIR);
+			return KERNEL_ERROR_ENOTDIR;
 		}
 
 		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
@@ -580,7 +538,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 		if (excl && creat && file_exist) {
 			g_files->DeleteDescriptor(descriptor);
-			return trace.Result(KERNEL_ERROR_EEXIST);
+			return KERNEL_ERROR_EEXIST;
+		}
+		if (rw_mode != Common::File::Mode::Read) {
+			Loader::DemonsSoulsWarp::NoteWrite(file->real_name);
 		}
 
 		if (creat && (!file_exist || trunc)) {
@@ -590,7 +551,17 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
-			result = file->f.Open(file->real_name, rw_mode);
+			// Debug warp (loader/demonsSoulsWarp.h): a read of the save gets a copy on the chosen map; the
+			// game's command-line file gets the console variables of KYTY_GAME_CONVARS (loader/gameArgs.h).
+			auto open_name = file->real_name;
+			if (rw_mode == Common::File::Mode::Read) {
+				if (auto copy = Loader::DemonsSoulsWarp::RedirectRead(file->real_name); !copy.empty()) {
+					open_name = std::move(copy);
+				} else if (auto args = Loader::GameArgs::RedirectRead(file->real_name); !args.empty()) {
+					open_name = std::move(args);
+				}
+			}
+			result = file->f.Open(open_name, rw_mode);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
@@ -605,33 +576,34 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		}
 
 		if (!result || file->f.IsInvalid()) {
+			if (rw_mode != Common::File::Mode::Read || creat || trunc) {
+				ReportWriteFailure(creat ? "create" : "open for writing", file->real_name);
+			}
 			g_files->DeleteDescriptor(descriptor);
-			return trace.Result(KERNEL_ERROR_EACCES);
+			return KERNEL_ERROR_EACCES;
 		}
 	}
 
 	file->opened = true;
-	return trace.Result(descriptor);
+	return descriptor;
 }
 
 int KYTY_SYSV_ABI KernelClose(int d) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("close", d);
-	StartBankTrace(trace, d);
 
 	if (d < DESCRIPTOR_MIN) {
-		return trace.Result(KERNEL_ERROR_EPERM);
+		return KERNEL_ERROR_EPERM;
 	}
 
 	if (::Libs::Network::Net::IsSocket(d)) {
 		const auto result = ::Libs::Network::Net::SocketClose(d);
-		return trace.Result((result == OK ? OK : PosixToKernel(::Libs::Network::NetToPosix(result))));
+		return (result == OK ? OK : PosixToKernel(::Libs::Network::NetToPosix(result)));
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
-		return trace.Result(KERNEL_ERROR_EBADF);
+		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_IF(!file->opened);
@@ -646,65 +618,97 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	g_files->DeleteDescriptor(d);
 
-	return trace.Result(OK);
+	return OK;
 }
 
-int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
-	PRINT_NAME();
-
-	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EBADF;
+// A file read into guest memory goes through a host buffer and is copied in by a write that takes the
+// fault path like any other. The kernel writes a guest buffer without it: a page the GPU trackers
+// protected again after the read invalidated it (a buffer or image sync on the render thread) made
+// ReadFile stop short, and the short count went to the game as the read's result.
+static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
+	constexpr uint32_t                 Chunk = 4u << 20u;
+	thread_local std::vector<uint8_t> bounce;
+	uint32_t                          total = 0;
+	while (total < nbytes) {
+		const uint32_t want = std::min(nbytes - total, Chunk);
+		if (bounce.size() < want) bounce.resize(want);
+		uint32_t got = 0;
+		f.Read(bounce.data(), want, &got);
+		if (got == 0) break;
+		const auto destination = reinterpret_cast<uint64_t>(buf) + total;
+		Memory::InvalidateMemoryForWrite(destination, got);
+		std::memcpy(reinterpret_cast<void*>(destination), bounce.data(), got);
+		total += got;
+		if (got < want) break;
 	}
+	return total;
+}
 
-	auto* file = g_files->GetFile(d);
-	if (file == nullptr || !file->opened) {
-		return KERNEL_ERROR_EBADF;
+// A file write from guest memory: from the guest buffer itself where no page of it faults on a
+// read. The kernel reads it without the fault path: a page it cannot read (the GPU wrote it; the
+// texture or file offload took it) ends the write there (EFAULT, a short count) on Linux, and on
+// Windows such a page is a guard page, whose guard the kernel's touch would clear unseen. Over such
+// pages, and from where a write stopped short, a piece is copied out first, by a read that takes
+// the fault path, then the write goes on. Unmapped memory is not copied (the host memcpy would
+// crash): the write stops short there, as before.
+static void WriteFromGuest(Common::File& f, const void* buf, uint32_t nbytes,
+                           uint32_t* bytes_written) {
+	constexpr uint32_t                Chunk = 4u << 20u;
+	thread_local std::vector<uint8_t> bounce;
+	const auto*                       bytes = static_cast<const uint8_t*>(buf);
+	uint32_t                          total = 0;
+	while (total < nbytes) {
+		uint32_t done = 0;
+		if (!Memory::ReadFaults(reinterpret_cast<uint64_t>(bytes + total), nbytes - total)) {
+			f.Write(bytes + total, nbytes - total, &done);
+			total += done;
+			if (total == nbytes) break;
+		}
+		const uint32_t want = std::min(nbytes - total, Chunk);
+		if (!Memory::IsFullyMapped(reinterpret_cast<uint64_t>(bytes + total), want)) break;
+		if (bounce.size() < want) bounce.resize(want);
+		std::memcpy(bounce.data(), bytes + total, want);
+		done = 0;
+		f.Write(bounce.data(), want, &done);
+		total += done;
+		if (done < want) break;
 	}
-
-	switch (command) {
-		case 1: return file->close_on_exec.load(std::memory_order_relaxed); // F_GETFD
-		case 2: // F_SETFD, FD_CLOEXEC
-			file->close_on_exec.store((arg & 1) != 0, std::memory_order_relaxed);
-			return OK;
-		default: return KERNEL_ERROR_EINVAL;
-	}
+	*bytes_written = total;
 }
 
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("read", d, 0, nbytes);
-	StartBankTrace(trace, d);
 
 	if (d < DESCRIPTOR_MIN) {
-		return trace.Result(KERNEL_ERROR_EPERM);
+		return KERNEL_ERROR_EPERM;
 	}
 
 	if (buf == nullptr) {
-		return trace.Result(KERNEL_ERROR_EFAULT);
+		return KERNEL_ERROR_EFAULT;
 	}
 
 	if (::Libs::Network::Net::IsSocket(d)) {
 		const auto result = ::Libs::Network::Net::Recv(d, buf, nbytes, 0);
-		return trace.Result((result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr())));
+		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
-		return trace.Result(KERNEL_ERROR_EBADF);
+		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_IF(!file->opened);
 
 	if (nbytes > INT_MAX) {
-		return trace.Result(KERNEL_ERROR_EINVAL);
+		return KERNEL_ERROR_EINVAL;
 	}
 	if (file->directory) {
 		Common::LockGuard lock(file->mutex);
 		const auto        bytes = ReadDirectory(file, buf, nbytes);
 		LOGF("\tRead %" PRIu64 " directory bytes from: %s\n", bytes,
 		     Common::PathToString(file->real_name).c_str());
-		return trace.Result(static_cast<int64_t>(bytes));
+		return static_cast<int64_t>(bytes);
 	}
 
 	if (file->special == SpecialFile::Random) {
@@ -713,38 +717,24 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		LOGF("\tRead %" PRIu64 " random bytes from: %s\n", static_cast<uint64_t>(nbytes),
 		     Common::PathToString(file->real_name).c_str());
 
-		return trace.Result(static_cast<int64_t>(nbytes));
+		return static_cast<int64_t>(nbytes);
 	}
 
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
-	const auto pos        = file->f.Tell();
-	const auto file_size  = file->f.Size();
-	trace.Context(static_cast<int64_t>(pos), static_cast<int64_t>(file_size));
-	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
-	ReportUnexpectedShortRead(file->real_name, pos, nbytes, remaining, bytes_read);
+	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 
 	file->mutex.Unlock();
 
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
-		return trace.Result(KERNEL_ERROR_EIO);
+		return KERNEL_ERROR_EIO;
 	}
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
-	if (bytes_read == 0) {
-		LOGF("\tReadZero: requested=%" PRIu64 " pos=%" PRIu64 " file_size=%" PRIu64 " from: %s\n",
-		     static_cast<uint64_t>(nbytes), static_cast<uint64_t>(pos), static_cast<uint64_t>(file_size),
-		     Common::PathToString(file->real_name).c_str());
-	}
 
-	return trace.Result(bytes_read);
+	return bytes_read;
 }
 
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
@@ -757,10 +747,6 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (d == 1 || d == 2) {
 		auto*      out      = (d == 1 ? stdout : stderr);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
-		if (written != 0) {
-			Common::StallDump::Progress(d == 1 ? Common::StallDump::Milestone::GuestStdout
-			                                 : Common::StallDump::Milestone::GuestStderr);
-		}
 		const auto flush_ok = std::fflush(out) == 0;
 
 		if (written != nbytes || !flush_ok) {
@@ -781,7 +767,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr || !file->opened || !file->writable) {
+	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -799,8 +785,8 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file->append) {
 		file->f.Seek(file->f.Size());
 	}
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -819,25 +805,23 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("pread", d, offset, nbytes);
-	StartBankTrace(trace, d);
 
 	if (d < DESCRIPTOR_MIN) {
-		return trace.Result(KERNEL_ERROR_EPERM);
+		return KERNEL_ERROR_EPERM;
 	}
 
 	if (buf == nullptr) {
-		return trace.Result(KERNEL_ERROR_EFAULT);
+		return KERNEL_ERROR_EFAULT;
 	}
 
 	if (offset < 0) {
-		return trace.Result(KERNEL_ERROR_EINVAL);
+		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
-		return trace.Result(KERNEL_ERROR_EBADF);
+		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_NOT_IMPLEMENTED(file->directory);
@@ -852,143 +836,28 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		LOGF("\tRead %" PRIu64 " random bytes (pos = %" PRId64 ") from: %s\n",
 		     static_cast<uint64_t>(nbytes), offset, Common::PathToString(file->real_name).c_str());
 
-		return trace.Result(static_cast<int64_t>(nbytes));
+		return static_cast<int64_t>(nbytes);
 	}
 
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
-	const auto file_size  = file->f.Size();
-	trace.Context(offset, static_cast<int64_t>(file_size));
-	const auto remaining =
-	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
-	ReportUnexpectedShortRead(file->real_name, static_cast<uint64_t>(offset), nbytes, remaining,
-	                          bytes_read);
+	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
 
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
-		return trace.Result(KERNEL_ERROR_EIO);
+		return KERNEL_ERROR_EIO;
 	}
 
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
 	     Common::PathToString(file->real_name).c_str());
 
-	return trace.Result(bytes_read);
-}
-
-static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
-                          std::vector<KernelIovec>* buffers, size_t* total) {
-	constexpr int MaxIov = 1024;
-	if (iovcnt < 0 || iovcnt > MaxIov || offset < 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-	if (iov == nullptr && iovcnt != 0) {
-		return KERNEL_ERROR_EFAULT;
-	}
-
-	if (iovcnt != 0) {
-		buffers->assign(iov, iov + iovcnt);
-	}
-	*total = 0;
-	for (const auto& buffer: *buffers) {
-		if (buffer.iov_len > INT_MAX - *total) {
-			return KERNEL_ERROR_EINVAL;
-		}
-		if (buffer.iov_base == nullptr && buffer.iov_len != 0) {
-			return KERNEL_ERROR_EFAULT;
-		}
-		*total += buffer.iov_len;
-	}
-	return OK;
-}
-
-int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
-	PRINT_NAME();
-	Common::BankIoTrace trace("preadv", d, offset, static_cast<uint64_t>(iovcnt));
-	StartBankTrace(trace, d);
-
-	std::vector<KernelIovec> buffers;
-	size_t                   total = 0;
-	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
-	if (error != OK) {
-		return trace.Result(error);
-	}
-
-	if (d < DESCRIPTOR_MIN) {
-		return trace.Result(KERNEL_ERROR_EBADF);
-	}
-	if (::Libs::Network::Net::IsSocket(d)) {
-		return trace.Result(KERNEL_ERROR_ESPIPE);
-	}
-	auto* file = g_files->GetFile(d);
-	if (file == nullptr || !file->opened || !file->readable) {
-		return trace.Result(KERNEL_ERROR_EBADF);
-	}
-
-	Common::LockGuard lock(file->mutex);
-	if (file->directory) {
-		return trace.Result(KERNEL_ERROR_EISDIR);
-	}
-	if (total == 0) {
-		return trace.Result(0);
-	}
-	if (file->special == SpecialFile::Random) {
-		for (const auto& buffer: buffers) {
-			if (buffer.iov_len != 0) {
-				Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base),
-				                         buffer.iov_len);
-				FillRandomBuffer(buffer.iov_base, buffer.iov_len);
-			}
-		}
-		return trace.Result(static_cast<int64_t>(total));
-	}
-	if (file->f.IsInvalid()) {
-		return trace.Result(KERNEL_ERROR_EIO);
-	}
-
-	const auto position  = file->f.Tell();
-	const auto file_size = file->f.Size();
-	trace.Context(offset, static_cast<int64_t>(file_size));
-	trace.Count(total);
-	if (!file->f.Seek(static_cast<uint64_t>(offset))) {
-		return trace.Result(KERNEL_ERROR_EIO);
-	}
-	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
-	int64_t bytes_read = 0;
-	for (const auto& buffer: buffers) {
-		if (remaining == 0) {
-			break;
-		}
-		if (buffer.iov_len == 0) {
-			continue;
-		}
-		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
-		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
-		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
-		bytes_read += bytes;
-		remaining -= bytes;
-		if (bytes < count) {
-			break;
-		}
-	}
-	if (!file->f.Seek(position)) {
-		return trace.Result(KERNEL_ERROR_EIO);
-	}
-	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
-	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
-	return trace.Result(bytes_read);
+	return bytes_read;
 }
 
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
@@ -1008,7 +877,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr || !file->opened || !file->writable) {
+	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1025,8 +894,8 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	auto     pos           = file->f.Tell();
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -1045,112 +914,30 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	return bytes_written;
 }
 
-static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<int64_t> offset) {
-	std::vector<KernelIovec> buffers;
-	size_t                   total = 0;
-	const int error = ValidateIovecs(iov, iovcnt, offset.value_or(0), &buffers, &total);
-	if (error != OK) {
-		return error;
-	}
-
-	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EBADF;
-	}
-	if (::Libs::Network::Net::IsSocket(d)) {
-		return KERNEL_ERROR_ESPIPE;
-	}
-	auto* file = g_files->GetFile(d);
-	if (file == nullptr || !file->opened || !file->writable) {
-		return KERNEL_ERROR_EBADF;
-	}
-	Common::LockGuard lock(file->mutex);
-	if (file->directory) {
-		return KERNEL_ERROR_EISDIR;
-	}
-	if (file->special != SpecialFile::None) {
-		return KERNEL_ERROR_EINVAL;
-	}
-	if (total == 0) {
-		return 0;
-	}
-	if (file->f.IsInvalid()) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	const auto position = file->f.Tell();
-	auto       target   = position;
-	if (file->append) {
-		target = file->f.Size();
-	} else if (offset) {
-		target = static_cast<uint64_t>(*offset);
-	}
-	if (target > static_cast<uint64_t>(INT64_MAX) - total) {
-		return KERNEL_ERROR_EFBIG;
-	}
-	if ((offset || file->append) && !file->f.Seek(target)) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	int64_t bytes_written = 0;
-	for (const auto& buffer: buffers) {
-		if (buffer.iov_len == 0) {
-			continue;
-		}
-		uint32_t bytes = 0;
-		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);
-		bytes_written += bytes;
-		if (bytes < buffer.iov_len) {
-			break;
-		}
-	}
-	const bool flushed  = !file->sync_writes || file->f.Flush();
-	const bool restored = !offset || file->f.Seek(position);
-	if (!flushed || !restored) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	LOGF("\tWritev %" PRId64 " bytes (pos = %" PRIu64 ", iovcnt = %d) to: %s\n", bytes_written,
-	     target, iovcnt, Common::PathToString(file->real_name).c_str());
-	return bytes_written;
-}
-
-int64_t KYTY_SYSV_ABI KernelWritev(int d, const KernelIovec* iov, int iovcnt) {
-	PRINT_NAME();
-	return Writev(d, iov, iovcnt, std::nullopt);
-}
-
-int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
-	PRINT_NAME();
-	return Writev(d, iov, iovcnt, offset);
-}
-
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("lseek", d, offset, static_cast<uint64_t>(whence));
-	StartBankTrace(trace, d);
 
 	if (d < DESCRIPTOR_MIN) {
-		return trace.Result(KERNEL_ERROR_EBADF);
+		return KERNEL_ERROR_EBADF;
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
-		return trace.Result(KERNEL_ERROR_EBADF);
+		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_IF(!file->opened);
 
 	if (file->special != SpecialFile::None) {
-		return trace.Result(KERNEL_ERROR_ESPIPE);
+		return KERNEL_ERROR_ESPIPE;
 	}
 
 	Common::LockGuard lock(file->mutex);
 
 	if (!file->directory && file->f.IsInvalid()) {
 		LOGF("\tfile is invalid\n");
-		return trace.Result(KERNEL_ERROR_EIO);
+		return KERNEL_ERROR_EIO;
 	}
 
 	uint64_t base = 0;
@@ -1158,24 +945,23 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 		case 0: break;
 		case 1: base = file->directory ? file->dents_offset : file->f.Tell(); break;
 		case 2: base = file->directory ? file->dirents.size() : file->f.Size(); break;
-		default: return trace.Result(KERNEL_ERROR_EINVAL);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
-	trace.Context(static_cast<int64_t>(base), -1);
 	uint64_t position = 0;
 	if (offset >= 0) {
 		if (base > static_cast<uint64_t>(INT64_MAX - offset)) {
-			return trace.Result(KERNEL_ERROR_EOVERFLOW);
+			return KERNEL_ERROR_EOVERFLOW;
 		}
 		position = base + static_cast<uint64_t>(offset);
 	} else {
 		const auto distance = uint64_t {0} - static_cast<uint64_t>(offset);
 		if (base < distance) {
-			return trace.Result(KERNEL_ERROR_EINVAL);
+			return KERNEL_ERROR_EINVAL;
 		}
 		position = base - distance;
 		if (position > INT64_MAX) {
-			return trace.Result(KERNEL_ERROR_EOVERFLOW);
+			return KERNEL_ERROR_EOVERFLOW;
 		}
 	}
 
@@ -1189,30 +975,24 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	LOGF("\tLseek (pos = %" PRIu64 ") to: %s\n", position,
 	     Common::PathToString(file->real_name).c_str());
 
-	return trace.Result(static_cast<int64_t>(position));
+	return static_cast<int64_t>(position);
 }
 
 int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("stat", -1);
-	if (Common::BankIoTrace::Enabled() && path != nullptr) {
-		trace.Start(path, Common::Thread::GetThreadIdUnique());
-	}
 
 	if (path == nullptr || sb == nullptr) {
-		return trace.Result(KERNEL_ERROR_EINVAL);
+		return KERNEL_ERROR_EINVAL;
 	}
 
 	LOGF("\t KernelStat: %s\n", path);
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
-	if (trace.Active()) { trace.HostPath(Common::PathToString(real_file_name)); }
 
-	std::error_code info_error;
-	const auto info = Common::File::GetInfo(real_file_name, &info_error);
+	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {
-		LOGF("\t metadata error: %d\n", info_error.value());
-		return trace.Result(MetadataError(info_error));
+		LOGF("\t file not found\n");
+		return KERNEL_ERROR_ENOENT;
 	}
 
 	const bool is_dir = !info->is_file;
@@ -1229,7 +1009,10 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {
-		stat.st_size    = static_cast<int64_t>(info->size);
+		// Debug warp and game console variables: a read gets a copy of another size (KernelOpen).
+		auto redirected = Loader::DemonsSoulsWarp::RedirectedSize(real_file_name);
+		if (!redirected) redirected = Loader::GameArgs::RedirectedSize(real_file_name);
+		stat.st_size = static_cast<int64_t>(redirected ? *redirected : info->size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 
@@ -1241,28 +1024,25 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	stat.st_ctim     = stat.st_atim;
 	stat.st_birthtim = stat.st_mtim;
 	*sb              = stat;
-	trace.Context(-1, stat.st_size);
 
-	return trace.Result(OK);
+	return OK;
 }
 
 int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	PRINT_NAME();
-	Common::BankIoTrace trace("fstat", d);
-	StartBankTrace(trace, d);
 
 	if (d < DESCRIPTOR_MIN) {
-		return trace.Result(KERNEL_ERROR_EPERM);
+		return KERNEL_ERROR_EPERM;
 	}
 
 	if (sb == nullptr) {
-		return trace.Result(KERNEL_ERROR_EFAULT);
+		return KERNEL_ERROR_EFAULT;
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
-		return trace.Result(KERNEL_ERROR_EBADF);
+		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_IF(!file->opened);
@@ -1276,11 +1056,19 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	auto wt = at;
 
 	if (file->special != SpecialFile::None) {
-		stat.st_mode    = 0020644u;
 		stat.st_size    = 0;
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
-	} else if (!file->directory) {
+		SecToTimespec(&stat.st_atim, at.ToUnix());
+		SecToTimespec(&stat.st_mtim, wt.ToUnix());
+		stat.st_ctim     = stat.st_atim;
+		stat.st_birthtim = stat.st_mtim;
+		*sb              = stat;
+
+		return OK;
+	}
+
+	if (!file->directory) {
 		file->mutex.Lock();
 
 		bool is_invalid = file->f.IsInvalid();
@@ -1291,7 +1079,7 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 		if (is_invalid) {
 			LOGF("\tfile is invalid\n");
-			return trace.Result(KERNEL_ERROR_EIO);
+			return KERNEL_ERROR_EIO;
 		}
 
 		stat.st_size    = static_cast<int64_t>(size);
@@ -1308,86 +1096,7 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	stat.st_ctim     = stat.st_atim;
 	stat.st_birthtim = stat.st_mtim;
 	*sb              = stat;
-	trace.Context(-1, stat.st_size);
 
-	return trace.Result(OK);
-}
-
-// Windows reports a path below a regular file as missing, where POSIX expects ENOTDIR.
-static bool HasFileAncestor(const std::filesystem::path& path) {
-	std::error_code error;
-	for (auto parent = path.parent_path(); !parent.empty() && parent != parent.root_path();
-	     parent      = parent.parent_path()) {
-		const auto status = std::filesystem::status(Common::NativeHostPath(parent), error);
-		if (error || !std::filesystem::exists(status)) {
-			continue;
-		}
-		return std::filesystem::is_regular_file(status);
-	}
-	return false;
-}
-
-int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
-	PRINT_NAME();
-	if (path == nullptr) {
-		return KERNEL_ERROR_EFAULT;
-	}
-	if (path[0] != '/' || length < 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-	size_t component_length = 0;
-	for (size_t i = 0; path[i] != '\0'; ++i) {
-		if (i >= 1023) {
-			return KERNEL_ERROR_ENAMETOOLONG;
-		}
-		if (path[i] == '/') {
-			component_length = 0;
-		} else if (++component_length > 255) {
-			return KERNEL_ERROR_ENAMETOOLONG;
-		}
-	}
-	if (IsRandomDevice(path)) {
-		return OK;
-	}
-	const auto real_name = g_mount_points->ResolvePath(path);
-	if (real_name.empty()) {
-		return KERNEL_ERROR_ENOENT;
-	}
-	if (Common::IsArchivePath(real_name)) {
-		return KERNEL_ERROR_EROFS;
-	}
-
-	std::error_code error;
-	const auto      status = std::filesystem::status(Common::NativeHostPath(real_name), error);
-	Common::ReportHostFileError("truncate.status", real_name, error);
-	if (!error) {
-		if (!std::filesystem::exists(status)) {
-			return HasFileAncestor(real_name) ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_ENOENT;
-		}
-		if (std::filesystem::is_directory(status)) {
-			return KERNEL_ERROR_EISDIR;
-		}
-		if (std::filesystem::is_regular_file(status)) {
-			std::filesystem::resize_file(Common::NativeHostPath(real_name), static_cast<uint64_t>(length), error);
-			Common::ReportHostFileError("truncate.resize_file", real_name, error);
-		}
-	}
-	if (error) {
-		switch (static_cast<std::errc>(error.default_error_condition().value())) {
-			case std::errc::no_such_file_or_directory:
-				return HasFileAncestor(real_name) ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_ENOENT;
-			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
-			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
-			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;
-			case std::errc::read_only_file_system: return KERNEL_ERROR_EROFS;
-			case std::errc::file_too_large: return KERNEL_ERROR_EFBIG;
-			case std::errc::invalid_argument: return KERNEL_ERROR_EINVAL;
-			case std::errc::no_space_on_device: return KERNEL_ERROR_ENOSPC;
-			default: return KERNEL_ERROR_EIO;
-		}
-	}
-	LOGF("\tTruncate (size = %" PRId64 ") file: %s\n", length,
-	     Common::PathToString(real_name).c_str());
 	return OK;
 }
 
@@ -1429,27 +1138,6 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
 
-	return OK;
-}
-
-int KYTY_SYSV_ABI KernelFsync(int d) {
-	PRINT_NAME();
-
-	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EBADF;
-	}
-
-	auto* file = g_files->GetFile(d);
-	if (file == nullptr || !file->opened) {
-		return KERNEL_ERROR_EBADF;
-	}
-
-	Common::LockGuard lock(file->mutex);
-	if (file->f.IsInvalid() || !file->f.Flush()) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	LOGF("\tFsync: %s\n", Common::PathToString(file->real_name).c_str());
 	return OK;
 }
 
@@ -1505,7 +1193,7 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
+	if (!Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
@@ -1585,11 +1273,8 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     path, mode);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
-	if (real_name.empty()) {
-		return KERNEL_ERROR_ENOENT;
-	}
 	if (Common::IsArchivePath(real_name)) {
-		return KERNEL_ERROR_EROFS;
+		return Common::File::IsDirectoryExisting(real_name) ? KERNEL_ERROR_EEXIST : KERNEL_ERROR_EROFS;
 	}
 
 	if (Common::File::IsDirectoryExisting(real_name)) {
@@ -1653,7 +1338,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 
 	auto real_name = g_mount_points->ResolvePath(mounted_path);
 
-	if (Common::File::IsFileExisting(real_name) || Common::File::IsDirectoryExisting(real_name)) {
+	if (Common::File::GetInfo(real_name)) {
 		return OK;
 	}
 

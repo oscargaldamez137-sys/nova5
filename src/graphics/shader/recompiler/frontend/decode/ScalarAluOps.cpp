@@ -24,8 +24,7 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x1cu, Opcode::S_XNOR_B32},        {0x1du, Opcode::S_XNOR_B64},
     {0x1eu, Opcode::S_LSHL_B32},        {0x1fu, Opcode::S_LSHL_B64},
     {0x20u, Opcode::S_LSHR_B32},        {0x21u, Opcode::S_LSHR_B64},
-    {0x22u, Opcode::S_ASHR_I32},        {0x23u, Opcode::S_ASHR_I64},
-    {0x24u, Opcode::S_BFM_B32},
+    {0x22u, Opcode::S_ASHR_I32},        {0x24u, Opcode::S_BFM_B32},
     {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
     {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
     {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
@@ -34,7 +33,6 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
     {0x33u, Opcode::S_PACK_LH_B32_B16}, {0x34u, Opcode::S_PACK_HH_B32_B16},
     {0x35u, Opcode::S_MUL_HI_U32},
-    {0x36u, Opcode::S_MUL_HI_I32},
 };
 
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
@@ -46,28 +44,18 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x09u, Opcode::S_WQM_B32},
     {0x0au, Opcode::S_WQM_B64},
     {0x0bu, Opcode::S_BREV_B32},
-    {0x0cu, Opcode::S_BREV_B64},
-    {0x0du, Opcode::S_BCNT0_I32_B32},
-    {0x0eu, Opcode::S_BCNT0_I32_B64},
     {0x0fu, Opcode::S_BCNT1_I32_B32},
     {0x10u, Opcode::S_BCNT1_I32_B64},
-    {0x11u, Opcode::S_FF0_I32_B32},
-    {0x12u, Opcode::S_FF0_I32_B64},
     {0x13u, Opcode::S_FF1_I32_B32},
     {0x14u, Opcode::S_FF1_I32_B64},
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
-    {0x17u, Opcode::S_FLBIT_I32},
-    {0x18u, Opcode::S_FLBIT_I32_I64},
-    {0x19u, Opcode::S_SEXT_I32_I8},
-    {0x1au, Opcode::S_SEXT_I32_I16},
     {0x1bu, Opcode::S_BITSET0_B32},
     {0x1cu, Opcode::S_BITSET0_B64},
     {0x1du, Opcode::S_BITSET1_B32},
     {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
-    {0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
     {0x2du, Opcode::S_QUADMASK_B64},
@@ -84,8 +72,7 @@ constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
     {0x03u, Opcode::S_CMP_GE_I32},  {0x04u, Opcode::S_CMP_LT_I32},  {0x05u, Opcode::S_CMP_LE_I32},
     {0x06u, Opcode::S_CMP_EQ_U32},  {0x07u, Opcode::S_CMP_LG_U32},  {0x08u, Opcode::S_CMP_GT_U32},
     {0x09u, Opcode::S_CMP_GE_U32},  {0x0au, Opcode::S_CMP_LT_U32},  {0x0bu, Opcode::S_CMP_LE_U32},
-    {0x0cu, Opcode::S_BITCMP0_B32}, {0x0du, Opcode::S_BITCMP1_B32},
-    {0x0eu, Opcode::S_BITCMP0_B64}, {0x0fu, Opcode::S_BITCMP1_B64}, {0x12u, Opcode::S_CMP_EQ_U64},
+    {0x0cu, Opcode::S_BITCMP0_B32}, {0x0du, Opcode::S_BITCMP1_B32}, {0x12u, Opcode::S_CMP_EQ_U64},
     {0x13u, Opcode::S_CMP_LG_U64},
 };
 
@@ -95,7 +82,7 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
     {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
     {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
     {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
-    {0x12u, Opcode::S_GETREG_B32}, {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
+    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
     {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
     {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
@@ -152,10 +139,6 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.family    = Family::SOP1;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
-	if (opcode == 0x21u && sdst == 125u) {
-		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump.
-		inst.opcode = Opcode::S_SETPC_B64;
-	}
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -164,25 +147,7 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_SWAPPC_B64:
-			inst.branch_target = UINT32_MAX;
-			[[fallthrough]];
-		case Opcode::S_MOV_B64:
-		case Opcode::S_CMOV_B64:
-		case Opcode::S_NOT_B64:
-		case Opcode::S_WQM_B64:
-		case Opcode::S_BREV_B64:
-		case Opcode::S_BITSET0_B64:
-		case Opcode::S_BITSET1_B64:
-		case Opcode::S_AND_SAVEEXEC_B64:
-		case Opcode::S_ORN2_SAVEEXEC_B64:
-		case Opcode::S_QUADMASK_B64:
-		case Opcode::S_ANDN1_SAVEEXEC_B64:
-		case Opcode::S_BITREPLICATE_B64_B32:
-			inst.data_dwords = 2u;
-			break;
 		case Opcode::S_GETPC_B64:
-			inst.data_dwords = 2u;
 			inst.src_count = 0;
 			DecodeScalarDestination(sdst, pc, inst.dst);
 			return;
@@ -222,8 +187,6 @@ void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
-	if (opcode == 0x0bu || (opcode >= 0x0fu && opcode <= 0x25u && (opcode & 1u)) || opcode == 0x29u)
-		inst.data_dwords = 2u;
 }
 
 void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
@@ -231,7 +194,7 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 23u) & 0x1fu;
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
-	const auto     imm    = (opcode >= 0x09u && opcode <= 0x0eu) || opcode == 0x12u
+	const auto     imm    = opcode >= 0x09u && opcode <= 0x0eu
 	                           ? static_cast<int32_t>(word & 0xffffu)
 	                           : static_cast<int32_t>(static_cast<int16_t>(word & 0xffffu));
 
@@ -251,7 +214,6 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_GETREG_B32:
 		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:

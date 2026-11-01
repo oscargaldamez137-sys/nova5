@@ -4,6 +4,10 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 namespace Libs::Dialog {
 
 namespace CommonDialog {
@@ -40,6 +44,32 @@ int KYTY_SYSV_ABI SigninDialogGetResult(void* result);
 
 namespace SaveDataDialog {
 
+// A save of the list the overlay shows (list mode): its directory, the game's texts for it and its date.
+struct HostEntry {
+	std::string dir_name;
+	std::string title;
+	std::string detail;
+	std::string date;
+};
+
+struct HostSnapshot {
+	uint64_t               generation;
+	int32_t                disp_type; // 1 save, 2 load, 3 delete
+	std::vector<HostEntry> entries;
+	size_t                 focus;
+};
+
+struct VisualState {
+	bool     active;
+	uint64_t revision;
+};
+
+bool        GetHostSnapshot(HostSnapshot* snapshot);
+VisualState GetVisualState() noexcept;
+void        SetVisibilityCallback(void (*callback)());
+bool        HostSelect(uint64_t generation, size_t index);
+bool        HostCancel(uint64_t generation);
+
 int KYTY_SYSV_ABI SaveDataDialogInitialize();
 int KYTY_SYSV_ABI SaveDataDialogGetStatus();
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus();
@@ -68,30 +98,22 @@ int KYTY_SYSV_ABI MsgDialogProgressBarSetMsg(int target, const char* msg);
 
 } // namespace MsgDialog
 
-namespace SystemDialog {
-
-enum class Kind { Error, Signin };
+namespace ErrorDialog {
 
 struct HostSnapshot {
-	Kind     kind;
 	uint64_t generation;
 	int32_t  error_code;
 };
 
 struct VisualState {
 	bool     active;
-	bool     background;
 	uint64_t revision;
 };
 
 bool        GetHostSnapshot(HostSnapshot* snapshot);
 VisualState GetVisualState() noexcept;
 void        SetVisibilityCallback(void (*callback)());
-bool        HostClose(uint64_t generation);
-
-} // namespace SystemDialog
-
-namespace ErrorDialog {
+bool        HostAccept(uint64_t generation);
 
 int KYTY_SYSV_ABI ErrorDialogInitialize();
 int KYTY_SYSV_ABI ErrorDialogOpen(const void* param);
