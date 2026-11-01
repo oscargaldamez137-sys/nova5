@@ -201,6 +201,8 @@ if(KYTY_CLANG_CL)
 	if(KYTY_NATIVE_OPT)
 		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>" "$<$<CONFIG:Release>:/clang:-march=${KYTY_MARCH}>")
 	endif()
+	# __FILE__ (asserts, logs) relative to the repository, not the build machine's folder.
+	add_compile_options("/clang:-ffile-prefix-map=${PROJECT_SOURCE_DIR}/=" "/clang:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.")
 	if(KYTY_THIN_LTO)
 		add_compile_options("$<$<CONFIG:Release>:-flto=thin>")
 		add_link_options("$<$<CONFIG:Release>:/opt:lldltojobs=all>")

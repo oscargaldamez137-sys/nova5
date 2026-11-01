@@ -17,7 +17,8 @@
         "Ajustes propios de cada juego: resolución, frecuencia, VSync, HDR, contador de FPS, idioma y más en sus opciones; «General» sigue los ajustes generales.",
         "Al pulsar la barra de trofeos de la pantalla de inicio se abre la lista de trofeos de ese juego.",
         "Opciones de cada juego (botón «Opciones del juego» o clic derecho en la carátula): modo Calidad, Equilibrado o Rendimiento, cada parche explicado y con su interruptor, y descarga de los parches de la comunidad para tu versión.",
-        "Astro Bot trae sus parches de rendimiento incluidos en el instalador."
+        "Astro Bot trae sus parches de rendimiento incluidos en el instalador.",
+        "Si un juego se cierra por un error, Nova5 te avisa y guarda el motivo en la carpeta _Logs para poder arreglarlo."
       ]
     },
     {

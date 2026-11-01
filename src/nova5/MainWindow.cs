@@ -2295,6 +2295,7 @@ public sealed class MainWindow : Window
 			_store.Save();
 		}
 		var closed   = _runningGame;
+		var crashed  = _running is { } process && process.ExitCode != 0;
 		_trophyCache.Clear(); // It may have earned trophies.
 		_running     = null;
 		_runningGame = null;
@@ -2302,6 +2303,8 @@ public sealed class MainWindow : Window
 		Activate();
 		Select(_index, force: true);
 		if (closed is not null) AfterArchiveTest(closed);
+		if (crashed && closed is not null && _zone != Zone.Choice)
+			ShowToast($"{closed.Name} se cerró por un error. El motivo queda en _Logs\\{closed.TitleId}.txt");
 	}
 
 	// ---- Building blocks ----------------------------------------------------------------------

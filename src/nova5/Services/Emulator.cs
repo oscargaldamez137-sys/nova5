@@ -61,7 +61,11 @@ public sealed class Emulator
 
 	public Process Launch(Game game)
 	{
-		var info = new ProcessStartInfo(ExePath) { WorkingDirectory = BaseDir, UseShellExecute = false };
+		// The emulator's console output goes to _Logs\<title id>.txt (the last run of each game), so a crash leaves its reason.
+		var info = new ProcessStartInfo(ExePath)
+		{
+			WorkingDirectory = BaseDir, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+		};
 		foreach (var arg in Arguments(game)) info.ArgumentList.Add(arg);
 		DemonsSoulsOptions.Apply(game.TitleId, info.Environment, key => Ini.Get(Global, key));
 		// The recording and render threads on the performance cores (run-windows.ps1's "auto"): +2.5 % in Demon's
@@ -74,7 +78,38 @@ public sealed class Emulator
 			info.Environment["KYTY_RECORDING_CPUS"] = cpus;
 			if (!info.Environment.ContainsKey("KYTY_RENDER_CPUS")) info.Environment["KYTY_RENDER_CPUS"] = cpus;
 		}
-		return Process.Start(info) ?? throw new InvalidOperationException("Nova5Emulator did not start");
+		var process = Process.Start(info) ?? throw new InvalidOperationException("Nova5Emulator did not start");
+		Log(process, LogFor(game.TitleId));
+		return process;
+	}
+
+	public string LogFor(string titleId) => Path.Combine(BaseDir, "_Logs", titleId + ".txt");
+
+	// Each line as it comes (flushed, so a crash keeps the last ones); stops at 64 MB.
+	private static void Log(Process process, string path)
+	{
+		Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+		var writer  = new StreamWriter(path, append: false, new System.Text.UTF8Encoding(false)) { AutoFlush = true };
+		var written = 0L;
+		var open    = 2;
+		void Line(object _, DataReceivedEventArgs e)
+		{
+			lock (writer)
+			{
+				if (e.Data is null)
+				{
+					if (--open == 0) writer.Dispose();
+					return;
+				}
+				if (written > 64L << 20) return;
+				written += e.Data.Length + 1;
+				writer.WriteLine(e.Data);
+			}
+		}
+		process.OutputDataReceived += Line;
+		process.ErrorDataReceived  += Line;
+		process.BeginOutputReadLine();
+		process.BeginErrorReadLine();
 	}
 
 	public List<string> Arguments(Game game)
