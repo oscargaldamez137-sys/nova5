@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/passTiming.h"
+#include "graphics/host_gpu/renderer/nativeIndirectPolicy.h"
 #include "local/raster-debug.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"
@@ -2500,13 +2501,6 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return true;
 	}
-	if (args.gpu_args != 0 && state.vs_input_info.stage.program != nullptr &&
-	    state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
-		// A mesh draw sizes its task grid from the counts.
-		ResetBindings();
-		return false;
-	}
-
 	bool programs_ok = false;
 	if (XprCapture::Enabled() && XprCapture::g_state.current_xpr &&
 	    XprCapture::g_state.capture_this) {
@@ -2532,8 +2526,15 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// A mesh draw sizes its task grid from the counts. (The draw's own program: before RefreshShaders the state held
 	// the previous draw's, or none in a fresh state.)
 	if (args.gpu_args != 0 && state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
+		// Jetsku 0cd821d0, MeshIndirect::AlwaysEmpty. Use THIS draw's shader,
+		// never the reused DrawRenderState's program before RefreshShaders.
+		const bool empty = NativeIndirect::EmptyMeshEnabled() &&
+		    NativeIndirect::AlwaysEmpty(true, args.index_count, state.vs_input_info.mesh.InputPrimitiveSize()) &&
+		    !state.depth_info.depth_clear_enable && !state.depth_info.stencil_clear_enable;
+		NativeIndirect::Count(empty ? NativeIndirect::Outcome::MeshEmpty : NativeIndirect::Outcome::MeshFallback,
+		                      args.gpu_args, args.index_count);
 		ResetBindings();
-		return false;
+		return empty;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
@@ -2633,6 +2634,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 	if (args.gpu_args != 0 && state.vs_input_info.stage.program != nullptr &&
 	    state.vs_input_info.stage.program->stage == ShaderType::Mesh) {
+		NativeIndirect::Count(NativeIndirect::Outcome::MeshFallback, args.gpu_args);
 		ResetBindings();
 		return false;
 	}

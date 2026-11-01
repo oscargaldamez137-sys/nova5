@@ -46,6 +46,12 @@ int32_t GetUserId() {
 	return g_config->user_id;
 }
 
+bool IsGuestUserId(int32_t user_id) {
+	// Nova5's four player IDs; match the save-data guest mapping too.
+	const int64_t delta = static_cast<int64_t>(user_id) - GetUserId();
+	return delta > 0 && delta <= 3 * 0x100 && delta % 0x100 == 0;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }

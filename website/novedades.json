@@ -1,0 +1,95 @@
+{
+  "_comment": "Novedades de cada versión, de la más nueva a la más antigua. Las leen la web (sección Novedades) y el lanzador (cuadro al actualizar y Ajustes > Información de la versión). Añade la versión nueva arriba antes de publicarla.",
+  "versions": [
+    {
+      "version": "0.7.1",
+      "date": "2026-11-01",
+      "title": "Trofeos, opciones de cada juego y ajustes renovados",
+      "items": [
+        "Trofeos de vuelta en el motor: al conseguir uno aparece un aviso con sonido y se guarda (los que ya tenías se conservan).",
+        "Nueva pestaña Trofeos: tu progreso en cada juego, con platino, oro, plata y bronce, y la lista de trofeos con su icono, descripción y fecha. Los ocultos no se desvelan hasta conseguirlos.",
+        "Comprimir juegos en .zar desde sus opciones: ocupan mucho menos (Astro Bot pasa de 148 a 44 GB) y se juegan igual. Clic derecho en la carátula > Comprimir en .zar; al terminar puedes probar el .zar antes de mandar la carpeta original a la papelera.",
+        "DLC: copia el .pkg del DLC en tu carpeta de juegos y Nova5 lo instala solo y se lo pasa al juego. Las opciones del juego muestran qué DLC tiene.",
+        "Al actualizar, Nova5 muestra un cuadro con todo lo nuevo de la versión. Puedes volver a verlo en Ajustes > Información de la versión.",
+        "Ajustes rediseñados y ordenados por secciones: cada opción explica para qué sirve, y la lista ya se puede desplazar con el mando, el teclado o la rueda del ratón.",
+        "Ajustes nuevos: VSync, HDR, ocultar el cursor, nombre de usuario, idioma de la consola, saltar avisos de inicio, vibración, altavoz y color de la luz del mando, y avisos de trofeos.",
+        "Teclado y ratón configurables: cada botón del DualSense con la tecla o el botón del ratón que quieras, y sensibilidad para mover la cámara con el ratón (F7). L2 y R2 ya vienen en Z y C.",
+        "Ajustes propios de cada juego: resolución, frecuencia, VSync, HDR, contador de FPS, idioma y más en sus opciones; «General» sigue los ajustes generales.",
+        "Al pulsar la barra de trofeos de la pantalla de inicio se abre la lista de trofeos de ese juego.",
+        "Opciones de cada juego (botón «Opciones del juego» o clic derecho en la carátula): modo Calidad, Equilibrado o Rendimiento, cada parche explicado y con su interruptor, y descarga de los parches de la comunidad para tu versión.",
+        "Astro Bot trae sus parches de rendimiento incluidos en el instalador."
+      ]
+    },
+    {
+      "version": "0.7.0",
+      "date": "2026-11-01",
+      "title": "Motor de emulación renovado",
+      "items": [
+        "Demon's Souls a 60 FPS a velocidad normal en el tutorial (antes 6–7 FPS).",
+        "Astro Bot: 50–60 FPS en el inicio y el mapa de la galaxia, guarda y carga partidas, y Sky Garden se juega con el cielo correcto (unos 19 FPS).",
+        "God of War Sons of Sparta sigue a 60 FPS.",
+        "Los hilos de dibujo se colocan solos en los núcleos de rendimiento del procesador.",
+        "Mismo lanzador: se actualiza conservando tus partidas, tu configuración y tus parches."
+      ]
+    },
+    {
+      "version": "0.6.0",
+      "date": "2026-10-29",
+      "title": "Más rendimiento y botón de donar",
+      "items": [
+        "Los comandos de la gráfica se preparan en un hilo aparte: Astro Bot ~+8 %, Demon's Souls ~+10 %.",
+        "Lectura anticipada de la memoria que escribe la GPU: Demon's Souls ~+8 %.",
+        "Botón Donar junto al título y en Ajustes."
+      ]
+    },
+    {
+      "version": "0.5.0",
+      "date": "2026-10-27",
+      "title": "Sparta jugable y galaxia fluida",
+      "items": [
+        "God of War Sons of Sparta 100 % jugable a 60 FPS, con sonido y control.",
+        "Astro Bot: el mapa de la galaxia pasa de ~35 a 52–54 FPS.",
+        "Nova5 abre archivos con rutas de más de 260 caracteres."
+      ]
+    },
+    {
+      "version": "0.4.0",
+      "date": "2026-10-26",
+      "title": "Menos esperas a la GPU e instalación de PKG mejorada",
+      "items": [
+        "Astro Bot: de ~14,5 a ~17 FPS al aterrizar en Sky Garden.",
+        "Demon's Souls ya no se cierra al arrancar.",
+        "Instalación de PKG con progreso real, velocidad y tiempo restante, y comprobación del espacio libre."
+      ]
+    },
+    {
+      "version": "0.3.0",
+      "date": "2026-10-26",
+      "title": "Instalación automática de PKG",
+      "items": [
+        "Copia un .pkg en tu carpeta de juegos y Nova5 lo instala y lo añade a la biblioteca.",
+        "Versión portable además del instalador.",
+        "Astro Bot más rápido en Sky Garden y arreglado el cierre de Wolverine al arrancar."
+      ]
+    },
+    {
+      "version": "0.2.0",
+      "date": "2026-10-25",
+      "title": "Ratón y actualizaciones automáticas",
+      "items": [
+        "Control con ratón: juegos, botones, pestañas y ajustes.",
+        "Nova5 avisa de las versiones nuevas y se actualiza con un clic, conservando partidas y ajustes.",
+        "+13 % de FPS en Astro Bot."
+      ]
+    },
+    {
+      "version": "0.1.0",
+      "date": "2026-10-25",
+      "title": "Primera versión pública",
+      "items": [
+        "Lanzador de estilo consola con carátulas, fondos y la música de menú de cada juego.",
+        "Control con mando o teclado e instalador sin permisos de administrador."
+      ]
+    }
+  ]
+}

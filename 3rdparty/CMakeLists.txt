@@ -82,10 +82,17 @@ else()
 	target_compile_options(zarchive PRIVATE -w)
 endif()
 
-add_executable(zarchive_tool EXCLUDE_FROM_ALL "${zarchive_source_SOURCE_DIR}/src/main.cpp")
+add_executable(zarchive_tool EXCLUDE_FROM_ALL "${PROJECT_SOURCE_DIR}/tools/zarchive/main.cpp")
 target_link_libraries(zarchive_tool PRIVATE zarchive)
 target_compile_features(zarchive_tool PRIVATE cxx_std_20)
-set_target_properties(zarchive_tool PROPERTIES OUTPUT_NAME zarchive)
+set_target_properties(zarchive_tool PROPERTIES OUTPUT_NAME zarchive
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+add_custom_target(zarchive_pack DEPENDS zarchive_tool)
+install(TARGETS zarchive_tool RUNTIME DESTINATION tools COMPONENT zarchive_pack EXCLUDE_FROM_ALL)
+install(FILES "${PROJECT_SOURCE_DIR}/tools/zarchive/LICENSE"
+  DESTINATION tools/licenses RENAME ZArchive.txt COMPONENT zarchive_pack EXCLUDE_FROM_ALL)
+install(FILES "${zstd_SOURCE_DIR}/LICENSE"
+  DESTINATION tools/licenses RENAME Zstd.txt COMPONENT zarchive_pack EXCLUDE_FROM_ALL)
 if(MSVC)
 	target_compile_options(zarchive_tool PRIVATE /W0)
 else()

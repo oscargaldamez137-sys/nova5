@@ -8,6 +8,13 @@ public sealed record Game(string TitleId, string Name, string Version, string Di
 	// Set for a .pkg that is not installed yet; Dir then holds the package's sce_sys read ahead for its art.
 	public string? Package { get; init; }
 
+	// Additional content (DLC): its param.json has no applicationCategoryType and no eboot.bin; TitleId is the game's.
+	public bool    IsAddon   { get; init; }
+	public string  ContentId { get; init; } = "";
+
+	// A game packed into a .zar: the archive the emulator loads; Dir is then its "<file>.zar.meta" folder.
+	public string? Archive   { get; init; }
+
 	public string  Eboot      => Path.Combine(Dir, "eboot.bin");
 	public string  SceSys     => Path.Combine(Dir, "sce_sys");
 	public string? Icon       => FirstExisting("icon0.png");
@@ -33,6 +40,15 @@ public static class Library
 				if (Read(dir) is { } game) games.TryAdd(Path.GetFullPath(game.Dir), game);
 				try
 				{
+					foreach (var archive in Directory.GetFiles(dir, "*.zar"))
+						if (Read(GameArchive.Meta(archive), requireEboot: false) is { IsAddon: false } packed)
+							games.TryAdd(Path.GetFullPath(archive), packed with { Archive = archive });
+				}
+				catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+				{
+				}
+				try
+				{
 					packages.AddRange(Directory.GetFiles(dir, "*.pkg"));
 				}
 				catch (Exception e) when (e is UnauthorizedAccessException or IOException)
@@ -48,10 +64,10 @@ public static class Library
 			// The package's own param.json (read ahead into a cache) gives its title, so a game installed
 			// anywhere else, such as an earlier manual extraction, is not installed twice.
 			var info = Packages.ReadInfo(package) is { } dir ? Read(dir, requireEboot: false) : null;
-			if (info is not null && installed.Contains(info.TitleId)) continue;
+			if (info is not null && !info.IsAddon && installed.Contains(info.TitleId)) continue;
 			pending.Add(info is null
 			    ? new Game("", PackageName(package), "", Path.GetDirectoryName(package)!) { Package = package }
-			    : info with { Package = package });
+			    : info with { Package = package, Name = info.IsAddon ? "DLC · " + info.Name : info.Name });
 		}
 		return games.Values.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).Concat(pending).ToList();
 	}
@@ -88,6 +104,17 @@ public static class Library
 
 	public static Game? ReadGame(string dir) => Read(dir);
 
+	public static Game? ReadAddon(string dir) => Read(dir, requireEboot: false) is { IsAddon: true } addon ? addon : null;
+
+	// The installed DLC of a game (folders with its title ID and an add-on param.json), for the emulator's --addcont.
+	public static List<Game> Addons(IEnumerable<string> roots, string titleId) =>
+	    roots.Where(Directory.Exists).SelectMany(root => Candidates(root, 4))
+	        .Select(dir => Read(dir, requireEboot: false))
+	        .OfType<Game>()
+	        .Where(g => g.IsAddon && g.ContentId.Length >= 16 && string.Equals(g.TitleId, titleId, StringComparison.OrdinalIgnoreCase))
+	        .DistinctBy(g => g.ContentId)
+	        .ToList();
+
 	private static Game? Read(string dir, bool requireEboot = true)
 	{
 		var param = Path.Combine(dir, "sce_sys", "param.json");
@@ -98,7 +125,11 @@ public static class Library
 			var root    = json.RootElement;
 			var titleId = root.TryGetProperty("titleId", out var id) ? id.GetString() ?? "" : "";
 			var version = root.TryGetProperty("contentVersion", out var v) ? v.GetString() ?? "" : "";
-			return new Game(titleId, TitleName(root) ?? titleId, version, dir);
+			var content = root.TryGetProperty("contentId", out var c) ? c.GetString() ?? "" : "";
+			return new Game(titleId, TitleName(root) ?? titleId, version, dir)
+			{
+				IsAddon = !root.TryGetProperty("applicationCategoryType", out _) && !File.Exists(Path.Combine(dir, "eboot.bin")), ContentId = content,
+			};
 		}
 		catch (JsonException)
 		{

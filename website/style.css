@@ -231,3 +231,18 @@ details p { color: var(--muted); margin: 0 0 20px; }
   .nav > .btn.small { display: none; }
   .menu-toggle { margin-left: auto; }
 }
+
+/* Novedades: the newest version open, older ones folded. */
+.changelog { display: grid; gap: 12px; max-width: 860px; }
+.changelog .release { padding: 28px 30px; border-radius: var(--radius); background: linear-gradient(160deg, var(--ink-2), var(--ink)); border: 1px solid rgba(94, 234, 212, .35); }
+.changelog .release h3 { font-size: 22px; margin: 6px 0 4px; }
+.changelog .ver { color: var(--aurora-a); font-size: 13px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; margin: 0; }
+.changelog ul { margin: 12px 0 0; padding-left: 20px; color: var(--muted); }
+.changelog li + li { margin-top: 6px; }
+
+.gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 28px; }
+.gallery figure { margin: 0; }
+.gallery img { display: block; width: 100%; height: auto; border-radius: 16px; border: 1px solid var(--line); box-shadow: 0 24px 60px -30px rgba(0, 0, 0, .8); }
+.gallery figcaption { color: var(--muted); font-size: 15px; margin-top: 12px; }
+.changelog details ul { margin: 0 0 20px; }
+.changelog summary .muted { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }

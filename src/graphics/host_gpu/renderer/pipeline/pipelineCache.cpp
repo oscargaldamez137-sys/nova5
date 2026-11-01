@@ -16,6 +16,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceReuse.h"
+#include "graphics/host_gpu/renderer/pipeline/programLookupMemo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -468,6 +470,7 @@ struct PipelineCache::ProgramCache {
 		// SourceDigest of the code it was made of: a warmup running beside the game adds a record's permutation to a
 		// program the game made only of the same code (TranslateWarmup).
 		uint64_t source_digest = 0;
+		std::unique_ptr<ResourceReuse> reuse;
 		// Prefetched permutations not used yet (AdoptPrefetchedModule).
 		std::vector<PrefetchedModule> prefetched;
 		// Table mode permutations being translated.
@@ -506,6 +509,99 @@ struct PipelineCache::ProgramCache {
 	};
 	std::shared_ptr<PlanLoads> plan_loads = std::make_shared<PlanLoads>();
 	uint64_t                   programs_erased = 0;
+	std::array<ProgramLookupMemo<ProgramKey, SourceEntry, Permutation>, 16> lookup_memos;
+	uint64_t source_memo_hits = 0, source_memo_misses = 0, permutation_memo_hits = 0;
+	static bool LookupMemoEnabled() {
+		static const bool enabled = [] { const auto* s = std::getenv("KYTY_PROGRAM_LOOKUP_MEMO"); return !s || std::strcmp(s, "0") != 0; }();
+		return enabled;
+	}
+	auto* LookupMemo(ShaderType stage) {
+		const auto i = static_cast<size_t>(stage);
+		return LookupMemoEnabled() && i < lookup_memos.size() ? &lookup_memos[i] : nullptr;
+	}
+	SourceEntry* FindSourceMemo(const ProgramKey& key) {
+		auto* memo = LookupMemo(key.stage);
+		if (memo) {
+			if (auto* source = memo->Find(key, programs_erased)) { ++source_memo_hits; return source; }
+		}
+		++source_memo_misses;
+		auto found = programs.find(key);
+		auto* source = found == programs.end() ? nullptr : &found->second;
+		if (memo) memo->Remember(key, source, programs_erased);
+		return source;
+	}
+	size_t reuse_bytes = 0;
+	uint64_t reuse_calls = 0, reuse_hits = 0, reuse_misses = 0, reuse_bypass = 0, reuse_checks = 0, reuse_uncertified = 0;
+	static int ResourceReuseMode() {
+		static const int mode = [] {
+			const char* value = std::getenv("KYTY_RESOURCE_REUSE");
+			return value ? std::atoi(value) : 1;
+		}();
+		return mode;
+	}
+	void DropReuse(SourceEntry& source) {
+		if (source.reuse) { reuse_bytes -= source.reuse->CapacityBytes(); source.reuse.reset(); }
+	}
+	bool MaterializeReusing(SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                        ShaderRecompiler::IR::ResourceSnapshot& resources,
+	                        ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                        ShaderRecompiler::IR::MaterializeReport* report,
+	                        const ShaderRecompiler::IR::ResourceSpecialization** borrowed) {
+		using namespace ShaderRecompiler::IR;
+		*borrowed = nullptr;
+		static constexpr size_t Budget = 64u * 1024u * 1024u;
+		static const bool log = [] { const auto* s = std::getenv("KYTY_RESOURCE_REUSE_LOG"); return s && std::strcmp(s, "0") != 0; }();
+		const auto mode = ResourceReuseMode();
+		++reuse_calls;
+		if (log && (reuse_calls & (reuse_calls - 1)) == 0)
+			std::printf("[RESOURCE-REUSE] calls=%llu hit=%llu miss=%llu bypass=%llu checks=%llu uncertified=%llu bytes=%zu mode=%d source_hit=%llu source_miss=%llu permutation_hit=%llu\n",
+			    (unsigned long long)reuse_calls, (unsigned long long)reuse_hits, (unsigned long long)reuse_misses,
+			    (unsigned long long)reuse_bypass, (unsigned long long)reuse_checks, (unsigned long long)reuse_uncertified, reuse_bytes, mode,
+			    (unsigned long long)source_memo_hits, (unsigned long long)source_memo_misses,
+			    (unsigned long long)permutation_memo_hits);
+		// XPR/capture observers must see actual reads. No reuse during their transaction.
+		if (mode == 0 || ShaderReadObserver::Active() || (!source.reuse && reuse_bytes >= Budget)) {
+			++reuse_bypass;
+			return MaterializeResources(source.resource_plan, runtime, resources, specialization,
+			                            report, &source.specialization_guard, borrowed);
+		}
+		if (!source.reuse) {
+			source.reuse = std::make_unique<ResourceReuse>();
+			reuse_bytes += source.reuse->CapacityBytes();
+		}
+		auto& memo = *source.reuse;
+		thread_local std::array<uint8_t, PreparedResourceReads::MaxBytes> scratch;
+		const auto clean_read = [](uint64_t address, void* data, size_t size) {
+			return LibKernel::Memory::TryReadGpuCleanBackingToHost(address, data, size);
+		};
+		if (memo.Matches(runtime, scratch, clean_read)) {
+			++reuse_hits;
+			if (mode == 2) {
+				++reuse_checks;
+				// The reference must really evaluate all sources (no specialization guard).
+				if (!MaterializeResources(source.resource_plan, runtime, resources, specialization, report) ||
+				    !ResourceReuse::Equal(resources, memo.resources) || specialization != memo.specialization)
+					EXIT("Resource reuse differs from full materialization: shader=0x%016llx\n",
+					     (unsigned long long)source.resource_plan.shader_hash);
+			} else {
+				resources = memo.resources;
+				specialization = memo.specialization;
+			}
+			return true;
+		}
+		++reuse_misses;
+		const auto before = memo.CapacityBytes();
+		const auto observed = memo.Begin(runtime, scratch);
+		// Do not borrow the specialization guard: it could suppress reads required by
+		// this certificate. This is the full evaluator Jetsku uses on a reuse miss.
+		const bool ok = MaterializeResources(source.resource_plan, observed, resources, specialization, report);
+		if (ok) { memo.resources = resources; memo.specialization = specialization; }
+		memo.Finish(ok);
+		reuse_uncertified += !memo.Valid();
+		reuse_bytes += memo.CapacityBytes() - before;
+		if (reuse_bytes > Budget) DropReuse(source);
+		return ok;
+	}
 	void UnlistPlan(SourceEntry& source) {
 		if (!source.plan_listed) return;
 		plans_out_by_use.erase(source.plan_node);
@@ -514,12 +610,14 @@ struct PipelineCache::ProgramCache {
 	// An entry about to be erased: no queue keeps it (rare: a warm program whose code changed).
 	void ForgetPlanLoads(SourceEntry& entry) {
 		UnlistPlan(entry);
+		DropReuse(entry);
 		programs_erased++;
 	}
 
 	// The plan back in the entry (its linear SRT plan kept meanwhile).
 	void RestorePlan(SourceEntry& source, ShaderRecompiler::IR::ResourcePlan plan) {
 		UnlistPlan(source);
+		DropReuse(source);
 		plan.linear_srt      = std::move(source.plan_linear);
 		ShaderRecompiler::IR::BuildActivitySrtPlan(plan);
 		source.resource_plan = std::move(plan);
@@ -2009,29 +2107,29 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && !entry->second.warm_code.empty()) {
-			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
-			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
-				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
-				ForgetPlanLoads(entry->second);
+		auto* entry = FindSourceMemo(lookup_key);
+		if (entry != nullptr && !entry->warm_code.empty()) {
+			if (!std::ranges::equal(params.code, entry->warm_code) ||
+			    !std::ranges::equal(params.back_code, entry->warm_back_code)) {
+				std::erase_if(by_program, [&](const auto& item) { return item.second.first == entry; });
+				ForgetPlanLoads(*entry);
 				// (A warmup beside the game may be making pipelines of its permutations: kept until it is done.)
 				if (warming) {
-					retired.push_back(programs.extract(entry));
+					retired.push_back(programs.extract(lookup_key));
 				} else {
-					for (const auto& p : entry->second.permutations) {
+					for (const auto& p : entry->permutations) {
 						DestroyShaderModule(device, p.handle.module);
 						if (p.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
 					}
-					programs.erase(entry);
+					programs.erase(lookup_key);
 				}
-				entry = programs.end();
+				entry = nullptr;
 			} else {
-				std::vector<uint32_t>().swap(entry->second.warm_code);
-				std::vector<uint32_t>().swap(entry->second.warm_back_code);
+				std::vector<uint32_t>().swap(entry->warm_code);
+				std::vector<uint32_t>().swap(entry->warm_back_code);
 			}
 		}
-		if (entry != programs.end()) EnsurePlan(entry->second);
+		if (entry != nullptr) EnsurePlan(*entry);
 		ShaderRecompiler::IR::ResourceSnapshot temporary_resources;
 		auto& resources = NativePreparationScratchEnabled() ? input_info.stage.resources
 		                                                    : temporary_resources;
@@ -2062,7 +2160,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization table_specialization;
 		const auto table_form = [&](const ShaderRecompiler::IR::ResourceSpecialization& value) {
 			table_specialization = value;
-			const auto& buffers  = entry->second.resource_plan.info.buffers;
+			const auto& buffers  = entry->resource_plan.info.buffers;
 			for (size_t i = 0; i < table_specialization.buffers.size(); ++i) {
 				auto& buffer            = table_specialization.buffers[i];
 				buffer.byte_base_offset = false;
@@ -2076,12 +2174,11 @@ struct PipelineCache::ProgramCache {
 			// one program takes any), the snapshot it binds from padded alike (TableResolveSet).
 			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images);
 		};
-		if (entry != programs.end()) {
+		if (entry != nullptr) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
 			if (!ReportMaterialization(label, stage, params.hash, report,
-			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan, runtime, resources, specialization,
-			                               &report, &entry->second.specialization_guard, &borrowed_specialization)))
+			                           MaterializeReusing(*entry, runtime, resources, specialization,
+			                                              &report, &borrowed_specialization)))
 				return {};
 			if (table_mode) table_form(borrowed_specialization ? *borrowed_specialization : specialization);
 			const auto& active_specialization =
@@ -2091,14 +2188,24 @@ struct PipelineCache::ProgramCache {
 				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 				    push_data_cursor, layout.ShaderDataDwords());
 			};
-			const auto find_permutation = [&] { return std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
-				               candidate.specialization == active_specialization;
-			        }); };
+			const auto find_permutation = [&]() -> const Permutation* {
+				const auto matches = [&](const Permutation& candidate) {
+					return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
+					       candidate.specialization == active_specialization;
+				};
+				auto* memo = LookupMemo(stage);
+				if (memo && memo->Find(lookup_key, programs_erased) == entry && memo->permutation && matches(*memo->permutation)) {
+					++permutation_memo_hits;
+					return memo->permutation;
+				}
+				const auto found = std::ranges::find_if(entry->permutations, matches);
+				const auto* result = found == entry->permutations.end() ? nullptr : &*found;
+				if (memo) { memo->Remember(lookup_key, entry, programs_erased); memo->permutation = result; }
+				return result;
+			};
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
-			auto& source = entry->second;
+			auto& source = *entry;
 			if (!table_mode && borrowed_specialization && source.guarded_permutation &&
 			    source.guarded_publication == source.specialization_guard.publication &&
 			    compatible_push_data(*source.guarded_permutation)) {
@@ -2107,8 +2214,7 @@ struct PipelineCache::ProgramCache {
 				selected->program.bindings.AdvancePushData(push_data_cursor);
 				return selected->handle;
 			}
-			if (const auto permutation = find_permutation();
-			    permutation != entry->second.permutations.end()) {
+			if (const auto* permutation = find_permutation()) {
 				if (!permutation->handle) return {}; // table mode refused
 				// Only a borrowed result certifies this exact guard publication.
 				// An ineligible reference transaction must not relabel an old guard.
@@ -2158,8 +2264,8 @@ struct PipelineCache::ProgramCache {
 		// Table mode: a program the normal path compiled first, in the table form of its specialization, translated
 		// by a compile worker (table_pending until then); a refused one keeps an empty permutation.
 		if (table_mode) {
-			if (entry == programs.end()) return {};
-			auto&      jobs  = entry->second.table_jobs;
+			if (entry == nullptr) return {};
+			auto&      jobs  = entry->table_jobs;
 			const auto found = std::ranges::find_if(jobs, [&](const auto& job) {
 				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
 			});
@@ -2224,7 +2330,7 @@ struct PipelineCache::ProgramCache {
 					std::printf("Table: %s 0x%016llx: %s", label, static_cast<unsigned long long>(params.hash),
 					            job->refused.c_str());
 			}
-			const auto& stored = entry->second.permutations.emplace_back(std::move(permutation));
+			const auto& stored = entry->permutations.emplace_back(std::move(permutation));
 			if (!stored.handle) return {};
 			publish_stage(stored.program);
 			stored.program.bindings.AdvancePushData(push_data_cursor);
@@ -2232,20 +2338,20 @@ struct PipelineCache::ProgramCache {
 		}
 		// A program met for the first time that the prefetch translated: its plan, materialized for
 		// this draw, and its modules are taken over.
-		if (entry == programs.end()) {
+		if (entry == nullptr) {
 			if (auto* group = PrefetchedGroup(params)) {
 				if (!ReportMaterialization(label, stage, params.hash, report,
 				                           ShaderRecompiler::IR::MaterializeResources(*group->plan, runtime, resources,
 				                                                                      specialization, &report)))
 					return {};
-				entry = programs.try_emplace(lookup_key, std::move(*group->plan)).first;
-				entry->second.source_digest = group->source;
-				entry->second.prefetched = std::move(group->modules);
+				entry = &programs.try_emplace(lookup_key, std::move(*group->plan)).first->second;
+				entry->source_digest = group->source;
+				entry->prefetched = std::move(group->modules);
 				// (Bytes written without the linear SRT plan LoadSpilledPlan made since are not the plan's now: a sweep
 				// writes its own, else a plan brought back would not match the linear SRT plan kept for it.)
 				if (!group->plan_linear_dropped)
-					entry->second.plan_spilled = {prefetch->spill, group->plan_offset, group->plan_bytes, group->plan_raw};
-				entry->second.plan_use     = plan_clock;
+					entry->plan_spilled = {prefetch->spill, group->plan_offset, group->plan_bytes, group->plan_raw};
+				entry->plan_use     = plan_clock;
 				group->plan.reset();
 			}
 		}
@@ -2254,13 +2360,13 @@ struct PipelineCache::ProgramCache {
 		const auto source_begin = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		bool       translated_here = false;
 		double     translate_ms    = 0.0;
-		const auto adopt = [&] { return AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor); };
-		if (entry == programs.end() ||
-		    (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr))) {
+		const auto adopt = [&] { return AdoptPrefetchedModule(*entry, options, specialization, push_data_cursor); };
+		if (entry == nullptr ||
+		    (adopt() == nullptr && (!TakePrefetchedModules(*entry, params) || adopt() == nullptr))) {
 			translated_here = true;
 			// With the slow-call log: the translation's specialization-independent part (front) and
 			// whether the program had other permutations already.
-			const bool known_program = entry != programs.end();
+			const bool known_program = entry != nullptr;
 			const auto front_begin   = std::chrono::steady_clock::now();
 			double     front_ms      = 0.0;
 			SlowLog::Scope translate_slow([&](double ms) {
@@ -2272,15 +2378,15 @@ struct PipelineCache::ProgramCache {
 			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			translate_ms = front_ms;
-			if (entry == programs.end()) {
+			if (entry == nullptr) {
 				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 				if (!ReportMaterialization(label, stage, params.hash, report,
 				                           ShaderRecompiler::IR::MaterializeResources(
 				                               resource_plan, runtime, resources, specialization, &report)))
 					return {};
-				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
-				entry->second.plan_use      = plan_clock;
-				entry->second.source_digest = SourceDigest(params.code, params.back_code);
+				entry = &programs.try_emplace(lookup_key, std::move(resource_plan)).first->second;
+				entry->plan_use      = plan_clock;
+				entry->source_digest = SourceDigest(params.code, params.back_code);
 			}
 			// A specialization met for the first time whose formatted buffers can decode their formats at
 			// run time gets the portable module (IR::PortableFormats) under its own specialization: the
@@ -2288,19 +2394,19 @@ struct PipelineCache::ProgramCache {
 			// up this draw. The warmup file records the exact specialization, and the next start compiles
 			// its specialized module.
 			auto portable = specialization;
-			if (ShaderRecompiler::IR::PortableFormats(entry->second.resource_plan.info, portable)) {
-				entry->second.permutations.push_back(CompilePermutation(
+			if (ShaderRecompiler::IR::PortableFormats(entry->resource_plan.info, portable)) {
+				entry->permutations.push_back(CompilePermutation(
 				    params, options, std::move(translated), std::move(portable), push_data_cursor));
-				entry->second.permutations.back().specialization = std::move(specialization);
+				entry->permutations.back().specialization = std::move(specialization);
 			} else {
-				entry->second.permutations.push_back(CompilePermutation(
+				entry->permutations.push_back(CompilePermutation(
 				    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 			}
 			render_translations++;
 			render_translate_ms +=
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 		}
-		const auto& permutation = entry->second.permutations.back();
+		const auto& permutation = entry->permutations.back();
 		if (PipelineSourceLog())
 			std::printf("PROGSRC %s hash=%016llx translated=%d translate_ms=%.1f ms=%.1f\n", label,
 			            static_cast<unsigned long long>(params.hash), translated_here ? 1 : 0, translate_ms,

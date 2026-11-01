@@ -4,6 +4,7 @@ using Avalonia.Animation;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
 using Avalonia.Input;
+using Avalonia.Input.Platform;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
@@ -15,7 +16,10 @@ namespace Nova5;
 
 public sealed class MainWindow : Window
 {
-	private enum Zone { Tiles, Buttons, Settings, Prompt }
+	private enum Zone { Tiles, Buttons, Settings, Prompt, Notes, GameOptions, Trophies, TrophyList, TextEntry, Keys, Choice }
+
+	private const int TrophiesTab = 1;
+	private const int SettingsTab = 2;
 
 	private const double TileSize   = 168;
 	private const double FocusSize  = 236;
@@ -49,8 +53,62 @@ public sealed class MainWindow : Window
 	private readonly Border[]   _buttons;
 	private readonly StackPanel _stats = new() { Spacing = 0 };
 	private readonly Panel      _gamesPage = new();
-	private readonly StackPanel _settingsList = new() { Spacing = 10, Width = 1100 };
+	private readonly StackPanel _settingsList = new() { Spacing = 6 };
+	private readonly ScrollViewer _settingsScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
 	private readonly Panel      _settingsPage = new() { IsVisible = false };
+	private readonly StackPanel _notesList = new() { Spacing = 34 };
+	private readonly ScrollViewer _notesScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+	private readonly TextBlock  _notesTitle = Text("", 44, FontWeight.Black);
+	private Border              _notes = new();
+	private Zone                _beforeNotes;
+	private readonly StackPanel _gameList = new() { Spacing = 6 };
+	private readonly ScrollViewer _gameScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+	private readonly TextBlock  _gameTitle = Text("", 44, FontWeight.Black);
+	private Border              _gameSheet = new();
+	private Game?               _optionsGame;
+	private GamePatches?        _patches;
+	private int                 _gameOption;
+	private bool                _downloadingPatches;
+	private Game?               _packing;
+	private double              _packProgress;
+	private string?             _confirmDelete;
+	private CancellationTokenSource? _packCancel;
+	private readonly TextBlock  _packText = Text("", 20, FontWeight.SemiBold, Palette.AuroraA);
+	private Border              _packPill = new();
+	private (string Folder, string Archive)? _zarTest;
+	private Border              _choiceSheet = new();
+	private readonly TextBlock  _choiceTitle = Text("", 40, FontWeight.Black);
+	private readonly TextBlock  _choiceMessage = new() { FontSize = 22, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 14) };
+	private readonly StackPanel _choiceList = new() { Spacing = 6 };
+	private List<Setting>       _choices = new();
+	private int                 _choiceIndex;
+	private Zone                _beforeChoice;
+	private readonly Border     _gameTrophies = new() { IsVisible = false };
+	private readonly Dictionary<string, TrophySet?> _trophyCache = new(StringComparer.OrdinalIgnoreCase);
+	private TrophySet?          _stripSet;
+	private readonly Panel      _trophiesPage = new() { IsVisible = false };
+	private Border?             _trophyPanel; // Hidden under a game's trophy list, which would show through it.
+	private readonly StackPanel _trophyGames = new() { Spacing = 6 };
+	private readonly ScrollViewer _trophyScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+	private readonly StackPanel _trophySummary = new() { Orientation = Orientation.Horizontal, Spacing = 26, Margin = new Thickness(0, 0, 0, 18) };
+	private List<TrophySet>     _trophySets = new();
+	private int                 _trophyIndex;
+	private readonly StackPanel _trophyList = new() { Spacing = 6 };
+	private readonly ScrollViewer _trophyListScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+	private readonly TextBlock  _trophyListTitle = Text("", 44, FontWeight.Black);
+	private readonly StackPanel _trophyListSummary = new() { Orientation = Orientation.Horizontal, Spacing = 26, Margin = new Thickness(0, 0, 0, 18) };
+	private Border              _trophySheet = new();
+	private Border              _textSheet = new();
+	private readonly TextBlock  _textTitle = Text("", 40, FontWeight.Black);
+	private readonly TextBox    _textBox = new() { FontSize = 30, MaxLength = 16, Width = 900, Padding = new Thickness(18, 12) };
+	private Action<string>?     _textDone;
+	private Zone                _beforeText;
+	private Border              _keysSheet = new();
+	private readonly StackPanel _keysList = new() { Spacing = 6 };
+	private readonly ScrollViewer _keysScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+	private Dictionary<string, string> _keymap = new();
+	private int                 _keyIndex;
+	private string?             _capturing;
 	private readonly TextBlock[] _tabs;
 	private readonly TextBlock  _clock = Text("", 22, FontWeight.SemiBold);
 	private readonly TextBlock  _padStatus = Text("Sin mando", 20, FontWeight.Normal, Palette.Muted);
@@ -75,8 +133,8 @@ public sealed class MainWindow : Window
 		Height     = 900;
 		WindowState = SnapshotPath is null ? WindowState.FullScreen : WindowState.Normal;
 
-		_buttons = new[] { ActionButton("Jugar", primary: true), ActionButton("Ajustes"), ActionButton("Abrir carpeta") };
-		_tabs    = new[] { Text("Juegos", 24, FontWeight.SemiBold), Text("Ajustes", 24, FontWeight.Normal, Palette.Muted) };
+		_buttons = new[] { ActionButton("Jugar", primary: true), ActionButton("Opciones del juego"), ActionButton("Abrir carpeta") };
+		_tabs    = new[] { Text("Juegos", 24, FontWeight.SemiBold), Text("Trofeos", 24, FontWeight.Normal, Palette.Muted), Text("Ajustes", 24, FontWeight.Normal, Palette.Muted) };
 		_toastBox = new Border
 		{
 			Child = _toast, Padding = new Thickness(28, 14), CornerRadius = new CornerRadius(16), Opacity = 0,
@@ -84,6 +142,12 @@ public sealed class MainWindow : Window
 			Transitions = new Transitions { new DoubleTransition { Property = OpacityProperty, Duration = TimeSpan.FromMilliseconds(250) } },
 		};
 		_prompt = BuildPrompt();
+		_notes  = BuildNotes();
+		_gameSheet = BuildGameOptions();
+		_trophySheet = BuildTrophySheet();
+		_textSheet = BuildTextEntry();
+		_keysSheet = BuildKeys();
+		_choiceSheet = BuildChoice();
 		Content = BuildLayout();
 
 		_music.Enabled = _store.Music;
@@ -107,7 +171,7 @@ public sealed class MainWindow : Window
 		};
 		PointerWheelChanged += (_, e) =>
 		{
-			if (_running is not null || _zone == Zone.Prompt) return;
+			if (_running is not null || _zone is Zone.Prompt or Zone.Notes or Zone.GameOptions or Zone.TrophyList or Zone.TextEntry or Zone.Keys or Zone.Choice) return;
 			OnInput(e.Delta.Y < 0 ? (_tab == 0 ? PadInput.Right : PadInput.Down) : (_tab == 0 ? PadInput.Left : PadInput.Up));
 		};
 		PropertyChanged += (_, e) =>
@@ -118,8 +182,19 @@ public sealed class MainWindow : Window
 		{
 			Reload();
 			_fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
-			if (SnapshotPath is { } snapshot) DispatcherTimer.RunOnce(() => SaveSnapshot(snapshot), TimeSpan.FromSeconds(4));
-			else if (_store.UpdateMode != "no") DispatcherTimer.RunOnce(() => CheckUpdates(false), TimeSpan.FromSeconds(3));
+			if (SnapshotPath is { } snapshot)
+			{
+				if (SnapshotNotes) ShowNotes(ReleaseNotes.Since(null, Updates.Current), firstTime: false);
+				if (SnapshotSettings) ShowTab(SettingsTab);
+				if (SnapshotTrophies) ShowTab(TrophiesTab);
+				if (SnapshotTrophyList && _trophySets.FirstOrDefault() is { } first) ShowTrophyList(first);
+				if (SnapshotGame && _games.FirstOrDefault(g => g.Package is null) is { } shown) ShowGameOptions(shown);
+				DispatcherTimer.RunOnce(() => SaveSnapshot(snapshot), TimeSpan.FromSeconds(4));
+				return;
+			}
+			// A new version (or a first run) shows what it brings, once.
+			if (_store.SeenNotes != Updates.Current.ToString()) ShowNotes(ReleaseNotes.Since(_store.SeenNotes, Updates.Current), firstTime: true);
+			if (_store.UpdateMode != "no") DispatcherTimer.RunOnce(() => CheckUpdates(false), TimeSpan.FromSeconds(3));
 		};
 		Closed  += (_, _) =>
 		{
@@ -155,6 +230,13 @@ public sealed class MainWindow : Window
 		_updatePill.Cursor      = new Cursor(StandardCursorType.Hand);
 		_updatePill.PointerPressed += (_, _) => StartUpdate();
 		status.Children.Add(_updatePill);
+		// While a game is being packed into .zar: its progress everywhere; a click offers to cancel.
+		_packPill = Pill(_packText);
+		_packPill.IsVisible   = false;
+		_packPill.BorderBrush = Palette.Aurora();
+		_packPill.Cursor      = new Cursor(StandardCursorType.Hand);
+		_packPill.PointerPressed += (_, _) => AskCancelPack();
+		status.Children.Add(_packPill);
 		status.Children.Add(Pill(_padStatus));
 		status.Children.Add(_clock);
 		var statusDock = new DockPanel { Width = 1920 - 144, LastChildFill = false };
@@ -197,6 +279,10 @@ public sealed class MainWindow : Window
 		}
 		info.Children.Add(actions);
 		Place(_gamesPage, info, 72, 640);
+		// The selected game's trophies, between the covers and its name.
+		Place(_gamesPage, _gameTrophies, 72, 486);
+		_gameTrophies.Cursor = new Cursor(StandardCursorType.Hand);
+		_gameTrophies.PointerPressed += (_, _) => OpenStripTrophies();
 
 		var statsBox = _statsBox = new Border
 		{
@@ -207,11 +293,25 @@ public sealed class MainWindow : Window
 		Place(_gamesPage, statsBox, 1920 - 72 - 440, 650);
 		stage.Children.Add(_gamesPage);
 
-		// Settings page.
-		var settingsTitle = Text("Ajustes del emulador", 44, FontWeight.Bold);
-		Place(_settingsPage, settingsTitle, 72, 200);
-		Place(_settingsPage, _settingsList, 72, 290);
+		// Settings page: one panel whose list scrolls (pad, keys and wheel), like Nexo's options.
+		_settingsScroll.Content = _settingsList;
+		var settingsPanel = Sheet("Ajustes", "▲ ▼ elegir     A ▸ cambiar     ◂ valor anterior     B volver", _settingsScroll, () => ShowTab(0), "B  Volver");
+		settingsPanel.Width  = 1320;
+		settingsPanel.Height = 790;
+		Place(_settingsPage, settingsPanel, (1920 - 1320) / 2.0, 186);
 		stage.Children.Add(_settingsPage);
+
+		// Trophies page: every game's progress; A opens its list.
+		var trophyContent = new DockPanel();
+		DockPanel.SetDock(_trophySummary, Dock.Top);
+		trophyContent.Children.Add(_trophySummary);
+		_trophyScroll.Content = _trophyGames;
+		trophyContent.Children.Add(_trophyScroll);
+		var trophyPanel = _trophyPanel = Sheet("Trofeos", "▲ ▼ elegir     A ver trofeos     B volver", trophyContent, () => ShowTab(0), "B  Volver");
+		trophyPanel.Width  = 1320;
+		trophyPanel.Height = 790;
+		Place(_trophiesPage, trophyPanel, (1920 - 1320) / 2.0, 186);
+		stage.Children.Add(_trophiesPage);
 
 		var hints = new DockPanel { Width = 1920 - 144, LastChildFill = false };
 		var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 34 };
@@ -231,6 +331,12 @@ public sealed class MainWindow : Window
 		Place(stage, toastDock, 0, 1080 - 170);
 
 		Place(stage, _prompt, 0, 0);
+		Place(stage, _gameSheet, 0, 0);
+		Place(stage, _trophySheet, 0, 0);
+		Place(stage, _keysSheet, 0, 0);
+		Place(stage, _choiceSheet, 0, 0);
+		Place(stage, _textSheet, 0, 0);
+		Place(stage, _notes, 0, 0);
 
 		var root = new Grid { Background = Palette.Brush(Palette.Night) };
 		root.Children.Add(_backA);
@@ -309,13 +415,1084 @@ public sealed class MainWindow : Window
 		};
 	}
 
+	// A titled panel in Nexo's style: "NOVA5 <version>" over the title, a close pill, the content and a key line.
+	private static Border Sheet(string title, string keys, Control content, Action close, string closeLabel)
+	{
+		var heading = new StackPanel { Spacing = 2 };
+		heading.Children.Add(new TextBlock
+		{
+			Text = $"NOVA5 {Updates.Current}", FontSize = 17, FontWeight = FontWeight.SemiBold, LetterSpacing = 1.5,
+			Foreground = Palette.Brush(Palette.AuroraA),
+		});
+		heading.Children.Add(title.Length > 0 ? Text(title, 44, FontWeight.Black) : new Panel());
+		var closer = Clickable(Pill(Text(closeLabel, 19, FontWeight.Bold, Palette.Muted)), close);
+		closer.VerticalAlignment = VerticalAlignment.Top;
+		var header = new DockPanel { Margin = new Thickness(0, 0, 0, 18) };
+		DockPanel.SetDock(closer, Dock.Right);
+		header.Children.Add(closer);
+		header.Children.Add(heading);
+
+		var footer = new TextBlock
+		{
+			Text = keys, FontSize = 18, Foreground = Palette.Brush(Palette.Muted), HorizontalAlignment = HorizontalAlignment.Center,
+			Margin = new Thickness(0, 14, 0, 0),
+		};
+		var layout = new DockPanel();
+		DockPanel.SetDock(header, Dock.Top);
+		DockPanel.SetDock(footer, Dock.Bottom);
+		layout.Children.Add(header);
+		layout.Children.Add(footer);
+		layout.Children.Add(content);
+		return new Border
+		{
+			Child = layout, Padding = new Thickness(40, 30, 40, 22), CornerRadius = new CornerRadius(30),
+			Background = Palette.Brush(Palette.Ink, 0.94), BorderBrush = Palette.Brush(Colors.White, 0.12), BorderThickness = new Thickness(1),
+			BoxShadow = BoxShadows.Parse("0 30 80 0 #A0000000"),
+		};
+	}
+
+	// ---- Release notes ------------------------------------------------------------------------
+
+	// Shown once after an update (and from Settings > Información de la versión); A or B closes it.
+	private Border BuildNotes()
+	{
+		_notesScroll.Content = _notesList;
+		var content = new DockPanel();
+		_notesTitle.Margin = new Thickness(0, 0, 0, 20);
+		_notesTitle.TextWrapping = TextWrapping.Wrap;
+		DockPanel.SetDock(_notesTitle, Dock.Top);
+		content.Children.Add(_notesTitle);
+		content.Children.Add(_notesScroll);
+		var sheet = Sheet("", "▲ ▼ desplazar     A o B cerrar     Vuelve a verlas en Ajustes › Información de la versión", content, CloseNotes, "B  Cerrar");
+		sheet.Width  = 1180;
+		sheet.Height = 820;
+		sheet.HorizontalAlignment = HorizontalAlignment.Center;
+		sheet.VerticalAlignment   = VerticalAlignment.Center;
+		sheet.PointerPressed += (_, e) => e.Handled = true; // Clicks inside do not reach the backdrop.
+		var backdrop = new Border
+		{
+			Width = 1920, Height = 1080, IsVisible = false, Background = Palette.Brush(Palette.Night, 0.8), Child = sheet,
+		};
+		backdrop.PointerPressed += (_, _) => CloseNotes();
+		return backdrop;
+	}
+
+	private void ShowNotes(List<ReleaseNote> notes, bool firstTime)
+	{
+		if (notes.Count == 0) return;
+		_notesTitle.Text = firstTime ? $"Novedades de Nova5 {Updates.Current}" : "Información de la versión";
+		_notesList.Children.Clear();
+		foreach (var note in notes)
+		{
+			var block = new StackPanel { Spacing = 10 };
+			var date  = DateTime.TryParse(note.Date, out var day) ? " · " + day.ToString("d 'de' MMMM 'de' yyyy", new System.Globalization.CultureInfo("es-ES")) : "";
+			block.Children.Add(Text($"VERSIÓN {note.Version}{date}", 18, FontWeight.SemiBold, Palette.AuroraA));
+			block.Children.Add(new TextBlock { Text = note.Title, FontSize = 30, FontWeight = FontWeight.Bold, Foreground = Palette.Brush(Palette.Text), TextWrapping = TextWrapping.Wrap });
+			foreach (var item in note.Items)
+			{
+				var line = new DockPanel { Margin = new Thickness(0, 4, 0, 0) };
+				var dot  = new Ellipse { Width = 9, Height = 9, Fill = Palette.Aurora(), VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(4, 12, 18, 0) };
+				DockPanel.SetDock(dot, Dock.Left);
+				line.Children.Add(dot);
+				line.Children.Add(new TextBlock { Text = item, FontSize = 23, LineHeight = 33, Foreground = Palette.Brush(Palette.Text, 0.88), TextWrapping = TextWrapping.Wrap });
+				block.Children.Add(line);
+			}
+			_notesList.Children.Add(block);
+		}
+		_notesScroll.Offset = default;
+		if (_zone != Zone.Notes) _beforeNotes = _zone;
+		_notes.IsVisible = true;
+		_zone = Zone.Notes;
+	}
+
+	private void CloseNotes()
+	{
+		if (_zone != Zone.Notes) return;
+		_notes.IsVisible = false;
+		_zone = _beforeNotes;
+		if (_store.SeenNotes != Updates.Current.ToString())
+		{
+			_store.SeenNotes = Updates.Current.ToString();
+			_store.Save();
+		}
+	}
+
+	private void NotesInput(PadInput input)
+	{
+		switch (input)
+		{
+			case PadInput.Up:   _notesScroll.Offset = _notesScroll.Offset.WithY(Math.Max(0, _notesScroll.Offset.Y - 140)); break;
+			case PadInput.Down: _notesScroll.Offset = _notesScroll.Offset.WithY(_notesScroll.Offset.Y + 140); break;
+			case PadInput.Accept or PadInput.Back: CloseNotes(); break;
+		}
+	}
+
+	// ---- Keyboard and mouse -------------------------------------------------------------------
+
+	// Each DualSense control with its key: A (or a click) waits for a key or mouse button, Supr clears, Esc cancels.
+	private Border BuildKeys()
+	{
+		_keysScroll.Content = _keysList;
+		var sheet = Sheet("Teclado y ratón", "▲ ▼ elegir     A asignar (pulsa una tecla o un botón del ratón)     Supr quitar     B cerrar", _keysScroll, CloseKeys, "B  Cerrar");
+		sheet.Width  = 1320;
+		sheet.Height = 860;
+		sheet.HorizontalAlignment = HorizontalAlignment.Center;
+		sheet.VerticalAlignment   = VerticalAlignment.Center;
+		sheet.PointerPressed += (_, e) => e.Handled = true;
+		// While a control waits, a click is the mouse button to give it.
+		sheet.AddHandler(PointerPressedEvent, (_, e) =>
+		{
+			if (_capturing is null) return;
+			var point = e.GetCurrentPoint(sheet).Properties;
+			StopCapture(point.IsRightButtonPressed ? "Mouse:Right" : point.IsMiddleButtonPressed ? "Mouse:Middle"
+			    : point.IsXButton1Pressed ? "Mouse:X1" : point.IsXButton2Pressed ? "Mouse:X2" : "Mouse:Left");
+			e.Handled = true;
+		}, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+		var backdrop = new Border { Width = 1920, Height = 1080, IsVisible = false, Background = Palette.Brush(Palette.Night, 0.8), Child = sheet };
+		backdrop.PointerPressed += (_, _) => { if (_capturing is null) CloseKeys(); };
+		return backdrop;
+	}
+
+	private void ShowKeys()
+	{
+		_keymap   = Keymap.Load(_emulator.Ini.Get("GlobalConfiguration", "keymap"));
+		_keyIndex = 0;
+		_capturing = null;
+		_keysScroll.Offset = default;
+		BuildKeyRows();
+		_keysSheet.IsVisible = true;
+		_zone = Zone.Keys;
+	}
+
+	private void CloseKeys()
+	{
+		if (_zone != Zone.Keys) return;
+		_capturing = null;
+		_keysSheet.IsVisible = false;
+		_zone = Zone.Settings;
+		BuildSettings();
+	}
+
+	private static readonly double[] Sensitivities = { 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3 };
+
+	private List<Setting> KeyOptions()
+	{
+		var list = Keymap.Controls.Select(c => new Setting(c.Label, "", () => _capturing == c.Name ? "Pulsa una tecla…" : Keymap.Show(_keymap.GetValueOrDefault(c.Name, "")),
+		    _ => { _capturing = c.Name; })).ToList();
+		list.Add(new("Sensibilidad del ratón", "Para mover la cámara con el ratón: F7 lo activa dentro del juego.",
+		    () => $"{Sensitivity():0.##}×", step =>
+		    {
+			    var now = Array.IndexOf(Sensitivities, Sensitivity());
+			    SetIni("mouse_sensitivity", Sensitivities[(Math.Max(now, 2) + step + Sensitivities.Length) % Sensitivities.Length].ToString(System.Globalization.CultureInfo.InvariantCulture));
+		    }));
+		list.Add(new("Restablecer", "Vuelve a las teclas de Nova5 para todos los botones.", () => "Restablecer ›", _ =>
+		{
+			_keymap = new Dictionary<string, string>(Keymap.Defaults);
+			SetIni("keymap", "");
+			ShowToast("Teclas restablecidas");
+		}));
+		return list;
+	}
+
+	private double Sensitivity() =>
+	    double.TryParse(_emulator.Ini.Get("GlobalConfiguration", "mouse_sensitivity"), System.Globalization.NumberStyles.Float,
+	        System.Globalization.CultureInfo.InvariantCulture, out var value) ? value : 1;
+
+	private void BuildKeyRows(bool reveal = false)
+	{
+		_keysList.Children.Clear();
+		var options = KeyOptions();
+		_keyIndex = Math.Clamp(_keyIndex, 0, options.Count - 1);
+		for (var i = 0; i < options.Count; i++)
+		{
+			var index = i;
+			_keysList.Children.Add(OptionRow(options[i], i == _keyIndex, step =>
+			{
+				if (_zone != Zone.Keys || _capturing is not null) return;
+				_keyIndex = index;
+				KeyOptions()[index].Change(step);
+				BuildKeyRows();
+			}));
+		}
+		if (reveal && _keysList.Children[_keyIndex] is Control chosen)
+			Dispatcher.UIThread.Post(() => chosen.BringIntoView(), DispatcherPriority.Loaded);
+	}
+
+	// Gives the waiting control that input ("" clears it, null cancels); an input belongs to one control only.
+	private void StopCapture(string? input)
+	{
+		if (_capturing is not { } control) return;
+		_capturing = null;
+		if (input is not null)
+		{
+			if (input.Length > 0)
+				foreach (var other in _keymap.Where(m => m.Key != control && m.Value == input).Select(m => m.Key).ToList()) _keymap[other] = "";
+			_keymap[control] = input;
+			SetIni("keymap", Keymap.Save(_keymap));
+		}
+		BuildKeyRows();
+	}
+
+	private void KeysInput(PadInput input)
+	{
+		if (_capturing is not null)
+		{
+			if (input == PadInput.Back) StopCapture(null);
+			return;
+		}
+		var options = KeyOptions();
+		switch (input)
+		{
+			case PadInput.Up:   _keyIndex = Math.Max(0, _keyIndex - 1); break;
+			case PadInput.Down: _keyIndex = Math.Min(options.Count - 1, _keyIndex + 1); break;
+			case PadInput.Left: options[_keyIndex].Change(-1); break;
+			case PadInput.Right or PadInput.Accept: options[_keyIndex].Change(1); break;
+			case PadInput.Back: CloseKeys(); return;
+		}
+		BuildKeyRows(reveal: true);
+	}
+
+	// ---- Text entry ---------------------------------------------------------------------------
+
+	// A one-line text box over everything (the keyboard types; Enter or A saves, Escape or B cancels).
+	private Border BuildTextEntry()
+	{
+		var content = new StackPanel { Spacing = 22 };
+		content.Children.Add(_textTitle);
+		content.Children.Add(_textBox);
+		var sheet = Sheet("", "Enter o A guardar     Esc o B cancelar", content, () => CloseText(false), "B  Cancelar");
+		sheet.Width = 1000;
+		sheet.HorizontalAlignment = HorizontalAlignment.Center;
+		sheet.VerticalAlignment   = VerticalAlignment.Center;
+		sheet.PointerPressed += (_, e) => e.Handled = true;
+		return new Border { Width = 1920, Height = 1080, IsVisible = false, Background = Palette.Brush(Palette.Night, 0.8), Child = sheet };
+	}
+
+	private void AskText(string title, string current, Action<string> done)
+	{
+		_textTitle.Text = title;
+		_textBox.Text   = current;
+		_textDone       = done;
+		_beforeText     = _zone;
+		_zone           = Zone.TextEntry;
+		_textSheet.IsVisible = true;
+		Dispatcher.UIThread.Post(() => { _textBox.Focus(); _textBox.SelectAll(); }, DispatcherPriority.Loaded);
+	}
+
+	private void CloseText(bool save)
+	{
+		if (_zone != Zone.TextEntry) return;
+		_textSheet.IsVisible = false;
+		_zone = _beforeText;
+		if (save && _textBox.Text?.Trim() is { Length: > 0 } text) _textDone?.Invoke(text);
+		if (_zone == Zone.Settings) BuildSettings();
+	}
+
+	// ---- Trophies -----------------------------------------------------------------------------
+
+	// Under the covers: the selected game's trophy progress and its latest trophies (read once per game; a game
+	// that closes may have new ones).
+	private void ShowGameTrophies(Game game)
+	{
+		if (!_trophyCache.TryGetValue(game.Dir, out var set))
+		{
+			set = Trophies.Load(_emulator.BaseDir, game, _emulator.Ini.Get("GlobalConfiguration", "user_id") ?? "1000",
+			    _emulator.Ini.Get("GlobalConfiguration", "console_language") ?? "1");
+			_trophyCache[game.Dir] = set;
+		}
+		_stripSet = set;
+		_gameTrophies.IsVisible = set is not null;
+		if (set is null) return;
+
+		var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 22, VerticalAlignment = VerticalAlignment.Center };
+		row.Children.Add(Cup(TrophyGrade.Platinum, 40));
+		row.Children.Add(Text($"{set.Percent} %", 34, FontWeight.Bold));
+		var summary = new StackPanel { Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+		summary.Children.Add(Text($"{set.Earned} de {set.Trophies.Count} trofeos", 20, FontWeight.SemiBold, Palette.Muted));
+		var bar = new Grid { Width = 220, Height = 6 };
+		bar.Children.Add(new Border { CornerRadius = new CornerRadius(3), Background = Palette.Brush(Colors.White, 0.12) });
+		bar.Children.Add(new Border { CornerRadius = new CornerRadius(3), Background = Palette.Aurora(), HorizontalAlignment = HorizontalAlignment.Left,
+		                              Width = Math.Max(6, 220 * set.Percent / 100.0), IsVisible = set.Earned > 0 });
+		summary.Children.Add(bar);
+		row.Children.Add(summary);
+		var counts = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 18, VerticalAlignment = VerticalAlignment.Center };
+		FillCounts(counts, set.Count, null);
+		row.Children.Add(counts);
+		// The latest ones earned, newest first.
+		foreach (var trophy in set.Trophies.Where(t => t.Unlocked is not null && t.Icon is not null).OrderByDescending(t => t.Unlocked).Take(5))
+		{
+			try
+			{
+				row.Children.Add(new Border
+				{
+					Width = 56, Height = 56, CornerRadius = new CornerRadius(10), ClipToBounds = true, VerticalAlignment = VerticalAlignment.Center,
+					BorderBrush = Palette.Brush(GradeColor(trophy.Grade), 0.8), BorderThickness = new Thickness(2),
+					Child = new Image { Source = new Bitmap(new MemoryStream(trophy.Icon!)), Stretch = Stretch.UniformToFill },
+					[ToolTip.TipProperty] = trophy.Name,
+				});
+			}
+			catch (Exception e) when (e is ArgumentException or NotSupportedException or InvalidOperationException)
+			{
+			}
+		}
+		_gameTrophies.Child = new Border
+		{
+			Child = row, Padding = new Thickness(22, 12), CornerRadius = new CornerRadius(20),
+			Background = Palette.Brush(Palette.Ink, 0.62), BorderBrush = Palette.Brush(Colors.White, 0.1), BorderThickness = new Thickness(1),
+		};
+	}
+
+	private static Color GradeColor(TrophyGrade grade) => grade switch
+	{
+		TrophyGrade.Platinum => Color.Parse("#A9DCF5"), TrophyGrade.Gold => Color.Parse("#F2C14E"),
+		TrophyGrade.Silver => Color.Parse("#C8D0DA"), _ => Color.Parse("#D08A57"),
+	};
+
+	private static string GradeName(TrophyGrade grade) => grade switch
+	{
+		TrophyGrade.Platinum => "Platino", TrophyGrade.Gold => "Oro", TrophyGrade.Silver => "Plata", _ => "Bronce",
+	};
+
+	// A trophy cup in the grade's colour, drawn so it needs no emoji or icon font.
+	private static Control Cup(TrophyGrade grade, double size) => new Viewbox
+	{
+		Width = size, Height = size, VerticalAlignment = VerticalAlignment.Center,
+		Child = new Avalonia.Controls.Shapes.Path
+		{
+			Data = Geometry.Parse("M7,2 H17 V4 H21 V7 C21,9.8 19,11.6 16.4,11.9 C15.6,13.6 14.1,14.8 13,15.1 V18 H16 V21 H8 V18 H11 V15.1 C9.9,14.8 8.4,13.6 7.6,11.9 C5,11.6 3,9.8 3,7 V4 H7 Z M5,6 V7 C5,8.3 5.8,9.4 7,9.8 V6 Z M17,6 V9.8 C18.2,9.4 19,8.3 19,7 V6 Z"),
+			Fill = Palette.Brush(GradeColor(grade)),
+		},
+	};
+
+	// "🏆 3/12" counters for each grade, with an optional total in front.
+	private static void FillCounts(StackPanel panel, Func<TrophyGrade, (int Earned, int Total)> count, string? lead)
+	{
+		panel.Children.Clear();
+		if (lead is not null) panel.Children.Add(Text(lead, 22, FontWeight.SemiBold));
+		foreach (var grade in Enum.GetValues<TrophyGrade>())
+		{
+			var (earned, total) = count(grade);
+			if (total == 0) continue;
+			var item = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+			item.Children.Add(Cup(grade, 26));
+			item.Children.Add(Text($"{earned}/{total}", 20, FontWeight.SemiBold, Palette.Muted));
+			panel.Children.Add(item);
+		}
+	}
+
+	private void BuildTrophies(bool reveal = false)
+	{
+		if (!reveal)
+		{
+			var user     = _emulator.Ini.Get("GlobalConfiguration", "user_id") ?? "1000";
+			var language = _emulator.Ini.Get("GlobalConfiguration", "console_language") ?? "1";
+			_trophySets = _games.Where(g => g.Package is null)
+			    .Select(g => Trophies.Load(_emulator.BaseDir, g, user, language)).OfType<TrophySet>()
+			    .OrderByDescending(s => s.LastUnlock ?? DateTime.MinValue).ThenBy(s => s.Title).ToList();
+		}
+		var all = _trophySets.SelectMany(s => s.Trophies).ToList();
+		FillCounts(_trophySummary, grade => (all.Count(t => t.Grade == grade && t.Unlocked is not null), all.Count(t => t.Grade == grade)),
+		    $"{all.Count(t => t.Unlocked is not null)} de {all.Count} trofeos en {_trophySets.Count} juego(s)");
+		_trophyGames.Children.Clear();
+		if (_trophySets.Count == 0)
+		{
+			_trophyGames.Children.Add(new TextBlock
+			{
+				Text = "Ningún juego de tu biblioteca trae lista de trofeos (sce_sys/trophy2).", FontSize = 22,
+				Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(26, 10),
+			});
+			return;
+		}
+		_trophyIndex = Math.Clamp(_trophyIndex, 0, _trophySets.Count - 1);
+		for (var i = 0; i < _trophySets.Count; i++)
+		{
+			var set   = _trophySets[i];
+			var index = i;
+			var row   = TrophyGameRow(set, i == _trophyIndex);
+			row.PointerPressed += (_, _) =>
+			{
+				if (_zone != Zone.Trophies) return;
+				_trophyIndex = index;
+				ShowTrophyList(set);
+			};
+			_trophyGames.Children.Add(row);
+		}
+		if (reveal && _trophyGames.Children[_trophyIndex] is Control chosen)
+			Dispatcher.UIThread.Post(() => chosen.BringIntoView(), DispatcherPriority.Loaded);
+	}
+
+	private Border TrophyGameRow(TrophySet set, bool focused)
+	{
+		var icon = new Border { Width = 92, Height = 92, CornerRadius = new CornerRadius(14), ClipToBounds = true, Background = Palette.Brush(Palette.Ink) };
+		if (set.Game.Icon is { } path)
+		{
+			try
+			{
+				using var stream = File.OpenRead(path);
+				icon.Child = new Image { Source = Bitmap.DecodeToWidth(stream, 184), Stretch = Stretch.UniformToFill };
+			}
+			catch (Exception e) when (e is IOException or ArgumentException or NotSupportedException or InvalidOperationException)
+			{
+			}
+		}
+		var counts = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 22 };
+		FillCounts(counts, set.Count, null);
+		var bar = new Grid { Height = 8, Margin = new Thickness(0, 4, 0, 0) };
+		bar.Children.Add(new Border { CornerRadius = new CornerRadius(4), Background = Palette.Brush(Colors.White, 0.1) });
+		bar.Children.Add(new Border
+		{
+			CornerRadius = new CornerRadius(4), Background = Palette.Aurora(), HorizontalAlignment = HorizontalAlignment.Left,
+			Width = Math.Max(8, 760 * set.Percent / 100.0), IsVisible = set.Earned > 0,
+		});
+		var text = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(24, 0, 0, 0), Width = 760 };
+		text.Children.Add(new TextBlock { Text = set.Title, FontSize = 25, FontWeight = FontWeight.SemiBold, Foreground = Palette.Brush(Palette.Text), TextTrimming = TextTrimming.CharacterEllipsis });
+		text.Children.Add(Text($"{set.Earned} de {set.Trophies.Count} conseguidos" + (set.LastUnlock is { } last && last > DateTime.MinValue ? $" · último el {last:d MMM yyyy}" : ""), 18, FontWeight.Normal, Palette.Muted));
+		text.Children.Add(counts);
+		text.Children.Add(bar);
+		var percent = new Border
+		{
+			Padding = new Thickness(18, 7), CornerRadius = new CornerRadius(999), MinWidth = 86, VerticalAlignment = VerticalAlignment.Center,
+			Background = set.Percent == 100 ? Palette.Aurora() : Palette.Brush(Colors.White, 0.08),
+			Child = new TextBlock { Text = $"{set.Percent} %", FontSize = 20, FontWeight = FontWeight.Bold, HorizontalAlignment = HorizontalAlignment.Center,
+			                        Foreground = set.Percent == 100 ? Palette.Brush(Color.Parse("#081022")) : Palette.Brush(Palette.Text, 0.9) },
+		};
+		var row = new DockPanel();
+		DockPanel.SetDock(icon, Dock.Left);
+		DockPanel.SetDock(percent, Dock.Right);
+		row.Children.Add(icon);
+		row.Children.Add(percent);
+		row.Children.Add(text);
+		return new Border
+		{
+			Child = row, Padding = new Thickness(20, 14), CornerRadius = new CornerRadius(18), Margin = new Thickness(0, 0, 14, 0),
+			Background = focused ? Palette.Brush(Colors.White, 0.09) : Brushes.Transparent,
+			BorderBrush = focused ? Palette.Aurora() : Brushes.Transparent, BorderThickness = new Thickness(2),
+			Cursor = new Cursor(StandardCursorType.Hand),
+		};
+	}
+
+	private void TrophiesInput(PadInput input)
+	{
+		switch (input)
+		{
+			case PadInput.Up:   _trophyIndex = Math.Max(0, _trophyIndex - 1); break;
+			case PadInput.Down: _trophyIndex = Math.Min(Math.Max(0, _trophySets.Count - 1), _trophyIndex + 1); break;
+			case PadInput.Accept when _trophyIndex < _trophySets.Count: ShowTrophyList(_trophySets[_trophyIndex]); return;
+			case PadInput.Back: ShowTab(0); return;
+		}
+		BuildTrophies(reveal: true);
+	}
+
+	// A click on the selected game's trophy strip: the Trophies tab with that game's list open.
+	private void OpenStripTrophies()
+	{
+		if (_stripSet is not { } set || _zone is not (Zone.Tiles or Zone.Buttons) || _running is not null) return;
+		ShowTab(TrophiesTab);
+		_trophyIndex = Math.Max(0, _trophySets.FindIndex(s => string.Equals(s.Game.Dir, set.Game.Dir, StringComparison.OrdinalIgnoreCase)));
+		BuildTrophies(reveal: true);
+		ShowTrophyList(_trophySets.ElementAtOrDefault(_trophyIndex) ?? set);
+	}
+
+	// One game's trophies: icon, grade, name and description; hidden ones stay hidden until earned.
+	private Border BuildTrophySheet()
+	{
+		_trophyListScroll.Content = _trophyList;
+		var content = new DockPanel();
+		_trophyListTitle.TextWrapping = TextWrapping.Wrap;
+		_trophyListTitle.MaxLines = 2;
+		_trophyListTitle.Margin = new Thickness(0, 0, 0, 10);
+		DockPanel.SetDock(_trophyListTitle, Dock.Top);
+		DockPanel.SetDock(_trophyListSummary, Dock.Top);
+		content.Children.Add(_trophyListTitle);
+		content.Children.Add(_trophyListSummary);
+		content.Children.Add(_trophyListScroll);
+		var sheet = Sheet("", "▲ ▼ desplazar     A o B cerrar", content, CloseTrophyList, "B  Cerrar");
+		sheet.Width  = 1320;
+		sheet.Height = 860;
+		sheet.HorizontalAlignment = HorizontalAlignment.Center;
+		sheet.VerticalAlignment   = VerticalAlignment.Center;
+		sheet.PointerPressed += (_, e) => e.Handled = true;
+		var backdrop = new Border { Width = 1920, Height = 1080, IsVisible = false, Background = Palette.Brush(Palette.Night, 0.8), Child = sheet };
+		backdrop.PointerPressed += (_, _) => CloseTrophyList();
+		return backdrop;
+	}
+
+	private void ShowTrophyList(TrophySet set)
+	{
+		_trophyListTitle.Text = set.Title;
+		FillCounts(_trophyListSummary, set.Count, $"{set.Earned} de {set.Trophies.Count} · {set.Percent} %");
+		_trophyList.Children.Clear();
+		foreach (var trophy in set.Trophies.OrderBy(t => t.Unlocked is null).ThenBy(t => t.Grade).ThenBy(t => t.Id))
+		{
+			var earned = trophy.Unlocked is not null;
+			var secret = trophy.Hidden && !earned;
+			var icon = new Border { Width = 78, Height = 78, CornerRadius = new CornerRadius(12), ClipToBounds = true, Background = Palette.Brush(Palette.Ink), Opacity = earned ? 1 : 0.35 };
+			if (!secret && trophy.Icon is { } png)
+			{
+				try
+				{
+					icon.Child = new Image { Source = new Bitmap(new MemoryStream(png)), Stretch = Stretch.UniformToFill };
+				}
+				catch (Exception e) when (e is ArgumentException or NotSupportedException or InvalidOperationException)
+				{
+				}
+			}
+			if (icon.Child is null) icon.Child = new Panel { Children = { new Viewbox { Margin = new Thickness(18), Child = Cup(trophy.Grade, 40) } } };
+			var text = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(22, 0, 0, 0) };
+			text.Children.Add(new TextBlock { Text = secret ? "Trofeo oculto" : trophy.Name, FontSize = 24, FontWeight = FontWeight.SemiBold, Foreground = Palette.Brush(Palette.Text, earned ? 1 : 0.75), TextWrapping = TextWrapping.Wrap });
+			text.Children.Add(new TextBlock { Text = secret ? "Sigue jugando para descubrirlo." : trophy.Description, FontSize = 18, Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap });
+			var state = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(24, 0, 10, 0) };
+			var grade = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right };
+			grade.Children.Add(Cup(trophy.Grade, 24));
+			grade.Children.Add(Text(GradeName(trophy.Grade), 19, FontWeight.SemiBold, GradeColor(trophy.Grade)));
+			state.Children.Add(grade);
+			state.Children.Add(new TextBlock
+			{
+				Text = !earned ? "Bloqueado" : trophy.Unlocked > DateTime.MinValue ? $"Conseguido el {trophy.Unlocked:d MMM yyyy}" : "Conseguido",
+				FontSize = 17, Foreground = Palette.Brush(earned ? Palette.AuroraA : Palette.Muted), HorizontalAlignment = HorizontalAlignment.Right,
+			});
+			var row = new DockPanel();
+			DockPanel.SetDock(icon, Dock.Left);
+			DockPanel.SetDock(state, Dock.Right);
+			row.Children.Add(icon);
+			row.Children.Add(state);
+			row.Children.Add(text);
+			_trophyList.Children.Add(new Border { Child = row, Padding = new Thickness(16, 10), CornerRadius = new CornerRadius(16), Margin = new Thickness(0, 0, 14, 0),
+			                                      Background = earned ? Palette.Brush(Colors.White, 0.05) : Brushes.Transparent });
+		}
+		_trophyListScroll.Offset = default;
+		if (_trophyPanel is not null) _trophyPanel.IsVisible = false;
+		_trophySheet.IsVisible = true;
+		_zone = Zone.TrophyList;
+	}
+
+	private void CloseTrophyList()
+	{
+		if (_zone != Zone.TrophyList) return;
+		_trophySheet.IsVisible = false;
+		if (_trophyPanel is not null) _trophyPanel.IsVisible = true;
+		_zone = Zone.Trophies;
+	}
+
+	private void TrophyListInput(PadInput input)
+	{
+		switch (input)
+		{
+			case PadInput.Up:   _trophyListScroll.Offset = _trophyListScroll.Offset.WithY(Math.Max(0, _trophyListScroll.Offset.Y - 140)); break;
+			case PadInput.Down: _trophyListScroll.Offset = _trophyListScroll.Offset.WithY(_trophyListScroll.Offset.Y + 140); break;
+			case PadInput.Accept or PadInput.Back: CloseTrophyList(); break;
+		}
+	}
+
+	// ---- Game options -------------------------------------------------------------------------
+
+	// A game's own options (its button or a right click on it): performance mode, each patch, community
+	// patches, folder and title ID.
+	private Border BuildGameOptions()
+	{
+		_gameScroll.Content = _gameList;
+		var content = new DockPanel();
+		_gameTitle.Margin = new Thickness(0, 0, 0, 20);
+		_gameTitle.TextWrapping = TextWrapping.Wrap;
+		_gameTitle.MaxLines = 2;
+		DockPanel.SetDock(_gameTitle, Dock.Top);
+		content.Children.Add(_gameTitle);
+		content.Children.Add(_gameScroll);
+		var sheet = Sheet("", "▲ ▼ elegir     A ▸ cambiar     ◂ valor anterior     B cerrar", content, CloseGameOptions, "B  Cerrar");
+		sheet.Width  = 1320;
+		sheet.Height = 860;
+		sheet.HorizontalAlignment = HorizontalAlignment.Center;
+		sheet.VerticalAlignment   = VerticalAlignment.Center;
+		sheet.PointerPressed += (_, e) => e.Handled = true;
+		var backdrop = new Border
+		{
+			Width = 1920, Height = 1080, IsVisible = false, Background = Palette.Brush(Palette.Night, 0.8), Child = sheet,
+		};
+		backdrop.PointerPressed += (_, _) => CloseGameOptions();
+		return backdrop;
+	}
+
+	private void ShowGameOptions(Game game)
+	{
+		if (game.Package is not null) return;
+		_optionsGame = game;
+		_patches     = GamePatches.Load(_emulator.BaseDir, game);
+		_gameOption  = 0;
+		_gameTitle.Text = game.Name;
+		_gameScroll.Offset = default;
+		BuildGameRows();
+		_gameSheet.IsVisible = true;
+		_zone = Zone.GameOptions;
+	}
+
+	private void CloseGameOptions()
+	{
+		if (_zone != Zone.GameOptions) return;
+		_gameSheet.IsVisible = false;
+		_zone = Zone.Buttons;
+		SetZoneVisuals();
+		Select(_index, force: true); // The "Parche activo" badge may have changed.
+	}
+
+	private static string ModeLabel(string mode) => mode switch
+	{
+		"calidad" => "Calidad", "equilibrado" => "Equilibrado", "rendimiento" => "Rendimiento", _ => "Personalizado",
+	};
+
+	private List<Setting> GameOptions()
+	{
+		var game = _optionsGame!;
+		var list = new List<Setting> { Section("Parches") };
+		if (_patches is { HasModes: true } patches)
+		{
+			list.Add(new("Modo", "Calidad: mejor imagen. Rendimiento: más FPS quitando efectos. Equilibrado: entre los dos. Personalizado: lo que elijas abajo.",
+			    () => ModeLabel(patches.Mode), step =>
+			    {
+				    var modes = GamePatches.ModeNames;
+				    var now   = Array.IndexOf(modes, patches.Mode);
+				    patches.ApplyMode(modes[now < 0 ? (step > 0 ? 0 : modes.Length - 1) : (now + step + modes.Length) % modes.Length]);
+			    }));
+		}
+		if (_patches is { } file)
+		{
+			foreach (var patch in file.Mods)
+			{
+				var index = patch.Index;
+				list.Add(new(patch.Label, patch.Detail, () => file.Mods[index].Enabled ? "Sí" : "No",
+				    _ => file.Set(index, !file.Mods[index].Enabled)));
+			}
+		}
+		else
+		{
+			list.Add(new("Sin parches", $"No hay parches para la versión {game.Version} de este juego. Puedes buscar los de la comunidad.", () => "", _ => { }));
+		}
+		list.Add(new("Buscar parches de la comunidad",
+		    $"Descarga los parches publicados para la versión {game.Version} (colección HEN-Cheats-Collection en GitHub). Llegan desactivados.",
+		    () => _downloadingPatches ? "Buscando…" : "Buscar ›", _ => DownloadPatches(game)));
+		// This game's own settings ([<title id>] in Nova5.ini); "General" follows the general settings.
+		list.Add(Section("Ajustes de este juego"));
+		var id = game.TitleId;
+		list.Add(GameCycle(id, "Resolución", "Resolución a la que se dibuja este juego.", "screen_resolution", "R1920X1080",
+		    Resolutions.Select(r => (r, r.TrimStart('R').Replace('X', '×'))).ToArray()));
+		list.Add(GameCycle(id, "Frecuencia de pantalla", "120 o 144 Hz si este juego tiene modo de 120 Hz; 60 Hz si va acelerado.", "vblank_frequency", "60",
+		    RefreshRates.Select(hz => (hz.ToString(), $"{hz} Hz")).ToArray()));
+		list.Add(GameCycle(id, "Sincronización (VSync)", "Mailbox: fluido. VSync: sin cortes, algo más de retraso. Sin límite: el menor retraso.", "present_mode", "Mailbox",
+		    ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", "Sin límite")));
+		list.Add(GameToggle(id, "Pantalla completa", "Este juego se abre a pantalla completa o en una ventana.", "fullscreen_enabled", true));
+		list.Add(GameToggle(id, "HDR", "Imagen HDR si tu monitor y el juego lo admiten.", "hdr_enabled", false));
+		list.Add(GameToggle(id, "Contador de FPS", "Muestra los FPS mientras juegas a este juego.", "perf_overlay_enabled", false));
+		list.Add(GameToggle(id, "Ocultar el cursor", "Oculta el puntero del ratón dentro de este juego.", "hide_cursor_enabled", false));
+		list.Add(GameCycle(id, "Idioma de la consola", "El idioma de textos y voces de este juego, si lo tiene.", "console_language", "1", ConsoleLanguages));
+		list.Add(GameToggle(id, "Saltar avisos de inicio", "Pide al juego que se salte los avisos del principio, si lo permite.", "skip_notice_screen", false));
+		list.Add(GameToggle(id, "Caché de shaders", "Guarda los shaders de este juego para que cargue más rápido.", "shader_cache_enabled", true));
+		list.Add(GameToggle(id, "Compatibilidad de CPU", "Solo si este juego se cierra al arrancar en tu procesador.", "amd_cpu_enabled", false));
+		// Options that only apply to this game.
+		if (game.TitleId == "PPSA01341")
+		{
+			list.AddRange(new[]
+			{
+			DemonsSoulsToggle("Espera de los hilos de trabajo", "Los hilos de trabajo del juego esperan sin gastar procesador. Experimental.", "ds_idle_enabled"),
+			DemonsSoulsToggle("Pausa en bucles de espera", "Menos uso del procesador mientras el juego espera. Experimental.", "ds_spin_backoff_enabled"),
+			DemonsSoulsToggle("Sin descarte de índices", "Omite un paso de descarte de geometría que el emulador no necesita. Experimental.", "ds_disable_index_culling"),
+			DemonsSoulsToggle("Núcleos de rendimiento", "Coloca los hilos de dibujo en los núcleos rápidos del procesador. Experimental.", "ds_affinity_enabled"),
+			DemonsSoulsToggle("Prioridad de dibujo", "Da más prioridad al hilo de dibujo. Experimental.", "ds_render_priority_enabled"),
+			});
+		}
+		list.Add(Section("Juego"));
+		// Additional content: what the emulator will load (installed DLC packages of this game).
+		var addons = Library.Addons(_emulator.GameDirs().Concat(_store.ExtraDirs), game.TitleId);
+		list.Add(addons.Count == 0
+		    ? new("Contenido adicional (DLC)", "No hay DLC instalado. Copia el .pkg del DLC en tu carpeta de juegos y Nova5 lo instalará solo, como los juegos.", () => "", _ => { })
+		    : new($"Contenido adicional (DLC): {addons.Count}", string.Join(" · ", addons.Select(a => a.Name)), () => "Instalado", _ => { }));
+		if (game.Archive is null)
+		{
+			var packed = GameArchive.Packed(game);
+			if (packed is null)
+			{
+				list.Add(new("Comprimir en .zar",
+				    "Guarda el juego en un solo archivo comprimido que ocupa mucho menos (Astro Bot pasa de 148 a 44 GB). Se juega igual, sin descomprimir. La carpeta original no se toca.",
+				    () => _packing == game ? $"Comprimiendo {_packProgress * 100:0} %" : _packing is not null ? "Espera…" : "Comprimir ›", _ => PackGame(game)));
+			}
+			else
+			{
+				list.Add(new("Borrar la carpeta original",
+				    $"Ya está comprimido en {System.IO.Path.GetFileName(packed)}: lleva la carpeta a la papelera para liberar espacio. El juego comprimido aparece en la biblioteca.",
+				    () => _confirmDelete == game.Dir ? "¿Seguro? Pulsa otra vez" : "Borrar ›", _ =>
+				    {
+					    if (_confirmDelete != game.Dir)
+					    {
+						    _confirmDelete = game.Dir;
+						    return;
+					    }
+					    _confirmDelete = null;
+					    try
+					    {
+						    GameArchive.RecycleFolder(game.Dir);
+						    CloseGameOptions();
+						    Reload();
+						    ShowToast("Carpeta original en la papelera");
+					    }
+					    catch (Exception e) when (e is IOException or UnauthorizedAccessException or OperationCanceledException)
+					    {
+						    ShowToast("No se pudo borrar: " + e.Message);
+					    }
+				    }));
+			}
+		}
+		list.Add(new("Abrir la carpeta del juego", game.Dir, () => "Abrir ›",
+		    _ => Process.Start(new ProcessStartInfo(game.Dir) { UseShellExecute = true })));
+		list.Add(new("Copiar el ID del título", $"{game.TitleId} · versión {game.Version}", () => "Copiar ›", _ =>
+		{
+			Clipboard?.SetTextAsync(game.TitleId);
+			ShowToast($"{game.TitleId} copiado");
+		}));
+		return list;
+	}
+
+	private void BuildGameRows(bool reveal = false)
+	{
+		_gameList.Children.Clear();
+		var options = GameOptions();
+		_gameOption = Math.Clamp(_gameOption, 0, options.Count - 1);
+		while (options[_gameOption].Header && _gameOption < options.Count - 1) _gameOption++;
+		for (var i = 0; i < options.Count; i++)
+		{
+			var index = i;
+			if (options[i].Header)
+			{
+				_gameList.Children.Add(SectionTitle(options[i].Label));
+				continue;
+			}
+			_gameList.Children.Add(OptionRow(options[i], i == _gameOption, step =>
+			{
+				if (_zone != Zone.GameOptions) return;
+				_gameOption = index;
+				GameOptions()[index].Change(step);
+				if (_zone == Zone.GameOptions) BuildGameRows();
+			}));
+		}
+		if (reveal && _gameList.Children[_gameOption] is Control chosen)
+			Dispatcher.UIThread.Post(() => chosen.BringIntoView(), DispatcherPriority.Loaded);
+	}
+
+	private void GameOptionsInput(PadInput input)
+	{
+		var options = GameOptions();
+		switch (input)
+		{
+			case PadInput.Up:   _gameOption = Step(options, _gameOption, -1); break;
+			case PadInput.Down: _gameOption = Step(options, _gameOption, 1); break;
+			case PadInput.Left: options[_gameOption].Change(-1); break;
+			case PadInput.Right or PadInput.Accept: options[_gameOption].Change(1); break;
+			case PadInput.Back: CloseGameOptions(); return;
+		}
+		if (_zone == Zone.GameOptions) BuildGameRows(reveal: true);
+	}
+
+	// Packs a game folder into .zar in the background: the progress (and time left) stays in the top bar, and at
+	// the end the player chooses what to do with the original folder.
+	private async void PackGame(Game game)
+	{
+		if (_packing is not null)
+		{
+			ShowToast($"Ya se está comprimiendo {_packing.Name}");
+			return;
+		}
+		if (_running is not null)
+		{
+			ShowToast("Cierra el juego antes de comprimirlo");
+			return;
+		}
+		_packing      = game;
+		_packProgress = 0;
+		_packCancel   = new CancellationTokenSource();
+		_packText.Text      = $"Comprimiendo {game.Name}: preparando…";
+		_packPill.IsVisible = true;
+		if (_zone == Zone.GameOptions) BuildGameRows();
+		ShowToast($"Comprimiendo {game.Name} en .zar. Puedes seguir usando Nova5; no lo cierres hasta que termine.");
+		var started = DateTime.UtcNow;
+		var shown   = DateTime.MinValue;
+		var size    = 0L;
+		try
+		{
+			// The UI follows at most twice a second (a game has hundreds of thousands of files).
+			var progress = new Progress<double>(p =>
+			{
+				_packProgress = p;
+				if ((DateTime.UtcNow - shown).TotalMilliseconds < 500 && p < 1) return;
+				shown = DateTime.UtcNow;
+				var elapsed = DateTime.UtcNow - started;
+				var left    = p > 0.02 ? TimeSpan.FromSeconds(elapsed.TotalSeconds * (1 - p) / p) : (TimeSpan?)null;
+				_packText.Text = $"Comprimiendo {game.Name}: {p * 100:0} %" + (left is { } l ? $" · quedan {Math.Max(1, Math.Round(l.TotalMinutes))} min" : "");
+				if (_zone == Zone.GameOptions && _optionsGame == game) BuildGameRows();
+			});
+			var token   = _packCancel.Token;
+			size        = await Task.Run(() => GameArchive.FolderSize(game.Dir), token);
+			var archive = await Task.Run(() => GameArchive.PackAsync(game, progress, token), token);
+			_packing = null;
+			_packPill.IsVisible = false;
+			Reload();
+			AfterPack(game, archive, size);
+		}
+		catch (OperationCanceledException)
+		{
+			ShowToast("Compresión cancelada; el juego sigue como estaba");
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+		{
+			ShowToast("No se pudo comprimir: " + e.Message);
+		}
+		finally
+		{
+			_packing = null;
+			_packPill.IsVisible = false;
+			_packCancel?.Dispose();
+			_packCancel = null;
+			if (_zone == Zone.GameOptions) BuildGameRows();
+		}
+	}
+
+	private void AskCancelPack()
+	{
+		if (_packing is not { } game || _zone is Zone.Choice or Zone.TextEntry) return;
+		ShowChoice("¿Cancelar la compresión?", $"Se está comprimiendo {game.Name} ({_packProgress * 100:0} %). Si cancelas se borra el .zar a medias y el juego queda como estaba.", new()
+		{
+			new("Seguir comprimiendo", "", () => "", _ => { }),
+			new("Cancelar la compresión", "", () => "", _ => _packCancel?.Cancel()),
+		});
+	}
+
+	// The .zar is ready: delete the folder now, try the .zar first (asked again when it closes), or later.
+	private void AfterPack(Game folder, string archive, long folderSize)
+	{
+		var packedSize = new FileInfo(archive).Length;
+		ShowChoice($"{folder.Name} ya está comprimido",
+		    $"El .zar ocupa {packedSize / 1e9:0.0} GB (la carpeta, {folderSize / 1e9:0.0} GB). ¿Qué hacemos con la carpeta original?", new()
+		{
+			new("Probar primero el .zar", "Abre ahora el juego comprimido. Al cerrarlo te pregunto si funcionó bien antes de borrar nada.",
+			    () => "", _ => TryArchive(folder.Dir, archive)),
+			new("Borrar la carpeta y quedarme con el .zar", $"La carpeta va a la papelera y liberas unos {folderSize / 1e9:0} GB.",
+			    () => "", _ => RecycleOriginal(folder.Dir)),
+			new("Decidir más tarde", "Se quedan las dos versiones. Puedes borrar la carpeta luego con clic derecho en el juego.",
+			    () => "", _ => { }),
+		});
+	}
+
+	private void TryArchive(string folder, string archive)
+	{
+		if (_games.FirstOrDefault(g => string.Equals(g.Archive, archive, StringComparison.OrdinalIgnoreCase)) is not { } packed)
+		{
+			ShowToast("No encuentro el juego comprimido en la biblioteca");
+			return;
+		}
+		_zarTest = (folder, archive);
+		Select(_games.IndexOf(packed), force: true);
+		Launch(packed);
+	}
+
+	private void RecycleOriginal(string folder)
+	{
+		try
+		{
+			GameArchive.RecycleFolder(folder);
+			Reload();
+			ShowToast("Carpeta original en la papelera; te queda el .zar");
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException or OperationCanceledException)
+		{
+			ShowToast("No se pudo borrar la carpeta: " + e.Message);
+		}
+	}
+
+	private void RecycleArchive(string archive)
+	{
+		try
+		{
+			Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(archive, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+			    Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+			if (Directory.Exists(GameArchive.Meta(archive))) GameArchive.RecycleFolder(GameArchive.Meta(archive));
+			Reload();
+			ShowToast(".zar en la papelera; te queda la carpeta");
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException or OperationCanceledException)
+		{
+			ShowToast("No se pudo borrar el .zar: " + e.Message);
+		}
+	}
+
+	// Called when a game closes: after trying a fresh .zar, ask whether it worked.
+	private void AfterArchiveTest(Game closed)
+	{
+		if (_zarTest is not { } test || !string.Equals(closed.Archive, test.Archive, StringComparison.OrdinalIgnoreCase)) return;
+		_zarTest = null;
+		ShowChoice("¿Funcionó bien el juego comprimido?", "Si se jugó igual que siempre, puedes borrar la carpeta original y quedarte solo con el .zar.", new()
+		{
+			new("Sí: borrar la carpeta original", "La carpeta va a la papelera; te quedas con el .zar.", () => "", _ => RecycleOriginal(test.Folder)),
+			new("No: borrar el .zar y quedarme con la carpeta", "El .zar va a la papelera; el juego queda como antes.", () => "", _ => RecycleArchive(test.Archive)),
+			new("Decidir más tarde", "Se quedan las dos versiones.", () => "", _ => { }),
+		});
+	}
+
+	// ---- Choice -------------------------------------------------------------------------------
+
+	// A question with a few answers over everything; A picks, B takes the last answer.
+	private Border BuildChoice()
+	{
+		var content = new StackPanel { Spacing = 4 };
+		content.Children.Add(_choiceTitle);
+		content.Children.Add(_choiceMessage);
+		content.Children.Add(_choiceList);
+		_choiceTitle.TextWrapping = TextWrapping.Wrap;
+		_choiceMessage.Foreground = Palette.Brush(Palette.Muted);
+		var sheet = Sheet("", "▲ ▼ elegir     A aceptar", content, () => PickChoice(_choices.Count - 1), "B  Cerrar");
+		sheet.Width = 1200;
+		sheet.HorizontalAlignment = HorizontalAlignment.Center;
+		sheet.VerticalAlignment   = VerticalAlignment.Center;
+		sheet.PointerPressed += (_, e) => e.Handled = true;
+		return new Border { Width = 1920, Height = 1080, IsVisible = false, Background = Palette.Brush(Palette.Night, 0.82), Child = sheet };
+	}
+
+	private void ShowChoice(string title, string message, List<Setting> choices)
+	{
+		if (_zone != Zone.Choice) _beforeChoice = _zone is Zone.GameOptions or Zone.TextEntry or Zone.Keys ? Zone.Tiles : _zone;
+		_gameSheet.IsVisible = false;
+		_choiceTitle.Text   = title;
+		_choiceMessage.Text = message;
+		_choices     = choices;
+		_choiceIndex = 0;
+		BuildChoiceRows();
+		_choiceSheet.IsVisible = true;
+		_zone = Zone.Choice;
+		WindowState = WindowState.FullScreen;
+		Activate();
+	}
+
+	private void BuildChoiceRows()
+	{
+		_choiceList.Children.Clear();
+		for (var i = 0; i < _choices.Count; i++)
+		{
+			var index = i;
+			_choiceList.Children.Add(OptionRow(_choices[i], i == _choiceIndex, _ => PickChoice(index)));
+		}
+	}
+
+	private void PickChoice(int index)
+	{
+		if (_zone != Zone.Choice || index < 0 || index >= _choices.Count) return;
+		var choice = _choices[index];
+		_choiceSheet.IsVisible = false;
+		_zone = _beforeChoice;
+		choice.Change(1);
+	}
+
+	private void ChoiceInput(PadInput input)
+	{
+		switch (input)
+		{
+			case PadInput.Up:   _choiceIndex = Math.Max(0, _choiceIndex - 1); break;
+			case PadInput.Down: _choiceIndex = Math.Min(_choices.Count - 1, _choiceIndex + 1); break;
+			case PadInput.Accept: PickChoice(_choiceIndex); return;
+			case PadInput.Back: PickChoice(_choices.Count - 1); return;
+		}
+		BuildChoiceRows();
+	}
+
+	// ---- Context menu -------------------------------------------------------------------------
+
+	// Right click on a game: its actions, as in SharpEmu's and KytyPS5's launchers.
+	private void ShowGameMenu(Control tile, Game game)
+	{
+		var items = new List<MenuItem>();
+		MenuItem Item(string header, Action click, bool enabled = true)
+		{
+			var item = new MenuItem { Header = header, IsEnabled = enabled, FontSize = 16 };
+			item.Click += (_, _) => click();
+			items.Add(item);
+			return item;
+		}
+		Item("Jugar", () => Launch(game));
+		Item("Opciones del juego", () => ShowGameOptions(game));
+		if (game.Archive is null)
+		{
+			if (_packing == game) Item($"Comprimiendo… {_packProgress * 100:0} %", () => { }, enabled: false);
+			else if (GameArchive.Packed(game) is { } packed) Item("Borrar la carpeta original (ya está en .zar)", () => ShowChoice("¿Borrar la carpeta original?",
+			    $"{game.Name} ya está comprimido en {System.IO.Path.GetFileName(packed)}. La carpeta va a la papelera.", new()
+			    {
+				    new("Sí, borrar la carpeta", "", () => "", _ => RecycleOriginal(game.Dir)),
+				    new("No", "", () => "", _ => { }),
+			    }));
+			else Item("Comprimir en .zar", () => PackGame(game), enabled: _packing is null);
+		}
+		else
+		{
+			Item("Borrar este .zar", () => ShowChoice("¿Borrar el juego comprimido?", $"{System.IO.Path.GetFileName(game.Archive)} va a la papelera.", new()
+			{
+				new("Sí, borrar el .zar", "", () => "", _ => RecycleArchive(game.Archive)),
+				new("No", "", () => "", _ => { }),
+			}));
+		}
+		Item("Abrir la carpeta", () => Process.Start(new ProcessStartInfo(game.Archive is null ? game.Dir : System.IO.Path.GetDirectoryName(game.Archive)!) { UseShellExecute = true }));
+		Item("Copiar el ID del título", () => { Clipboard?.SetTextAsync(game.TitleId); ShowToast($"{game.TitleId} copiado"); });
+		var menu = new ContextMenu { ItemsSource = items, FontFamily = Palette.Font };
+		menu.Open(tile);
+	}
+	private async void DownloadPatches(Game game)
+	{
+		if (_downloadingPatches) return;
+		_downloadingPatches = true;
+		BuildGameRows();
+		try
+		{
+			var (found, added) = await GamePatches.DownloadAsync(_emulator.BaseDir, game, CancellationToken.None);
+			if (_optionsGame == game) _patches = GamePatches.Load(_emulator.BaseDir, game);
+			// Nothing new is said in a box, not a toast: the list does not change.
+			if (added == 0 && _zone == Zone.GameOptions && _optionsGame == game)
+			{
+				_downloadingPatches = false;
+				if (found == 0)
+					PatchesBox(game, "No se encontraron parches para este juego",
+					    $"La colección de parches de la comunidad no tiene ninguno para {game.Name} (versión {game.Version}). Puedes volver a buscar más adelante.");
+				else
+					PatchesBox(game, "Ya se añadieron todos los parches disponibles",
+					    "Este juego ya tiene todos los parches de la comunidad para su versión. Actívalos o desactívalos en la lista.");
+				return;
+			}
+			ShowToast(added > 0 ? $"{added} parche(s) nuevo(s): actívalos en la lista"
+			    : found == 0 ? "No se encontraron parches para este juego" : "Ya se añadieron todos los parches disponibles");
+		}
+		catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or System.Text.Json.JsonException)
+		{
+			ShowToast("No se pudieron descargar los parches: " + e.Message);
+		}
+		finally
+		{
+			_downloadingPatches = false;
+			if (_zone == Zone.GameOptions) BuildGameRows();
+		}
+	}
+
+	// A message over the game options; Aceptar goes back to the same row.
+	private void PatchesBox(Game game, string title, string message)
+	{
+		var option = _gameOption;
+		ShowChoice(title, message, new() { new("Aceptar", "", () => "", _ =>
+		{
+			ShowGameOptions(game);
+			_gameOption = option;
+			BuildGameRows();
+		}) });
+	}
+
 	// ---- Data ---------------------------------------------------------------------------------
 
 	private void Reload()
 	{
+		_trophyCache.Clear();
 		var roots = _emulator.GameDirs().Concat(_store.ExtraDirs).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 		var previous = _games.ElementAtOrDefault(_index)?.Dir;
 		_games = Library.Scan(roots);
+		if (SnapshotPath is not null) _games.RemoveAll(g => g.Package is not null); // Pictures for the web: installed games only.
 		_index = Math.Max(0, _games.FindIndex(g => g.Dir == previous));
 		_row.Children.Clear();
 		foreach (var game in _games) _row.Children.Add(Tile(game));
@@ -324,7 +1501,20 @@ public sealed class MainWindow : Window
 		{
 			var index = i;
 			_row.Children[i].Cursor = new Cursor(StandardCursorType.Hand);
-			_row.Children[i].PointerPressed += (_, _) => TileClicked(index);
+			_row.Children[i].PointerPressed += (sender, e) =>
+			{
+				// Right click: that game's options, like SharpEmu's and KytyPS5's context menu.
+				if (e.GetCurrentPoint(sender as Control).Properties.IsRightButtonPressed)
+				{
+					if (_zone is Zone.Tiles or Zone.Buttons && _running is null && index < _games.Count && _games[index].Package is null)
+					{
+						Select(index, force: true);
+						ShowGameMenu((Control)sender!, _games[index]);
+					}
+					return;
+				}
+				TileClicked(index);
+			};
 		}
 		if (!_emulator.Exists) ShowToast("No se encontró Nova5Emulator junto al lanzador");
 		Select(_index, force: true);
@@ -468,6 +1658,7 @@ public sealed class MainWindow : Window
 		if (_statsBox is not null) _statsBox.IsVisible = game is not null;
 		if (game is null)
 		{
+			_gameTrophies.IsVisible = false;
 			_meta.Children.Add(Text("Elige la carpeta donde tienes tus juegos de PS5 extraídos", 22, FontWeight.Normal, Palette.Muted));
 			SetBackground(null);
 			_music.Stop();
@@ -477,6 +1668,7 @@ public sealed class MainWindow : Window
 		{
 			foreach (var button in _buttons) button.IsVisible = false;
 			if (_statsBox is not null) _statsBox.IsVisible = false;
+			_gameTrophies.IsVisible = false;
 			_meta.Children.Add(Badge("Paquete PKG"));
 			_meta.Children.Add(Text($"{new FileInfo(package).Length / 1e9:0.0} GB", 22, FontWeight.Normal, Palette.Muted));
 			if (_packageProgress.GetValueOrDefault(package) is { } progress)
@@ -495,7 +1687,11 @@ public sealed class MainWindow : Window
 			_music.Stop();
 			return;
 		}
-		_meta.Children.Add(Badge(_emulator.PatchFor(game.TitleId) is null ? "Instalado" : "Parche activo"));
+		ShowGameTrophies(game);
+		var patches = GamePatches.Load(_emulator.BaseDir, game);
+		_meta.Children.Add(Badge(patches is { HasModes: true } ? $"Modo {ModeLabel(patches.Mode)}"
+		    : patches?.Mods.Any(m => m.Enabled) == true ? "Parches activos" : "Instalado"));
+		if (game.Archive is not null) _meta.Children.Add(Badge("Comprimido .zar"));
 		foreach (var part in new[] { game.TitleId, "v" + game.Version, LastPlayedText(game) })
 		{
 			if (part.Length == 0) continue;
@@ -580,6 +1776,23 @@ public sealed class MainWindow : Window
 			Key.Q => PadInput.PrevTab, Key.E or Key.Tab => PadInput.NextTab, Key.Y => PadInput.Options,
 			_ => null,
 		};
+		if (_zone == Zone.Keys && _capturing is { } control)
+		{
+			e.Handled = true;
+			if (e.Key == Key.Escape) StopCapture(null);
+			else if (e.Key == Key.Delete) StopCapture("");
+			else if (Keymap.Name(e.Key) is { } name) StopCapture(name);
+			return;
+		}
+		if (_zone == Zone.TextEntry)
+		{
+			if (e.Key is Key.Enter or Key.Escape)
+			{
+				CloseText(e.Key == Key.Enter);
+				e.Handled = true;
+			}
+			return;
+		}
 		if (e.Key == Key.F11)
 		{
 			WindowState = WindowState == WindowState.FullScreen ? WindowState.Maximized : WindowState.FullScreen;
@@ -599,6 +1812,36 @@ public sealed class MainWindow : Window
 
 	private void OnInput(PadInput input)
 	{
+		if (_zone == Zone.TextEntry)
+		{
+			if (input is PadInput.Accept or PadInput.Back) CloseText(input == PadInput.Accept);
+			return;
+		}
+		if (_zone == Zone.Keys)
+		{
+			KeysInput(input);
+			return;
+		}
+		if (_zone == Zone.Choice)
+		{
+			ChoiceInput(input);
+			return;
+		}
+		if (_zone == Zone.Notes)
+		{
+			NotesInput(input);
+			return;
+		}
+		if (_zone == Zone.GameOptions)
+		{
+			GameOptionsInput(input);
+			return;
+		}
+		if (_zone == Zone.TrophyList)
+		{
+			TrophyListInput(input);
+			return;
+		}
 		if (_zone == Zone.Prompt)
 		{
 			if (input == PadInput.Accept) Close();
@@ -607,12 +1850,17 @@ public sealed class MainWindow : Window
 		}
 		if (input is PadInput.PrevTab or PadInput.NextTab)
 		{
-			ShowTab(_tab == 0 ? 1 : 0);
+			ShowTab((_tab + (input == PadInput.NextTab ? 1 : _tabs.Length - 1)) % _tabs.Length);
 			return;
 		}
 		if (_zone == Zone.Settings)
 		{
 			SettingsInput(input);
+			return;
+		}
+		if (_zone == Zone.Trophies)
+		{
+			TrophiesInput(input);
 			return;
 		}
 		switch (input)
@@ -623,7 +1871,7 @@ public sealed class MainWindow : Window
 			case PadInput.Right: FocusButton(_button + 1); break;
 			case PadInput.Down when _zone == Zone.Tiles && Current is not null: SetZone(Zone.Buttons); break;
 			case PadInput.Up when _zone == Zone.Buttons: SetZone(Zone.Tiles); break;
-			case PadInput.Options or PadInput.Menu: ShowTab(1); break;
+			case PadInput.Options or PadInput.Menu: ShowTab(SettingsTab); break;
 			case PadInput.Back when _zone == Zone.Buttons: SetZone(Zone.Tiles); break;
 			case PadInput.Back: ShowPrompt(true); break;
 			case PadInput.Accept: Activate(_zone == Zone.Tiles ? 0 : _button); break;
@@ -644,7 +1892,7 @@ public sealed class MainWindow : Window
 				if (_packageFailed.Remove(package)) InstallPendingPackages(); // Retry after a failure.
 				break;
 			case 0: Launch(game); break;
-			case 1: ShowTab(1); break;
+			case 1: ShowGameOptions(game); break;
 			case 2: Process.Start(new ProcessStartInfo(game.Dir) { UseShellExecute = true }); break;
 		}
 	}
@@ -665,7 +1913,7 @@ public sealed class MainWindow : Window
 	// A click selects a game; a click on the selected game plays it, like pressing A.
 	private void TileClicked(int index)
 	{
-		if (_zone is Zone.Prompt or Zone.Settings || _running is not null) return;
+		if (_zone is not (Zone.Tiles or Zone.Buttons) || _running is not null) return;
 		if (index == _index && _zone == Zone.Tiles)
 		{
 			Activate(0);
@@ -697,11 +1945,17 @@ public sealed class MainWindow : Window
 			_tabs[i].Foreground = Palette.Brush(i == tab ? Palette.Text : Palette.Muted);
 		}
 		_gamesPage.IsVisible    = tab == 0;
-		_settingsPage.IsVisible = tab == 1;
-		if (tab == 1)
+		_settingsPage.IsVisible = tab == SettingsTab;
+		_trophiesPage.IsVisible = tab == TrophiesTab;
+		if (tab == SettingsTab)
 		{
 			_zone = Zone.Settings;
 			BuildSettings();
+		}
+		else if (tab == TrophiesTab)
+		{
+			_zone = Zone.Trophies;
+			BuildTrophies();
 		}
 		else
 		{
@@ -711,7 +1965,13 @@ public sealed class MainWindow : Window
 
 	// ---- Settings -----------------------------------------------------------------------------
 
-	private sealed record Setting(string Label, Func<string> Value, Action<int> Change);
+	private sealed record Setting(string Label, string Detail, Func<string> Value, Action<int> Change)
+	{
+		// A section title: drawn as a heading, skipped by the pad.
+		public bool Header { get; init; }
+	}
+
+	private static Setting Section(string title) => new(title, "", () => "", _ => { }) { Header = true };
 
 	private static readonly string[] Resolutions = { "R1280X720", "R1920X1080", "R2560X1440", "R3840X2160" };
 	private static readonly int[] RefreshRates = { 60, 120, 144 };
@@ -721,13 +1981,23 @@ public sealed class MainWindow : Window
 
 	private List<Setting> Settings() => new()
 	{
-		DemonsSoulsToggle("Demon's Souls: espera de workers (experimental)", "ds_idle_enabled"),
-		DemonsSoulsToggle("Demon's Souls: pausa en bucle de espera (experimental)", "ds_spin_backoff_enabled"),
-		DemonsSoulsToggle("Demon's Souls: desactivar culling de índices (experimental)", "ds_disable_index_culling"),
-		DemonsSoulsToggle("Demon's Souls: afinidad a núcleos P (experimental)", "ds_affinity_enabled"),
-		DemonsSoulsToggle("Demon's Souls: prioridad de render (experimental)", "ds_render_priority_enabled"),
-		Toggle("Pantalla completa al jugar", "fullscreen_enabled", true),
-		new("Resolución", () => _emulator.Ini.Get("GlobalConfiguration", "screen_resolution")?.TrimStart('R').Replace('X', '×') ?? "1920×1080",
+		Section("Nova5"),
+		new("Información de la versión", $"Tienes Nova5 {Updates.Current}. Abre las novedades de esta versión y de las anteriores.",
+		    () => "Ver ›", _ => ShowNotes(ReleaseNotes.All.Where(n => n.Version <= Updates.Current).ToList(), firstTime: false)),
+		new(_update is null ? "Buscar actualizaciones" : $"Actualizar a Nova5 {_update.Version}",
+		    _update is null ? "Consulta en GitHub si hay una versión nueva de Nova5." : "Descarga e instala la versión nueva; tus partidas y ajustes se conservan.",
+		    () => _updating ? "Actualizando…" : _update is null ? "Buscar ›" : "Actualizar ›", _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }),
+		new("Actualizaciones", "Avisar: te pregunta antes de instalar. Automáticas: se instalan al abrir Nova5. Desactivadas: no se conecta para esto.",
+		    () => _store.UpdateMode switch { "auto" => "Automáticas", "no" => "Desactivadas", _ => "Avisar" }, step =>
+		{
+			string[] modes = { "avisar", "auto", "no" };
+			_store.UpdateMode = modes[(Math.Max(Array.IndexOf(modes, _store.UpdateMode), 0) + step + modes.Length) % modes.Length];
+			_store.Save();
+		}),
+		Section("Pantalla"),
+		Toggle("Pantalla completa al jugar", "Los juegos se abren a pantalla completa; si no, en una ventana.", "fullscreen_enabled", true),
+		new("Resolución", "Resolución a la que se dibujan los juegos. Elige la de tu monitor para que se vean nítidos; más alta exige más a la gráfica.",
+		    () => _emulator.Ini.Get("GlobalConfiguration", "screen_resolution")?.TrimStart('R').Replace('X', '×') ?? "1920×1080",
 		    step =>
 		    {
 			    var current = Array.IndexOf(Resolutions, _emulator.Ini.Get("GlobalConfiguration", "screen_resolution") ?? "R1920X1080");
@@ -735,49 +2005,104 @@ public sealed class MainWindow : Window
 		    }),
 		// Emulated display refresh. At 119 Hz or more games are told the screen is 120 Hz, so
 		// those with a 120 Hz mode can pass 60 FPS; games that count vblanks could run faster.
-		new("Frecuencia de pantalla", () => $"{RefreshRate()} Hz", step =>
+		new("Frecuencia de pantalla", "Los juegos con modo de 120 Hz pueden pasar de 60 FPS con 120 o 144 Hz. Si un juego va acelerado, vuelve a 60 Hz.",
+		    () => $"{RefreshRate()} Hz", step =>
 		{
 			var current = Array.IndexOf(RefreshRates, RefreshRate());
 			SetIni("vblank_frequency", RefreshRates[(Math.Max(current, 0) + step + RefreshRates.Length) % RefreshRates.Length].ToString());
 		}),
-		Toggle("Contador de FPS en pantalla", "perf_overlay_enabled", false),
-		Toggle("Caché de shaders (cargas más rápidas)", "shader_cache_enabled", true),
-		Toggle("Compatibilidad de CPU (--amd-cpu)", "amd_cpu_enabled", false),
-		new("Música del menú", () => _store.Music ? "Sí" : "No", _ =>
+		Cycle("Sincronización (VSync)", "Mailbox: fluido y sin cortes, recomendado. VSync: sin cortes pero con algo más de retraso. Sin límite: el menor retraso, puede verse cortada la imagen.",
+		    "present_mode", "Mailbox", ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", "Sin límite")),
+		Toggle("HDR", "Imagen HDR si tu monitor y el juego lo admiten.", "hdr_enabled", false),
+		Toggle("Contador de FPS en pantalla", "Muestra los FPS y el uso de la gráfica y el procesador mientras juegas.", "perf_overlay_enabled", false),
+		Toggle("Ocultar el cursor", "Oculta el puntero del ratón dentro del juego.", "hide_cursor_enabled", false),
+		Section("Juego"),
+		new("Nombre de usuario", "El nombre que ven los juegos, por ejemplo al guardar o en los marcadores. Se escribe con el teclado.",
+		    () => _emulator.Ini.Get("GlobalConfiguration", "user_name") is { Length: > 0 } name ? name : "Nova5",
+		    _ => AskText("Nombre de usuario", _emulator.Ini.Get("GlobalConfiguration", "user_name") ?? "Nova5", value => SetIni("user_name", value))),
+		Cycle("Idioma de la consola", "El idioma que los juegos usan para textos y voces, si lo tienen.", "console_language", "1", ConsoleLanguages),
+		Toggle("Saltar avisos de inicio", "Pide a los juegos que se salten las pantallas de aviso del principio, si lo permiten.", "skip_notice_screen", false),
+		Section("Rendimiento"),
+		Toggle("Caché de shaders", "Guarda los shaders ya preparados para que los juegos carguen más rápido y tengan menos tirones.", "shader_cache_enabled", true),
+		Toggle("Compatibilidad de CPU", "Solo si un juego se cierra al arrancar en tu procesador. Puede bajar el rendimiento.", "amd_cpu_enabled", false),
+		Section("Mando"),
+		new("Teclado y ratón", "Qué tecla o botón del ratón hace cada botón del DualSense. Por defecto L2 y R2 van en Z y C.", () => "Configurar ›", _ => ShowKeys()),
+		Percent("Vibración del mando", "Intensidad de la vibración (0 % la apaga).", "controller_vibration_intensity", 100),
+		Percent("Altavoz del mando", "Volumen del altavoz del DualSense.", "controller_speaker_volume", 50),
+		Cycle("Color de la barra de luz", "Color de la luz del DualSense. Automático: el que pida el juego.", "controller_color", "",
+		    ("", "Automático"), ("#0050FF", "Azul"), ("#5EEAD4", "Aurora"), ("#8B5CF6", "Morado"), ("#FF2D55", "Rojo"), ("#30D158", "Verde"), ("#FFFFFF", "Blanco")),
+		Section("Trofeos"),
+		Toggle("Avisos de trofeos", "Muestra un aviso con sonido al conseguir un trofeo mientras juegas.", "trophy_enabled", true),
+		Cycle("Duración del aviso", "Cuánto tiempo se queda el aviso de trofeo en pantalla.", "trophy_duration_seconds", "6",
+		    ("5", "5 s"), ("6", "6 s"), ("8", "8 s"), ("10", "10 s")),
+		Section("Audio"),
+		new("Música del menú", "Suena la música de menú de cada juego al seleccionarlo.", () => _store.Music ? "Sí" : "No", _ =>
 		{
 			_store.Music   = !_store.Music;
 			_music.Enabled = _store.Music;
 			_store.Save();
 		}),
-		new("Volumen de la música", () => $"{_store.MusicVolume * 100:0} %", step =>
+		new("Volumen de la música", "Volumen de la música del menú.", () => $"{_store.MusicVolume * 100:0} %", step =>
 		{
 			_store.MusicVolume = Math.Clamp(Math.Round(_store.MusicVolume + step * 0.1, 1), 0, 1);
 			_music.Volume      = _store.MusicVolume;
 			_store.Save();
 		}),
-		new("Actualizaciones", () => _store.UpdateMode switch { "auto" => "Automáticas", "no" => "Desactivadas", _ => "Avisar" }, step =>
-		{
-			string[] modes = { "avisar", "auto", "no" };
-			_store.UpdateMode = modes[(Math.Max(Array.IndexOf(modes, _store.UpdateMode), 0) + step + modes.Length) % modes.Length];
-			_store.Save();
-		}),
-		new(_update is null ? $"Buscar actualizaciones (tienes la {Updates.Current})" : $"Actualizar a Nova5 {_update.Version}",
-		    () => _updating ? "Actualizando…" : "", _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }),
-		new("Añadir carpeta de juegos", () => "", _ => AddFolder()),
-		new("Donar a Nova5 en Ko-fi ☕", () => "ko-fi.com/nova5emu",
+		Section("Biblioteca"),
+		new("Añadir carpeta de juegos", "Elige otra carpeta con juegos de PS5 o archivos .pkg para añadirlos a la biblioteca.", () => "Elegir ›", _ => AddFolder()),
+		new("Donar", "Nova5 es gratis. Si te resulta útil, puedes apoyarlo en ko-fi.com/nova5emu.", () => "Ko-fi ›",
 		    _ => Process.Start(new ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),
-		new("Salir de Nova5", () => "", _ => ShowPrompt(true)),
+		new("Salir de Nova5", "Cierra el lanzador.", () => "Salir ›", _ => ShowPrompt(true)),
 	};
 
-	private Setting DemonsSoulsToggle(string label, string key)
+	private Setting DemonsSoulsToggle(string label, string detail, string key)
 	{
 		var variable = DemonsSoulsOptions.Switches.Single(s => s.Key == key).Variable;
 		bool Enabled() => DemonsSoulsOptions.Effective(_emulator.Ini.Get("GlobalConfiguration", key), Environment.GetEnvironmentVariable(variable));
-		return new(label, () => Enabled() ? "Sí" : "No", _ => SetIni(key, Enabled() ? "false" : "true"));
+		return new(label, detail, () => Enabled() ? "Sí" : "No", _ => SetIni(key, Enabled() ? "false" : "true"));
 	}
 
-	private Setting Toggle(string label, string key, bool fallback) =>
-	    new(label, () => _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? "Sí" : "No",
+	private static readonly (string, string)[] ConsoleLanguages =
+	{
+		("20", "Español (Latinoamérica)"), ("3", "Español (España)"), ("1", "Inglés (EE. UU.)"), ("18", "Inglés (Reino Unido)"),
+		("17", "Portugués (Brasil)"), ("7", "Portugués (Portugal)"), ("2", "Francés"), ("4", "Alemán"), ("5", "Italiano"),
+		("0", "Japonés"), ("9", "Coreano"), ("11", "Chino simplificado"), ("10", "Chino tradicional"), ("8", "Ruso"), ("16", "Polaco"),
+	};
+
+	// A Nova5.ini value chosen from a list: left and right move through it.
+	private Setting Cycle(string label, string detail, string key, string fallback, params (string Value, string Label)[] options)
+	{
+		int Current() => Math.Max(0, Array.FindIndex(options, o => o.Value == (_emulator.Ini.Get("GlobalConfiguration", key) ?? fallback)));
+		return new(label, detail, () => options[Current()].Label,
+		    step => SetIni(key, options[(Current() + step + options.Length) % options.Length].Value));
+	}
+
+	// A setting of one game: "General (…)" follows the general one; any other choice is kept in [<title id>] only for it.
+	private Setting GameCycle(string titleId, string label, string detail, string key, string fallback, params (string Value, string Label)[] options)
+	{
+		string? Own() => _emulator.Ini.Get(titleId, key) is { Length: > 0 } own ? own : null;
+		string General() => options.FirstOrDefault(o => o.Value == (_emulator.Ini.Get("GlobalConfiguration", key) ?? fallback)).Label ?? options[0].Label;
+		int Current() => Own() is { } own ? Array.FindIndex(options, o => o.Value == own) + 1 : 0; // 0 is General.
+		return new(label, detail, () => Current() > 0 ? options[Current() - 1].Label : $"General ({General()})", step =>
+		{
+			var next = (Math.Max(Current(), 0) + step + options.Length + 1) % (options.Length + 1);
+			if (next == 0) _emulator.Ini.Remove(titleId, key);
+			else _emulator.Ini.Set(titleId, key, options[next - 1].Value);
+			_emulator.Ini.Save();
+		});
+	}
+
+	private Setting GameToggle(string titleId, string label, string detail, string key, bool fallback) =>
+	    GameCycle(titleId, label, detail, key, fallback ? "true" : "false", ("true", "Sí"), ("false", "No"));
+
+	private Setting Percent(string label, string detail, string key, int fallback)
+	{
+		int Current() => int.TryParse(_emulator.Ini.Get("GlobalConfiguration", key), out var value) ? value : fallback;
+		return new(label, detail, () => $"{Current()} %", step => SetIni(key, Math.Clamp(Current() + step * 10, 0, 100).ToString()));
+	}
+
+	private Setting Toggle(string label, string detail, string key, bool fallback) =>
+	    new(label, detail, () => _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? "Sí" : "No",
 	        _ => SetIni(key, _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? "false" : "true"));
 
 	private void SetIni(string key, string value)
@@ -786,51 +2111,96 @@ public sealed class MainWindow : Window
 		_emulator.Ini.Save();
 	}
 
-	private void BuildSettings()
+	// Each option: its name and what it does on the left, its value in a pill on the right (filled when on).
+	private void BuildSettings(bool reveal = false)
 	{
 		_settingsList.Children.Clear();
 		var settings = Settings();
 		_setting = Math.Clamp(_setting, 0, settings.Count - 1);
+		while (settings[_setting].Header && _setting < settings.Count - 1) _setting++;
 		for (var i = 0; i < settings.Count; i++)
 		{
-			var row   = new DockPanel();
-			var value = Text(settings[i].Value(), 26, FontWeight.SemiBold, Palette.AuroraA);
-			DockPanel.SetDock(value, Dock.Right);
-			row.Children.Add(value);
-			row.Children.Add(Text(settings[i].Label, 26, FontWeight.Normal));
-			var focused = i == _setting;
-			var index   = i;
-			var item = new Border
+			var index = i;
+			if (settings[i].Header)
 			{
-				Child = row, Padding = new Thickness(28, 18), CornerRadius = new CornerRadius(16),
-				Background = Palette.Brush(focused ? Colors.White : Palette.Ink, focused ? 0.14 : 0.55),
-				BorderBrush = focused ? Palette.Aurora() : Palette.Brush(Colors.White, 0.08), BorderThickness = new Thickness(focused ? 2 : 1),
-				Cursor = new Cursor(StandardCursorType.Hand),
-			};
-			// Left click goes to the next value, right click to the previous one.
-			item.PointerPressed += (_, e) =>
+				_settingsList.Children.Add(SectionTitle(settings[i].Label));
+				continue;
+			}
+			_settingsList.Children.Add(OptionRow(settings[i], i == _setting, step =>
 			{
 				if (_zone != Zone.Settings) return;
 				_setting = index;
-				Settings()[index].Change(e.GetCurrentPoint(item).Properties.IsRightButtonPressed ? -1 : 1);
-				if (_zone == Zone.Settings && _tab == 1) BuildSettings();
-			};
-			_settingsList.Children.Add(item);
+				Settings()[index].Change(step);
+				if (_zone == Zone.Settings && _tab == SettingsTab) BuildSettings();
+			}));
 		}
+		// With the pad or the keys, the chosen row always stays in view.
+		if (reveal && _settingsList.Children[_setting] is Control chosen)
+			Dispatcher.UIThread.Post(() => chosen.BringIntoView(), DispatcherPriority.Loaded);
 	}
+
+	// One option row: its name and what it does on the left, its value in a pill on the right (filled when on).
+	// A left click passes +1 (next value), a right click -1.
+	private static Border OptionRow(Setting setting, bool focused, Action<int> click)
+	{
+		var text = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center };
+		text.Children.Add(new TextBlock { Text = setting.Label, FontSize = 25, FontWeight = FontWeight.SemiBold, Foreground = Palette.Brush(Palette.Text), TextWrapping = TextWrapping.Wrap });
+		if (setting.Detail.Length > 0)
+			text.Children.Add(new TextBlock { Text = setting.Detail, FontSize = 18, Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap });
+		var shown = setting.Value();
+		var on    = shown == "Sí";
+		var value = new Border
+		{
+			Padding = new Thickness(18, 7), CornerRadius = new CornerRadius(999), MinWidth = 76, VerticalAlignment = VerticalAlignment.Center,
+			Margin = new Thickness(28, 0, 0, 0), IsVisible = shown.Length > 0,
+			Background = on ? Palette.Aurora() : Palette.Brush(Colors.White, 0.08),
+			Child = new TextBlock
+			{
+				Text = shown, FontSize = 19, FontWeight = FontWeight.Bold, HorizontalAlignment = HorizontalAlignment.Center,
+				Foreground = on ? Palette.Brush(Color.Parse("#081022")) : Palette.Brush(Palette.Text, 0.85),
+			},
+		};
+		var row = new DockPanel();
+		DockPanel.SetDock(value, Dock.Right);
+		row.Children.Add(value);
+		row.Children.Add(text);
+		var item = new Border
+		{
+			Child = row, Padding = new Thickness(26, 15), CornerRadius = new CornerRadius(18), Margin = new Thickness(0, 0, 14, 0),
+			Background = focused ? Palette.Brush(Colors.White, 0.09) : Brushes.Transparent,
+			BorderBrush = focused ? Palette.Aurora() : Brushes.Transparent, BorderThickness = new Thickness(2),
+			Cursor = new Cursor(StandardCursorType.Hand),
+		};
+		item.PointerPressed += (_, e) => click(e.GetCurrentPoint(item).Properties.IsRightButtonPressed ? -1 : 1);
+		return item;
+	}
+
+	// The next selectable row in that direction (section titles are skipped); stays put at either end.
+	private static int Step(List<Setting> list, int from, int direction)
+	{
+		for (var i = from + direction; i >= 0 && i < list.Count; i += direction)
+			if (!list[i].Header) return i;
+		return from;
+	}
+
+	private static Control SectionTitle(string title) => new TextBlock
+	{
+		Text = title.ToUpperInvariant(), FontSize = 17, FontWeight = FontWeight.Bold, LetterSpacing = 1.6,
+		Foreground = Palette.Brush(Palette.AuroraA), Margin = new Thickness(26, 18, 0, 2),
+	};
 
 	private void SettingsInput(PadInput input)
 	{
 		var settings = Settings();
 		switch (input)
 		{
-			case PadInput.Up:    _setting = Math.Max(0, _setting - 1); break;
-			case PadInput.Down:  _setting = Math.Min(settings.Count - 1, _setting + 1); break;
+			case PadInput.Up:    _setting = Step(settings, _setting, -1); break;
+			case PadInput.Down:  _setting = Step(settings, _setting, 1); break;
 			case PadInput.Left:  settings[_setting].Change(-1); break;
 			case PadInput.Right or PadInput.Accept: settings[_setting].Change(1); break;
 			case PadInput.Back:  ShowTab(0); return;
 		}
-		BuildSettings();
+		if (_zone == Zone.Settings) BuildSettings(reveal: true);
 	}
 
 	private async void AddFolder()
@@ -843,7 +2213,7 @@ public sealed class MainWindow : Window
 		var before = _games.Count;
 		Reload();
 		ShowToast(_games.Count > before ? $"{_games.Count - before} juego(s) añadido(s)" : "No se encontraron juegos en esa carpeta");
-		if (_tab == 1) ShowTab(0);
+		if (_tab != 0) ShowTab(0);
 	}
 
 	// ---- Updates ------------------------------------------------------------------------------
@@ -852,7 +2222,7 @@ public sealed class MainWindow : Window
 	{
 		if (manual) ShowToast("Buscando actualizaciones…");
 		_update = await Updates.CheckAsync();
-		if (_tab == 1) BuildSettings();
+		if (_tab == SettingsTab) BuildSettings();
 		if (_update is null)
 		{
 			if (manual) ShowToast($"Tienes la última versión ({Updates.Current})");
@@ -924,11 +2294,14 @@ public sealed class MainWindow : Window
 			_store.LastPlayed[game.TitleId]  = DateTime.UtcNow;
 			_store.Save();
 		}
+		var closed   = _runningGame;
+		_trophyCache.Clear(); // It may have earned trophies.
 		_running     = null;
 		_runningGame = null;
 		WindowState  = WindowState.FullScreen;
 		Activate();
 		Select(_index, force: true);
+		if (closed is not null) AfterArchiveTest(closed);
 	}
 
 	// ---- Building blocks ----------------------------------------------------------------------
@@ -1077,6 +2450,11 @@ public sealed class MainWindow : Window
 
 	// --snapshot <file.png>: renders the home screen at 1920x1080 and exits, to review the UI without a session.
 	public static string? SnapshotPath { get; set; }
+	public static bool    SnapshotNotes { get; set; }
+	public static bool    SnapshotSettings { get; set; }
+	public static bool    SnapshotGame { get; set; }
+	public static bool    SnapshotTrophies { get; set; }
+	public static bool    SnapshotTrophyList { get; set; }
 
 	private void SaveSnapshot(string path)
 	{

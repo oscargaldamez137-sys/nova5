@@ -19,6 +19,7 @@ public:
 	~ShaderReadObserver() { s_current = m_previous; }
 	ShaderReadObserver(const ShaderReadObserver&)            = delete;
 	ShaderReadObserver& operator=(const ShaderReadObserver&) = delete;
+	static bool Active() { return s_current != nullptr; }
 	// Nested observers all see the read, innermost first.
 	static void         ObserveRead(uint64_t address, uint64_t size) {
         for (auto* observer = s_current; observer != nullptr; observer = observer->m_previous)
@@ -36,12 +37,17 @@ public:
 			    input.read_specialization_memory ? ReadClean : nullptr;
 			m_runtime.sync_memory = input.sync_memory ? Sync : nullptr;
 			m_runtime.try_read_memory_span = input.try_read_memory_span ? ReadSpan : nullptr;
+			m_runtime.mapping_end = input.mapping_end ? MappingEnd : nullptr;
 		}
 		Runtime(const Runtime&)                                                         = delete;
 		Runtime&                                              operator=(const Runtime&) = delete;
 		[[nodiscard]] const ShaderRecompiler::IR::SrtRuntime& Get() const { return m_runtime; }
 
 	private:
+		static uint64_t MappingEnd(void* userdata, uint64_t address) {
+			auto& self = *static_cast<Runtime*>(userdata);
+			return self.m_original.mapping_end(self.m_original.userdata, address);
+		}
 		void Observe(uint64_t address, uint64_t size) const {
 			for (auto* observer = m_observer; observer != nullptr; observer = observer->m_previous)
 				observer->m_callback(observer->m_userdata, address, size);

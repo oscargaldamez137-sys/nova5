@@ -62,6 +62,8 @@ Copy-Item (Join-Path $PSScriptRoot 'LEEME.txt') $stage
 $extractor = Join-Path $(if ($Tools) { $Tools } else { Join-Path $repo '..\herramientas' }) 'pkg-extractor\pkg-to-anyps5-src'
 New-Item -ItemType Directory -Force (Join-Path $stage 'tools') | Out-Null
 Copy-Item (Join-Path $extractor 'target\release\pkg-to-anyps5.exe') (Join-Path $stage 'tools')
+# .zar packer (Exzap/ZArchive, MIT-0; the zarchive_pack CMake target), run from a game's options.
+if (Test-Path (Join-Path $build 'tools\zarchive.exe')) { Copy-Item (Join-Path $build 'tools\zarchive.exe') (Join-Path $stage 'tools') }
 Copy-Item (Join-Path $extractor 'LICENSE') (Join-Path $licenses 'pkg-to-anyps5-LICENSE.txt')
 Copy-Item (Join-Path $extractor 'README.md') (Join-Path $licenses 'pkg-to-anyps5-README.md')
 Copy-Item (Join-Path $PSScriptRoot 'pkg-to-anyps5.patch') (Join-Path $licenses 'pkg-to-anyps5-changes.patch')

@@ -4,9 +4,12 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 union SDL_Event;
@@ -14,6 +17,8 @@ union SDL_Event;
 namespace Libs::Graphics {
 
 struct GraphicContext;
+
+void NotifyTrophyUnlocked(std::string_view name, int32_t grade, std::span<const std::byte> icon_png);
 
 struct SystemOverlayVisualState {
 	bool     active;

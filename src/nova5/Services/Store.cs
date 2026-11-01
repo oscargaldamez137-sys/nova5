@@ -12,6 +12,8 @@ public sealed class Store
 	public double                       MusicVolume { get; set; } = 0.6;
 	// "avisar" shows an update and waits for the player, "auto" installs it at startup, "no" never checks.
 	public string                       UpdateMode  { get; set; } = "avisar";
+	// The last version whose notes the player saw; a newer Nova5 shows its notes once at startup.
+	public string?                      SeenNotes   { get; set; }
 
 	private static string FilePath => Path.Combine(AppContext.BaseDirectory, "nova5.json");
 

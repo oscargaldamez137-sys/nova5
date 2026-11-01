@@ -9,7 +9,7 @@
     <AssemblyName>Nova5</AssemblyName>
     <RootNamespace>Nova5</RootNamespace>
     <ApplicationIcon>Assets\nova5.ico</ApplicationIcon>
-    <Version>0.7.0</Version>
+    <Version>0.7.1</Version>
     <Product>Nova5</Product>
     <Copyright>GPL-2.0-or-later. Based on KytyPS5.</Copyright>
     <!-- One executable next to Nova5Emulator.exe that carries its own .NET runtime, so any PC can run it. -->
@@ -23,6 +23,10 @@
 
   <ItemGroup>
     <AvaloniaResource Include="Assets\**" />
+    <!-- The release notes the website shows too (Services/ReleaseNotes.cs). -->
+    <EmbeddedResource Include="..\..\website\novedades.json" LogicalName="novedades.json" />
+    <!-- Tuned patch files, installed next to the launcher; Services/GamePatches.cs seeds _Patches from them. -->
+    <None Include="patches\*.json" Link="assets\patches\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 
   <ItemGroup>

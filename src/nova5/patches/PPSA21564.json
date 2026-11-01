@@ -1,0 +1,83 @@
+{
+  "id": "PPSA21564",
+  "name": "ASTRO BOT: non RT and bounded texture loading watermark",
+  "version": "01.007.000",
+  "process": "eboot.bin",
+  "source_sha256": "70d673f7c43edb189461a60f076e15baa73f9a82a579603e44372ae5b7225d3d",
+  "mods": [
+    {
+      "name": "WITHDRAWN: 6 GiB reported budget exceeds real 4.5 GiB texture pool",
+      "enabled": false,
+      "nova5": {
+        "label": "Retirado: presupuesto de texturas de 6 GB",
+        "detail": "Anuncia más memoria de texturas de la real. Retirado porque puede causar fallos; déjalo desactivado."
+      },
+      "memory": [
+        {
+          "offset": "0x73b018a",
+          "off": "48b90000002001000000",
+          "on": "48b90000008001000000"
+        }
+      ]
+    },
+    {
+      "name": "Select the existing non-tiled deferred-lighting renderer",
+      "enabled": true,
+      "nova5": {
+        "label": "Iluminación sin ray tracing",
+        "detail": "Usa el renderizador de iluminación que el juego trae sin ray tracing. Necesario en todos los modos.",
+        "modes": [ "calidad", "equilibrado", "rendimiento" ]
+      },
+      "memory": [
+        {
+          "offset": "0x73eb993",
+          "off": "4584f60f84ed0800004531f64c8d3dea78a40141b430",
+          "on": "4584f6e9ee080000904531f64c8d3dea78a40141b430"
+        }
+      ]
+    },
+    {
+      "name": "Disable GI probes and lighting shaders",
+      "enabled": true,
+      "nova5": {
+        "label": "Sin iluminación global",
+        "detail": "Quita la iluminación indirecta (luz que rebota): más FPS, pero la imagen se ve más plana.",
+        "modes": [ "rendimiento" ]
+      },
+      "memory": [
+        {
+          "offset": "0x711d0b3",
+          "off": "0fb682800700008887e4050000",
+          "on": "b80000000090908887e4050000"
+        }
+      ]
+    },
+    {
+      "name": "Experimental: 95% texture loading watermark within original 4.5 GiB pool",
+      "enabled": true,
+      "nova5": {
+        "label": "Carga de texturas limitada",
+        "detail": "Carga texturas hasta el 95 % de la memoria del juego, con menos tirones. Experimental.",
+        "modes": [ "equilibrado", "rendimiento" ]
+      },
+      "memory": [
+        {
+          "offset": "0x743f612",
+          "off": "c5fa1005eaf8f000",
+          "on": "c5fa100516f2f000"
+        },
+        {
+          "offset": "0x743f8ba",
+          "off": "c5fa100542f6f000",
+          "on": "c5fa10056eeff000"
+        },
+        {
+          "offset": "0x7440dba",
+          "off": "c5f82e0542e1f000",
+          "on": "c5f82e056edaf000"
+        }
+      ]
+    }
+  ],
+  "verified_eboot_sha256": "3b5100797fe83663e18a650f82f901d066acf1029ae80cfb1be638fe0839debd"
+}

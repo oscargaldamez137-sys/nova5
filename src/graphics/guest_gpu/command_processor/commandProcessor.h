@@ -184,6 +184,10 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Jetsku 146edeaf: native indirects leave NUM_INSTANCES in GPU memory;
+	// read it only when a later direct draw inherits it. Known counts need one source.
+	uint64_t m_pending_instances_address = 0;
+	uint32_t NumInstances();
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

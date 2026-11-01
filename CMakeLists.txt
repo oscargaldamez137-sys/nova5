@@ -663,6 +663,9 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 add_executable(clean_read_cache_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CleanReadCacheTests.cpp")
 target_include_directories(clean_read_cache_tests PRIVATE ${inc_headers})
 
+add_executable(jetsku_draw_ports_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JetskuDrawPortsTests.cpp")
+target_include_directories(jetsku_draw_ports_tests PRIVATE ${inc_headers})
+
 add_executable(texture_binding_memo_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TextureBindingMemoTests.cpp")
 target_include_directories(texture_binding_memo_tests PRIVATE ${inc_headers})
 
@@ -875,6 +878,7 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME clean_read_cache COMMAND $<TARGET_FILE:clean_read_cache_tests>)
+	add_test(NAME jetsku_draw_ports COMMAND $<TARGET_FILE:jetsku_draw_ports_tests>)
 	add_test(NAME texture_binding_memo COMMAND $<TARGET_FILE:texture_binding_memo_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -990,6 +994,25 @@ endif()
 
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+
+# Nova5 trophy packages/persistence, shared with the previous engine (8778e665).
+add_executable(trophy_system_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TrophySystemTests.cpp")
+target_link_libraries(trophy_system_tests PRIVATE common)
+target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+  add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
+endif()
+add_custom_target(nova5_trophy_assets
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/images"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav"
+    "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds/trophy-unlock.wav"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/assets/images/hidden-trophy.png"
+    "$<TARGET_FILE_DIR:kyty_emulator>/assets/images/hidden-trophy.png"
+  VERBATIM)
+add_dependencies(kyty_emulator nova5_trophy_assets)
+install(FILES "${PROJECT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav" DESTINATION assets/sounds)
+install(FILES "${PROJECT_SOURCE_DIR}/assets/images/hidden-trophy.png" DESTINATION assets/images)
 set_target_properties(kyty_emulator PROPERTIES OUTPUT_NAME Nova5Emulator)
 configure_macos_guest_address_space(kyty_emulator)
 

@@ -145,6 +145,8 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// GPU-thread-only counterpart of Jetsku's pending-publication query.
+	[[nodiscard]] bool HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool HasUnpublishedDownloads() const { return m_active_guest_readbacks != 0; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	// IsRegionCpuModified's answer, inline (the table path's).

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/passTiming.h"
+#include "graphics/host_gpu/renderer/nativeIndirectPolicy.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "local/resource-provenance.h"
 
@@ -52,6 +53,7 @@
 #include <optional>
 #include <thread>
 #include <vector>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -1254,11 +1256,22 @@ void CommandProcessor::SetDispatchIndirectArgsBaseAddress(
 }
 
 void CommandProcessor::SetNumInstances(uint32_t num_instances) {
+	m_pending_instances_address = 0;
 	if (num_instances == 0) {
 		num_instances = 1;
 	}
 
 	m_num_instances = num_instances;
+}
+
+uint32_t CommandProcessor::NumInstances() {
+	if (m_pending_instances_address != 0) {
+		const auto address = std::exchange(m_pending_instances_address, 0);
+		NativeIndirect::Count(NativeIndirect::Outcome::InstanceRead, address);
+		(void)LibKernel::Memory::SyncGpuCleanBacking(address, sizeof(uint32_t));
+		std::memcpy(&m_num_instances, reinterpret_cast<const void*>(address), sizeof(uint32_t));
+	}
+	return m_num_instances;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -1300,7 +1313,7 @@ bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (args.base_vertex != 0 || args.first_instance != 0) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1313,63 +1326,62 @@ bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 }
 
 bool CommandProcessor::TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed) {
-	// Reading GPU-written arguments on the CPU waits for the GPU to finish all work queued so
-	// far (0.1-0.3 ms). The draw uses them on the GPU instead, as native XPR runs do: an indexed
-	// triangle, point or line list over the whole index buffer (primitive restart with a custom index scans the
-	// indices a draw uses), or a non-indexed draw of a directly drawn type (a triangle strip here).
 	using Prospero::PrimitiveType;
-	const auto     primitive = m_ucfg.GetPrimType();
-	const uint64_t size      = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	// Diagnostic: KYTY_INDIRECT_LOG=1 counts why a draw's GPU-written arguments are read on the CPU.
-	static const bool indirect_log = std::getenv("KYTY_INDIRECT_LOG") != nullptr;
-	if (indirect_log) {
-		static std::atomic<uint64_t> why[8];
-		auto&      res    = GetGpuResources();
-		const auto bytes0 = uint64_t {count ? count - 1u : 0u} * stride + size;
-		const int  reason = count == 0 || (args & 3u) != 0 || stride % 4u != 0 || stride < size ? 0
-		                    : indexed && primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kPointList && primitive != PrimitiveType::kLineList ? 1
-		                    : indexed && (m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size) ? 2
-		                    : !indexed && primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip &&
-		                            primitive != PrimitiveType::kTriFan && primitive != PrimitiveType::kLineList &&
-		                            primitive != PrimitiveType::kLineStrip && primitive != PrimitiveType::kPointList
-		                        ? 3
-		                    : !res.IsMapped(args, bytes0)                                        ? 4
-		                    : !res.GetBufferCache().HasGpuDirtyBytes(args, bytes0)               ? 5
-		                    : res.GetTextureCache().IsRegionGpuModified(args, bytes0)            ? 6
-		                                                                                         : 7;
-		const auto n = why[reason].fetch_add(1) + 1;
-		if (reason != 7 && reason != 5 && (n & (n - 1)) == 0)
-			std::printf("[INDIRECT] refused reason=%d (n=%llu) args=0x%llx indexed=%d prim=%u index_type=%u count=%u\n", reason,
-			            static_cast<unsigned long long>(n), static_cast<unsigned long long>(args), indexed,
-			            static_cast<unsigned>(primitive), m_index_type_and_size, count);
+	using NativeIndirect::Outcome;
+	const auto refuse = [&](Outcome why) { NativeIndirect::Count(why, args, m_index_buffer_size); return false; };
+	if (!NativeIndirect::Enabled()) return refuse(Outcome::Disabled);
+	const uint64_t size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	if (!count || (args & 3u) || (stride & 3u) || stride < size) return refuse(Outcome::Arguments);
+	const auto primitive = m_ucfg.GetPrimType();
+	switch (primitive) {
+		case PrimitiveType::kTriList: case PrimitiveType::kTriStrip: case PrimitiveType::kTriFan:
+		case PrimitiveType::kPointList: case PrimitiveType::kLineList: case PrimitiveType::kLineStrip: break;
+		default: return refuse(Outcome::Topology);
 	}
-	if (count == 0 || (args & 3u) != 0 || stride % 4u != 0 || stride < size ||
-	    (indexed ? (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kPointList &&
-	                primitive != PrimitiveType::kLineList) || m_index_type_and_size > 1 || !m_index_base_addr ||
-	                   !m_index_buffer_size
-	             : primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip &&
-	                   primitive != PrimitiveType::kTriFan && primitive != PrimitiveType::kLineList &&
-	                   primitive != PrimitiveType::kLineStrip && primitive != PrimitiveType::kPointList))
-		return false;
-	const uint64_t bytes     = uint64_t {count - 1u} * stride + size;
-	auto&          resources = GetGpuResources();
-	if (!resources.IsMapped(args, bytes) || !resources.GetBufferCache().HasGpuDirtyBytes(args, bytes) ||
-	    resources.GetTextureCache().IsRegionGpuModified(args, bytes))
-		return false;
-	if (!indexed)
-		return DrawIndexAuto({.vertex_count    = 1,
-		                      .instance_count  = 1,
-		                      .offset_source   = DrawOffsetSource::IndirectArgs,
-		                      .gpu_args        = args,
-		                      .gpu_args_count  = count,
-		                      .gpu_args_stride = stride});
-	return DrawIndex({.index_count     = m_index_buffer_size,
-	                  .index_addr      = reinterpret_cast<const void*>(m_index_base_addr),
-	                  .instance_count  = 1,
-	                  .offset_source   = DrawOffsetSource::IndirectArgs,
-	                  .gpu_args        = args,
-	                  .gpu_args_count  = count,
-	                  .gpu_args_stride = stride});
+	if (indexed && (m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size))
+		return refuse(Outcome::Index);
+	const auto& hw = CurrentBuffer().GetRegisters();
+	const auto& control = hw.GetRenderControl();
+	const auto& over = hw.GetDepthRenderOverride();
+	// Jetsku MayRunTargetOperation: argument counts are unknown, so don't execute a
+	// metadata clear/copy or resolve that the zero-count CPU path could skip.
+	if (hw.GetColorControl().mode > 1 || control.copy_depth_to_color || control.copy_stencil_to_color ||
+	    control.depth_clear_enable || control.stencil_clear_enable ||
+	    (hw.GetColorControl().mode == 0 && ((over.force_z_dirty && over.force_z_valid) ||
+	     (over.force_stencil_dirty && over.force_stencil_valid)))) return refuse(Outcome::TargetOp);
+	// Jetsku ResolveNativePrimitiveRestart: a custom restart requires a CPU scan.
+	if (indexed) {
+		const auto reset = m_ucfg.GetPrimitiveResetControl();
+		if (reset & ~3u) return refuse(Outcome::Restart);
+		if ((reset & 1u) && (primitive == PrimitiveType::kTriStrip || primitive == PrimitiveType::kTriFan ||
+		                       primitive == PrimitiveType::kLineStrip)) {
+			const uint32_t mask = m_index_type_and_size == 0 ? 0xffffu : 0xffffffffu;
+			const auto value = hw.GetPrimitiveResetIndex();
+			if (!((reset & 2u) && (value & ~mask)) && (value & mask) != mask) return refuse(Outcome::Restart);
+		}
+	}
+	if (count > m_renderer.GetGraphics().GetPhysicalDeviceProperties().limits.maxDrawIndirectCount)
+		return refuse(Outcome::HostLimit);
+	const uint64_t bytes = uint64_t{count - 1u} * stride + size;
+	auto& resources = GetGpuResources();
+	if (!resources.IsMapped(args, bytes) || (indexed && !resources.IsMapped(m_index_base_addr,
+	        uint64_t{m_index_buffer_size} * (m_index_type_and_size == 0 ? 2u : 4u))))
+		return refuse(Outcome::Mapping);
+	auto& cache = resources.GetBufferCache();
+	if (!cache.HasGpuDirtyBytes(args, bytes) && !cache.HasPendingBackingPublication(args, bytes))
+		return refuse(Outcome::CpuClean);
+	if (resources.GetTextureCache().IsRegionGpuModified(args, bytes)) return refuse(Outcome::ImageOwner);
+	const bool accepted = indexed
+	    ? DrawIndex({.index_count = m_index_buffer_size, .index_addr = reinterpret_cast<const void*>(m_index_base_addr),
+	                 .instance_count = 1, .offset_source = DrawOffsetSource::IndirectArgs,
+	                 .gpu_args = args, .gpu_args_count = count, .gpu_args_stride = stride})
+	    : DrawIndexAuto({.vertex_count = 1, .instance_count = 1, .offset_source = DrawOffsetSource::IndirectArgs,
+	                     .gpu_args = args, .gpu_args_count = count, .gpu_args_stride = stride});
+	if (accepted) {
+		m_pending_instances_address = args + uint64_t{count - 1u} * stride + sizeof(uint32_t);
+		NativeIndirect::Count(Outcome::Native, args, m_index_buffer_size);
+	}
+	return accepted;
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1512,7 +1524,7 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	// A zero-sized draw draws nothing on the normal path either (it returns first).
 	if (index_count == 0 || index_address == 0 || index_address % element != 0) return skip();
 	CheckBuffer();
-	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
+	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, NumInstances()};
 	const auto index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 	if (DrawStateObserver::g_shadow.last_clean &&
 	    executor.TableContinue(CurrentBuffer(), {}, index_address, uint64_t {index_count} * element, index_type, &draw))
@@ -1558,7 +1570,7 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 		if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
 		else if (HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) scaled.emplace(m_ctx, m_sh_ctx.GetPs());
 	}
-	const RenderExecutor::NativeXprDirectDraw draw {0, packet[1], m_num_instances, false};
+	const RenderExecutor::NativeXprDirectDraw draw {0, packet[1], NumInstances(), false};
 	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
 	           ? 3u
 	           : 0u;
@@ -1629,6 +1641,7 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 	                                                    {argument_addresses.data(), count})) {
 		return 0;
 	}
+	m_pending_instances_address = 0;
 	m_num_instances = last_instances;
 	m_draw_run_skip = 0;
 	return count * 5u;
@@ -1657,6 +1670,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));
+		m_pending_instances_address = 0;
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
@@ -1691,6 +1705,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 			     args.index_count_per_instance, index_count);
 		}
 	}
+
+	m_pending_instances_address = 0;
 
 	m_num_instances = args.instance_count;
 	DrawIndex({.index_count    = index_count,
@@ -1750,6 +1766,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			m_pending_instances_address = 0;
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1784,6 +1801,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 				     args->index_count_per_instance, index_count);
 			}
 		}
+
+		m_pending_instances_address = 0;
 
 		m_num_instances = args->instance_count;
 		DrawIndex({.index_count    = index_count,
@@ -1879,7 +1898,7 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	CheckBuffer();
 
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a menu's own draw notes the
 	// menu first.

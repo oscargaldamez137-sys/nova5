@@ -1,4 +1,4 @@
-﻿using Avalonia;
+using Avalonia;
 
 namespace Nova5;
 
@@ -28,6 +28,12 @@ internal static class Program
 		}
 		var snapshot = Array.IndexOf(args, "--snapshot");
 		if (snapshot >= 0 && snapshot + 1 < args.Length) MainWindow.SnapshotPath = Path.GetFullPath(args[snapshot + 1]);
+		// With --snapshot: the notes box or the settings page instead of the home screen.
+		MainWindow.SnapshotNotes    = args.Contains("--snapshot-notes");
+		MainWindow.SnapshotSettings = args.Contains("--snapshot-settings");
+		MainWindow.SnapshotGame     = args.Contains("--snapshot-game");
+		MainWindow.SnapshotTrophies = args.Contains("--snapshot-trophies");
+		MainWindow.SnapshotTrophyList = args.Contains("--snapshot-trophy-list");
 		BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
 	}
 

@@ -16,6 +16,14 @@
   <img src="website/assets/nova5-launcher.jpg" width="820" alt="Lanzador de Nova5">
 </p>
 
+<p align="center">
+  <img src="website/assets/nova5-trofeos.jpg" width="405" alt="Trofeos de cada juego">
+  <img src="website/assets/nova5-lista-trofeos.jpg" width="405" alt="Lista de trofeos de un juego">
+  <br>
+  <img src="website/assets/nova5-opciones-juego.jpg" width="405" alt="Opciones del juego: modos y parches">
+  <img src="website/assets/nova5-ajustes.jpg" width="405" alt="Ajustes por secciones">
+</p>
+
 ## Qué es
 
 Nova5 combina el emulador [KytyPS5](https://github.com/KytyPS5/KytyPS5), con mejoras de rendimiento
@@ -23,7 +31,10 @@ y correcciones propias, y un lanzador nuevo pensado para jugar desde el sofá:
 
 - Carátulas y fondos en alta resolución de cada juego, con transiciones suaves.
 - La música de menú de cada juego al seleccionarlo (`sce_sys/snd0.at9`, decodificada con LibAtrac9).
-- Control total con mando (SDL3) o teclado.
+- Control total con mando (SDL3), teclado o ratón; teclas del DualSense configurables.
+- Trofeos: avisos al conseguirlos y una pestaña con el progreso y la lista de cada juego.
+- Opciones de cada juego: modos Calidad, Equilibrado y Rendimiento, parches explicados, parches de la comunidad y ajustes propios (resolución, VSync, HDR…).
+- Compresión de juegos en `.zar` (se juegan sin descomprimir), instalación automática de `.pkg` de juegos y DLC.
 - Configuración automática en el primer arranque: detecta el procesador y activa la compatibilidad de CPU solo si hace falta.
 - Instalador para Windows que no requiere permisos de administrador.
 

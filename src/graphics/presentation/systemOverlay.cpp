@@ -7,6 +7,13 @@
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
+#include "imgui_internal.h"
+#include "stb_image.h"
+#include "common/emulatorConfig.h"
+#include "common/localization.h"
+#include <filesystem>
+#include <limits>
+#include <cstring>
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
@@ -32,6 +39,156 @@
 namespace Libs::Graphics {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+struct TrophyNotification {
+	std::string            name;
+	int32_t                grade;
+	std::vector<std::byte> icon_png;
+};
+std::mutex                     g_trophy_notification_mutex;
+std::deque<TrophyNotification> g_trophy_notifications;
+std::atomic<bool>              g_trophy_notification_active {false};
+
+std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
+	std::vector<std::string_view> lines;
+	auto* const                  font = ImGui::GetFont();
+	for (;;) {
+		const auto newline   = text.find('\n');
+		const auto paragraph = text.substr(0, newline);
+		auto       line      = paragraph.substr(0, 0);
+		for (auto start = paragraph.find_first_not_of(" \t\r"); start != std::string_view::npos;) {
+			const auto end  = std::min(paragraph.find_first_of(" \t\r", start), paragraph.size());
+			const auto word = paragraph.substr(start, end - start);
+			const std::string_view candidate(line.empty() ? word.begin() : line.begin(),
+			                                 word.end());
+			// Keep an oversized word intact; the toast's clip rectangle handles overflow.
+			if (!line.empty() && font->CalcTextSizeA(font_size, std::numeric_limits<float>::max(),
+			                                       0.0f, candidate.data(),
+			                                       candidate.data() + candidate.size()).x > width) {
+				lines.push_back(line);
+				line = word;
+			} else {
+				line = candidate;
+			}
+			start = paragraph.find_first_not_of(" \t\r", end);
+		}
+		lines.push_back(line);
+		if (newline == std::string_view::npos) {
+			return lines;
+		}
+		text.remove_prefix(newline + 1);
+	}
+}
+void AddSystemFontFallbacks(ImGuiIO& io) {
+	io.Fonts->AddFontDefault();
+	const auto add = [&](std::initializer_list<const char*> paths) {
+		for (const char* path: paths) {
+			std::error_code error;
+			if (std::filesystem::is_regular_file(path, error)) {
+				ImFontConfig config;
+				config.MergeMode = true;
+				config.Flags = ImFontFlags_NoLoadError;
+				if (io.Fonts->AddFontFromFileTTF(path, 0.0f, &config) != nullptr) {
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	bool found =
+	    add({"C:/Windows/Fonts/segoeui.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+	         "/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	         "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf"});
+	const auto  locale     = Common::Localization::LocaleName(Config::GetConsoleLanguage());
+	const char* noto_cjk[] = {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"};
+	if (locale == "ja-JP") {
+		found = add({"C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc",
+		             "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", noto_cjk[0], noto_cjk[1],
+		             noto_cjk[2]});
+	} else if (locale == "ko-KR") {
+		found = add({"C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+		             noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "zh-Hans" || locale == "zh-Hant") {
+		found =
+		    add({locale == "zh-Hans" ? "C:/Windows/Fonts/msyh.ttc" : "C:/Windows/Fonts/msjh.ttc",
+		         "/System/Library/Fonts/PingFang.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "th-TH") {
+		found = add({"C:/Windows/Fonts/leelawui.ttf", "C:/Windows/Fonts/tahoma.ttf",
+		             "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+		             "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+		             "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+		             "/usr/share/fonts/noto/NotoSansThai-Regular.ttf"});
+	} else if (locale == "ar-AE") {
+		found = add({"C:/Windows/Fonts/tahoma.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf",
+		             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		             "/usr/share/fonts/TTF/DejaVuSans.ttf",
+		             "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+		             "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf"});
+	}
+	if (!found) {
+		LOGF("[Trophy] no installed fallback font for %.*s\n", static_cast<int>(locale.size()),
+		     locale.data());
+	}
+}
+std::u16string Utf8ToUtf16(std::string_view text);
+
+std::string PrepareTrophySubtitle(int language) {
+	const auto text = Common::Localization::Get(language, "trophy.toast.earned");
+	if (Common::Localization::LocaleName(language) != "ar-AE") {
+		return std::string(text);
+	}
+	struct ArabicForm {
+		char16_t letter;
+		char16_t isolated;
+		bool     joins_next;
+	};
+	static constexpr ArabicForm FORMS[] = {
+	    {0x0621, 0xfe80, false}, {0x0622, 0xfe81, false}, {0x0623, 0xfe83, false},
+	    {0x0624, 0xfe85, false}, {0x0625, 0xfe87, false}, {0x0626, 0xfe89, true},
+	    {0x0627, 0xfe8d, false}, {0x0628, 0xfe8f, true},  {0x0629, 0xfe93, false},
+	    {0x062a, 0xfe95, true},  {0x062b, 0xfe99, true},  {0x062c, 0xfe9d, true},
+	    {0x062d, 0xfea1, true},  {0x062e, 0xfea5, true},  {0x062f, 0xfea9, false},
+	    {0x0630, 0xfeab, false}, {0x0631, 0xfead, false}, {0x0632, 0xfeaf, false},
+	    {0x0633, 0xfeb1, true},  {0x0634, 0xfeb5, true},  {0x0635, 0xfeb9, true},
+	    {0x0636, 0xfebd, true},  {0x0637, 0xfec1, true},  {0x0638, 0xfec5, true},
+	    {0x0639, 0xfec9, true},  {0x063a, 0xfecd, true},  {0x0641, 0xfed1, true},
+	    {0x0642, 0xfed5, true},  {0x0643, 0xfed9, true},  {0x0644, 0xfedd, true},
+	    {0x0645, 0xfee1, true},  {0x0646, 0xfee5, true},  {0x0647, 0xfee9, true},
+	    {0x0648, 0xfeed, false}, {0x0649, 0xfeef, false}, {0x064a, 0xfef1, true},
+	};
+	const auto form = [](char16_t c) -> const ArabicForm* {
+		for (const auto& value: FORMS) {
+			if (value.letter == c) {
+				return &value;
+			}
+		}
+		return nullptr;
+	};
+	const auto logical = Utf8ToUtf16(text);
+	if (std::none_of(logical.begin(), logical.end(),
+	                 [](char16_t c) { return c >= 0x0600 && c <= 0x06ff; })) {
+		return std::string(text);
+	}
+	auto visual = logical;
+	for (size_t i = 0; i < logical.size(); ++i) {
+		const auto* current = form(logical[i]);
+		if (current == nullptr) {
+			continue;
+		}
+		const auto* previous = i > 0 ? form(logical[i - 1]) : nullptr;
+		const auto* next     = i + 1 < logical.size() ? form(logical[i + 1]) : nullptr;
+		const bool  joins_previous =
+		    previous != nullptr && previous->joins_next && current->letter != 0x0621;
+		const bool joins_next = current->joins_next && next != nullptr && next->letter != 0x0621;
+		visual[i]             = static_cast<char16_t>(current->isolated + (joins_next ? 2 : 0) +
+		                                              (joins_previous ? 1 : 0));
+	}
+	std::reverse(visual.begin(), visual.end());
+	return Common::Utf16ToUtf8(visual);
+}
 
 namespace CoreIme   = Libs::Ime;
 namespace DialogIme = Libs::Dialog::ImeDialog;
@@ -476,8 +633,17 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
 	const auto save   = SaveDialog::GetVisualState();
-	return {core.active || dialog.active || error.active || save.active,
-	        core.revision + dialog.revision + error.revision + save.revision};
+	const bool trophy = g_trophy_notification_active.load(std::memory_order_acquire);
+	return {core.active || dialog.active || error.active || save.active || trophy,
+	        core.revision + dialog.revision + error.revision + save.revision + (trophy ? 1u : 0u)};
+}
+
+void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
+                          std::span<const std::byte> icon_png) {
+	std::scoped_lock lock(g_trophy_notification_mutex);
+	g_trophy_notifications.push_back(
+	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
+	g_trophy_notification_active.store(true, std::memory_order_release);
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -639,8 +805,14 @@ struct SystemOverlay::Impl {
 	explicit Impl(GraphicContext& context): graphics(context) {}
 
 	~Impl() {
+		if (trophy_sound_device != 0) SDL_CloseAudioDevice(trophy_sound_device);
+		SDL_FreeWAV(trophy_sound_data);
+		if (trophy_sound_initialized) SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		ReleaseVulkan();
 		if (imgui_context != nullptr) {
+			ImGui::SetCurrentContext(imgui_context);
+			if (trophy_notification_image) ImGui::UnregisterUserTexture(trophy_notification_image.get());
+			for (const auto& texture: retired_trophy_images) ImGui::UnregisterUserTexture(texture.get());
 			ImGui::DestroyContext(imgui_context);
 		}
 	}
@@ -661,7 +833,7 @@ struct SystemOverlay::Impl {
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
 		// The default font first (dialogs); the panels' where Windows has it.
-		io.Fonts->AddFontDefault();
+		AddSystemFontFallbacks(io);
 #ifdef _WIN32
 		const char* windows = std::getenv("WINDIR");
 		const auto  fonts   = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\";
@@ -731,6 +903,190 @@ struct SystemOverlay::Impl {
 		vulkan_initialized = true;
 	}
 
+	std::unique_ptr<ImTextureData> LoadTrophyIcon(std::span<const std::byte> encoded) {
+		if (encoded.empty() ||
+		    encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+			return nullptr;
+		}
+
+		const auto* data   = reinterpret_cast<const stbi_uc*>(encoded.data());
+		const int   size   = static_cast<int>(encoded.size());
+		int         width  = 0;
+		int         height = 0;
+		if (!stbi_info_from_memory(data, size, &width, &height, nullptr) || width <= 0 ||
+		    height <= 0 || width > 512 || height > 512) {
+			LOGF("[Trophy] invalid icon or dimensions exceed 512x512\n");
+			return nullptr;
+		}
+		auto* pixels = stbi_load_from_memory(data, size, &width, &height, nullptr, 4);
+		if (pixels == nullptr) {
+			LOGF("[Trophy] could not decode trophy icon: %s\n", stbi_failure_reason());
+			return nullptr;
+		}
+
+		auto texture = std::make_unique<ImTextureData>();
+		texture->Create(ImTextureFormat_RGBA32, width, height);
+		std::memcpy(texture->Pixels, pixels,
+		            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+		texture->UseColors = true;
+		stbi_image_free(pixels);
+		ImGui::RegisterUserTexture(texture.get());
+		return texture;
+	}
+
+	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
+		std::erase_if(retired_trophy_images, [](const auto& texture) {
+			if (texture->Status != ImTextureStatus_Destroyed) {
+				return false;
+			}
+			ImGui::UnregisterUserTexture(texture.get());
+			return true;
+		});
+		const float TOAST_LIFETIME = static_cast<float>(Config::GetTrophyDurationSeconds());
+		if (trophy_notification &&
+		    std::chrono::duration<float>(now - trophy_notification_born).count() >=
+		        TOAST_LIFETIME) {
+			trophy_notification.reset();
+			if (trophy_notification_image) {
+				// Keep the texture registered until the backend retires in-flight frames.
+				trophy_notification_image->WantDestroyNextFrame = true;
+				retired_trophy_images.push_back(std::move(trophy_notification_image));
+			}
+		}
+		if (!trophy_notification) {
+			{
+				std::scoped_lock lock(g_trophy_notification_mutex);
+				if (g_trophy_notifications.empty()) {
+					g_trophy_notification_active.store(!retired_trophy_images.empty(),
+					                                   std::memory_order_release);
+					return;
+				}
+				trophy_notification = std::move(g_trophy_notifications.front());
+				g_trophy_notifications.pop_front();
+			}
+			trophy_notification_subtitle = PrepareTrophySubtitle(Config::GetConsoleLanguage());
+			trophy_notification_born     = now;
+			trophy_notification_image    = LoadTrophyIcon(trophy_notification->icon_png);
+			PlayTrophySound();
+		}
+		const float age = std::chrono::duration<float>(now - trophy_notification_born).count();
+		const float screen_scale =
+		    std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                        static_cast<float>(frame_extent.height) / 1080.0f),
+		               0.65f, 1.25f);
+		const float width = std::max(
+		    0.0f, std::min(520.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
+		constexpr std::array GRADE_COLORS {
+		    IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255), IM_COL32(211, 220, 232, 255),
+		    IM_COL32(211, 142, 91, 255)};
+		const int   grade        = trophy_notification->grade;
+		const bool  has_grade    = grade > 0 && grade <= static_cast<int>(GRADE_COLORS.size());
+		const float pad          = 10.0f * screen_scale;
+		const float base_height  = 104.0f * screen_scale;
+		const float icon_size    = base_height - 2.0f * pad;
+		const float text_offset  = trophy_notification_image != nullptr
+		                               ? pad + icon_size + 18.0f * screen_scale
+		                               : 20.0f * screen_scale;
+		const float title_offset = text_offset + (has_grade ? 30.0f * screen_scale : 0.0f);
+		const float title_size   = 26.0f * screen_scale;
+		const float line_height  = 30.0f * screen_scale;
+		const float text_padding = 16.0f * screen_scale;
+		const auto  title_lines  = WrapTrophyTitle(trophy_notification->name, title_size,
+		                                           width - title_offset - text_padding);
+		const float block_height =
+		    static_cast<float>(title_lines.size()) * line_height + 28.0f * screen_scale;
+		const float  height   = std::max(base_height, block_height + 2.0f * text_padding);
+		const float  rounding = 14.0f * screen_scale;
+		const float  fade_in  = std::clamp(age / 0.22f, 0.0f, 1.0f);
+		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
+		const float  alpha    = std::min(fade_in, fade_out);
+		const float  slide    = (1.0f - fade_in) * (width + 24.0f);
+		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 32.0f - width + slide,
+		                       std::max(32.0f, min_top + 12.0f)};
+		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
+		auto*        draw = ImGui::GetForegroundDrawList();
+		const auto   fade = [alpha](int r, int g, int b, int a) {
+            return IM_COL32(r, g, b, static_cast<int>(static_cast<float>(a) * alpha));
+		};
+		draw->AddRectFilled({top_left.x + 3.0f, top_left.y + 5.0f},
+		                    {bottom_right.x + 3.0f, bottom_right.y + 5.0f}, fade(0, 0, 0, 90),
+		                    rounding);
+		draw->AddRectFilled(top_left, bottom_right, fade(24, 26, 32, 235), rounding);
+		draw->AddRect(top_left, bottom_right, fade(255, 255, 255, 28), rounding,
+		              ImDrawFlags_RoundCornersAll, 1.0f);
+
+		const float text_left = top_left.x + text_offset;
+		if (trophy_notification_image != nullptr) {
+			const ImVec2 icon_min {top_left.x + pad, top_left.y + (height - icon_size) * 0.5f};
+			const ImVec2 icon_max {icon_min.x + icon_size, icon_min.y + icon_size};
+			draw->AddImageRounded(trophy_notification_image->GetTexRef(), icon_min, icon_max,
+			                      {0, 0}, {1, 1}, fade(255, 255, 255, 255), 8.0f * screen_scale);
+			draw->AddRect(icon_min, icon_max, fade(255, 255, 255, 40), 8.0f * screen_scale,
+			              ImDrawFlags_RoundCornersAll, 1.0f);
+		}
+
+		const float title_y = top_left.y + (height - block_height) * 0.5f;
+		const float title_x = top_left.x + title_offset;
+		if (has_grade) {
+			// Small cup glyph tinted with the trophy grade.
+			const ImU32 cup = ImGui::GetColorU32(GRADE_COLORS[grade - 1], alpha);
+			const float u   = screen_scale;
+			const float cx  = text_left + 9.0f * u;
+			const float cy  = title_y + 15.0f * u;
+			draw->AddRectFilled({cx - 8.0f * u, cy - 11.0f * u}, {cx + 8.0f * u, cy + 2.0f * u},
+			                    cup, 2.0f * u, ImDrawFlags_RoundCornersBottom);
+			draw->AddRect({cx - 11.0f * u, cy - 9.0f * u}, {cx - 6.0f * u, cy - 3.0f * u}, cup,
+			              2.0f * u, ImDrawFlags_RoundCornersLeft, 1.8f * u);
+			draw->AddRect({cx + 6.0f * u, cy - 9.0f * u}, {cx + 11.0f * u, cy - 3.0f * u}, cup,
+			              2.0f * u, ImDrawFlags_RoundCornersRight, 1.8f * u);
+			draw->AddRectFilled({cx - 1.5f * u, cy + 2.0f * u}, {cx + 1.5f * u, cy + 7.0f * u}, cup);
+			draw->AddRectFilled({cx - 5.0f * u, cy + 7.0f * u}, {cx + 5.0f * u, cy + 10.0f * u}, cup,
+			                    1.5f * u);
+		}
+		draw->PushClipRect(top_left, {bottom_right.x - text_padding, bottom_right.y}, true);
+		float line_y = title_y;
+		for (const auto line : title_lines) {
+			draw->AddText(nullptr, title_size, {title_x, line_y}, fade(255, 255, 255, 255),
+			              line.data(), line.data() + line.size());
+			line_y += line_height;
+		}
+		const float subtitle_size = 20.0f * screen_scale;
+		const float subtitle_width =
+		    ImGui::GetFont()
+		        ->CalcTextSizeA(subtitle_size, std::numeric_limits<float>::max(), 0.0f,
+		                        trophy_notification_subtitle.c_str())
+		        .x;
+		const float available_width = std::max(1.0f, width - text_offset - text_padding);
+		const float fitted_size = std::max(
+		    1.0f, subtitle_size * std::min(1.0f, available_width / std::max(1.0f, subtitle_width)));
+		draw->AddText(nullptr, fitted_size, {text_left, line_y + 8.0f * screen_scale},
+		              fade(176, 180, 192, 255), trophy_notification_subtitle.c_str());
+		draw->PopClipRect();
+	}
+
+	// SDL2 equivalent of Nova5's SDL3 queue, independent of guest audio output.
+	void PlayTrophySound() {
+		if (!trophy_sound_attempted) {
+			trophy_sound_attempted = true;
+			trophy_sound_initialized = SDL_InitSubSystem(SDL_INIT_AUDIO) == 0;
+			if (!trophy_sound_initialized) { LOGF("[Trophy] audio init: %s\n", SDL_GetError()); return; }
+			char* base = SDL_GetBasePath();
+			if (!base) { LOGF("[Trophy] sound base path: %s\n", SDL_GetError()); return; }
+			const auto path = std::string(base) + "assets/sounds/trophy-unlock.wav";
+			SDL_free(base);
+			SDL_AudioSpec spec {};
+			if (!SDL_LoadWAV(path.c_str(), &spec, &trophy_sound_data, &trophy_sound_size)) {
+				LOGF("[Trophy] sound load: %s\n", SDL_GetError()); return;
+			}
+			trophy_sound_device = SDL_OpenAudioDevice(nullptr, 0, &spec, nullptr, 0);
+			if (!trophy_sound_device) { LOGF("[Trophy] audio device: %s\n", SDL_GetError()); return; }
+		}
+		if (trophy_sound_device) {
+			if (SDL_QueueAudio(trophy_sound_device, trophy_sound_data, trophy_sound_size) != 0)
+				LOGF("[Trophy] queue sound: %s\n", SDL_GetError());
+			SDL_PauseAudioDevice(trophy_sound_device, 0);
+		}
+	}
 	void DrainInput(OverlaySession session) {
 		std::deque<InputEvent> events;
 		bool                   reset = false;
@@ -1217,7 +1573,7 @@ struct SystemOverlay::Impl {
 	                  SystemOverlayHud* hud) {
 		OverlaySnapshot snapshot;
 		bool            dialog = GetOverlaySnapshot(&snapshot);
-		if (!dialog && hud == nullptr) {
+		if (!dialog && hud == nullptr && !g_trophy_notification_active.load(std::memory_order_acquire)) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1250,7 +1606,7 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
-			if (hud == nullptr) {
+			if (hud == nullptr && !g_trophy_notification_active.load(std::memory_order_acquire)) {
 				ImGui::EndFrame();
 				return false;
 			}
@@ -1268,6 +1624,7 @@ struct SystemOverlay::Impl {
 		if (hud != nullptr) {
 			DrawHud(*hud);
 		}
+		DrawTrophyNotification(frame_extent, now, hud ? static_cast<float>(hud->drawn.offset.y + hud->drawn.extent.height) : 0.0f);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;
@@ -1303,6 +1660,17 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_Shutdown();
 		vulkan_initialized = false;
 	}
+
+	std::unique_ptr<ImTextureData>              trophy_notification_image;
+	std::optional<TrophyNotification>           trophy_notification;
+	std::string                                 trophy_notification_subtitle;
+	Clock::time_point                           trophy_notification_born;
+	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
+	SDL_AudioDeviceID                           trophy_sound_device      = 0;
+	uint8_t*                                    trophy_sound_data        = nullptr;
+	uint32_t                                    trophy_sound_size        = 0;
+	bool                                        trophy_sound_attempted   = false;
+	bool                                        trophy_sound_initialized = false;
 
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;

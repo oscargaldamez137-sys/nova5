@@ -65,6 +65,7 @@
 #   .\run-windows.ps1 -Follow                stay open showing the run log until the game exits, then its
 #                                            exit code (run.cmd)
 #   .\run-windows.ps1 -DryRun                print environment and command only
+#   .\run-windows.ps1 -WorkDir <folder>      run the game from that folder (saves, caches, patches), e.g. Nova5's juego\
 # A release package has its Nova5Emulator.exe and launch.json next to this
 # script: those are used instead of the build tree's. A build tree takes run-windows.json (the release
 # package's launch.json).
@@ -72,6 +73,7 @@ param(
 	[string]$Config = $(@("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
 	                    Select-Object -First 1),
 	[string]$Game = '',
+	[string]$WorkDir = $PSScriptRoot,
 	[string]$Exe = $(if (Test-Path "$PSScriptRoot\Nova5Emulator.exe") { "$PSScriptRoot\Nova5Emulator.exe" } else { "$PSScriptRoot\_Build\windows\Nova5Emulator.exe" }),
 	[int]$Width = 0,
 	[int]$Height = 0,
@@ -584,7 +586,7 @@ if ($CaptureCrash) {
 	$launchArguments = @("`"$logDir\$stamp.crash.log`"", "`"$out`"", "$CrashWatchAddress", "$mask", "`"$Exe`"") + $quoted
 	Write-Host "external crash capture: $logDir\$stamp.crash.log (debugger overhead; do not benchmark FPS)"
 }
-$process = Start-Process -FilePath $launchExe -ArgumentList $launchArguments -WorkingDirectory $PSScriptRoot -PassThru `
+$process = Start-Process -FilePath $launchExe -ArgumentList $launchArguments -WorkingDirectory $WorkDir -PassThru `
 	-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
 if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
 $null = $process.Handle # keeps the exit code readable after the process ends

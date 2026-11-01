@@ -709,6 +709,17 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 	request->copied.notify_all();
 }
 
+bool BufferCache::HasPendingBackingPublication(uint64_t address, uint64_t size) const {
+	if (!size || !m_active_guest_readbacks) return false;
+	for (const auto& request: m_guest_readbacks) {
+		if (!request || request->state.load(std::memory_order_acquire) == GuestReadback::Detached) continue;
+		for (const auto& part: request->parts)
+			if (address < part.address + part.size && (address >= part.address || size > part.address - address))
+				return true;
+	}
+	return false;
+}
+
 void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_read_only, bool gpu_write) {
 	// Read-only bindings use device bytes. Pending copies retain GPU ownership
 	// and CPU-clean pages, so synchronization cannot upload over those bytes.

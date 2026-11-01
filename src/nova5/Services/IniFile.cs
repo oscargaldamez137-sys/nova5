@@ -47,6 +47,11 @@ public sealed class IniFile
 		_lines.Insert(end, $"{key}={value}");
 	}
 
+	public void Remove(string section, string key)
+	{
+		if (Find(section, key) is var index and >= 0) _lines.RemoveAt(index);
+	}
+
 	public void Save() => File.WriteAllLines(_path, _lines, new UTF8Encoding(false));
 
 	private int Find(string section, string key)

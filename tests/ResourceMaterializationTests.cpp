@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceReuse.h"
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
 #endif
@@ -148,6 +149,55 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
   return ExtractResourcePlan(program);
+}
+
+void TestJetskuResourceReuseTransaction() {
+  using namespace Libs::Graphics;
+  using namespace ShaderRecompiler::IR;
+  struct Memory {
+    uint32_t word = 73;
+    unsigned reads = 0;
+    bool clean = true;
+    static bool Read(void* p, uint64_t address, uint32_t* value) {
+      auto& m = *static_cast<Memory*>(p);
+      ++m.reads;
+      if (address != 0x1000) return false;
+      *value = m.word; return true;
+    }
+  } memory;
+  auto plan = SrtPlan(0x1000);
+  ResourceReuse memo;
+  std::array<uint8_t, PreparedResourceReads::MaxBytes> scratch;
+  const SrtRuntime runtime {.read_memory = Memory::Read, .userdata = &memory};
+  const auto capture = [&] {
+    auto observed = memo.Begin(runtime, scratch);
+    const bool ok = MaterializeResources(plan, observed, memo.resources, memo.specialization);
+    memo.Finish(ok);
+    Check(ok && memo.Valid(), "Jetsku capture must observe the actual evaluator's reads");
+  };
+  const auto matches = [&] {
+    return memo.Matches(runtime, scratch, [&](uint64_t a, void* p, size_t n) {
+      if (!memory.clean || a != 0x1000 || n != 4) return false;
+      std::memcpy(p, &memory.word, 4); return true;
+    });
+  };
+  capture();
+  Check(memory.reads != 0 && memo.resources.flattened_srt == std::vector<uint32_t>{73},
+        "native/interpreted SRT did not pass its reads through the certificate");
+  const auto reads = memory.reads;
+  for (unsigned i = 0; i < 10; ++i) Check(matches(), "unchanged resource certificate missed");
+  Check(memory.reads == reads, "reuse ran the evaluator again");
+  ResourceSnapshot reference;
+  ResourceSpecialization reference_spec;
+  Check(MaterializeResources(plan, runtime, reference, reference_spec) &&
+            ResourceReuse::Equal(reference, memo.resources) && reference_spec == memo.specialization,
+        "reused transaction differs from full materialization");
+  memory.word = 91;
+  Check(!matches(), "changed SRT bytes reused an old flattened snapshot");
+  capture();
+  Check(memo.resources.flattened_srt == std::vector<uint32_t>{91}, "refresh published stale bytes");
+  memory.clean = false;
+  Check(!matches(), "dirty GPU bytes were certified by old backing");
 }
 
 void TestMappedSrtUsesDirectReaderByDefault() {
@@ -665,6 +715,7 @@ int main() {
   TestBdaReadPlanIntervals();
   TestBdaReadPlanTransactions();
   TestMappedSrtUsesDirectReaderByDefault();
+  TestJetskuResourceReuseTransaction();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationPreservesPriorStage();

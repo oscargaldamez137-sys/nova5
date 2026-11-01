@@ -17,8 +17,10 @@ public static partial class Packages
 	public static string OutputFor(string package) =>
 	    Path.Combine(Path.GetDirectoryName(package)!, Path.GetFileNameWithoutExtension(package) + " (Nova5)");
 
+	// A game is installed with its eboot.bin, a DLC (no executable) with its param.json.
 	public static bool IsInstalled(string package) =>
-	    File.Exists(Path.Combine(OutputFor(package), "app0", "eboot.bin")) && !File.Exists(Path.Combine(OutputFor(package), Marker));
+	    (File.Exists(Path.Combine(OutputFor(package), "app0", "eboot.bin")) || File.Exists(Path.Combine(OutputFor(package), "app0", "sce_sys", "param.json"))) &&
+	    !File.Exists(Path.Combine(OutputFor(package), Marker));
 
 	// Reads only sce_sys from the package (well under a second) into _Cache\pkg so the library can show the
 	// game's title, cover, background and menu music before it is installed. Null when the package cannot be read.
@@ -163,9 +165,11 @@ public static partial class Packages
 			}
 			Directory.Delete(source, recursive: true);
 		}
-		if (!File.Exists(Path.Combine(app, "eboot.bin")) || !File.Exists(Path.Combine(app, "sce_sys", "param.json")))
+		// A game has its eboot.bin; a DLC only its content and param.json.
+		if (!File.Exists(Path.Combine(app, "sce_sys", "param.json")) ||
+		    (!File.Exists(Path.Combine(app, "eboot.bin")) && Library.ReadAddon(app) is null))
 		{
-			throw new InvalidDataException("El paquete no contiene un juego (falta eboot.bin o param.json)");
+			throw new InvalidDataException("El paquete no contiene un juego ni un DLC (falta eboot.bin o param.json)");
 		}
 		File.Delete(Path.Combine(output, Marker));
 		progress.Report(new InstallProgress("Instalado", 1));

@@ -79,6 +79,7 @@ public sealed class Emulator
 
 	public List<string> Arguments(Game game)
 	{
+		_section = game.TitleId;
 		var args = new List<string>();
 		var resolution = (Get("screen_resolution", "R1920X1080")).TrimStart('R').Split('X');
 		args.AddRange(["--screen-width", resolution[0], "--screen-height", resolution[1]]);
@@ -88,6 +89,11 @@ public sealed class Emulator
 		args.AddRange(["--controller-volume", Get("controller_speaker_volume", "50")]);
 		args.AddRange(["--controller-vibration", Get("controller_vibration_intensity", "100")]);
 		args.AddRange(["--keyboard-player", Get("controller_keyboard_player", "0")]);
+		// The whole keyboard map (a map replaces the emulator's own keys; Nova5's defaults add L2 and R2).
+		foreach (var (control, input) in Keymap.Load(Ini.Get(Global, "keymap")).Where(m => m.Value.Length > 0))
+			args.AddRange(["--keymap", $"{control}={input}"]);
+		if (Ini.Get(Global, "mouse_sensitivity") is { Length: > 0 } sensitivity)
+			args.AddRange(["--keymap", $"MouseSensitivity={sensitivity}"]);
 		args.AddRange(["--present-mode", Get("present_mode", "Mailbox")]);
 		if (int.TryParse(Get("gpu_index", "-1"), out var gpu) && gpu >= 0) args.AddRange(["--gpu", gpu.ToString()]);
 		Flag(args, "fullscreen_enabled", "--fullscreen");
@@ -96,7 +102,7 @@ public sealed class Emulator
 		Flag(args, "readback_linear_images", "--readback-linear-images");
 		Flag(args, "readback_tiled_images", "--readback-tiled-images");
 		Flag(args, "sync_raw_image_buffers", "--sync-raw-image-buffers");
-		if (!Ini.GetBool(Global, "trophy_enabled", true)) args.Add("--no-trophy-notifications");
+		if (!Bool("trophy_enabled", true)) args.Add("--no-trophy-notifications");
 		args.AddRange(["--trophy-duration", Get("trophy_duration_seconds", "6")]);
 		Flag(args, "perf_overlay_enabled", "--perf-overlay");
 		Flag(args, "skip_notice_screen", "--skip-notice-screen");
@@ -104,7 +110,7 @@ public sealed class Emulator
 		Flag(args, "tessellation_enabled", "--tessellation");
 		Flag(args, "occlusion_queries_enabled", "--occlusion-queries");
 		// (Said either way: the engine's own default is on.)
-		args.AddRange(["--shader-cache", ShaderCache ? "true" : "false"]);
+		args.AddRange(["--shader-cache", Bool("shader_cache_enabled", true) ? "true" : "false"]);
 		args.AddRange(["--vblank-frequency", Get("vblank_frequency", "60")]);
 		args.AddRange(["--console-language", Get("console_language", "1")]);
 		Flag(args, "vulkan_validation_enabled", "--vulkan-validation");
@@ -119,23 +125,35 @@ public sealed class Emulator
 		Flag(args, "profiler_enabled", "--profile");
 		Flag(args, "amd_cpu_enabled", "--amd-cpu");
 		// The red zone protection is on unless Nova5.ini turns it off: the engine runs games with it (run-windows.ps1).
-		if (Ini.GetBool(Global, "red_zone_protection_enabled", true)) args.Add("--redzone");
+		if (Bool("red_zone_protection_enabled", true)) args.Add("--redzone");
 		Flag(args, "renderdoc_enabled", "--rd");
-		args.AddRange(["--game", game.Eboot]);
+		args.AddRange(["--game", game.Archive ?? game.Eboot]);
+		// Its installed DLC, each as LABEL=folder (the label is the content ID's last 16 characters).
+		foreach (var addon in Library.Addons(GameDirs().Concat(Store.Load().ExtraDirs), game.TitleId))
+			args.AddRange(["--addcont", $"{addon.ContentId[^16..]}={addon.Dir}"]);
 		if (PatchFor(game.TitleId) is { } patch) args.AddRange(["--game-patch", patch]);
 		return args;
 	}
 
+	// While building a game's arguments: its own settings ([<title id>] in Nova5.ini) over the general ones.
+	private string? _section;
+
+	private string? Value(string key) =>
+	    (_section is { } section ? Ini.Get(section, key) is { Length: > 0 } own ? own : null : null) ?? Ini.Get(Global, key);
+
+	private bool Bool(string key, bool fallback) =>
+	    Value(key) is { } value ? value.Equals("true", StringComparison.OrdinalIgnoreCase) : fallback;
+
 	private string Get(string key, string fallback) =>
-	    Ini.Get(Global, key) is { Length: > 0 } value ? value : fallback;
+	    Value(key) is { Length: > 0 } value ? value : fallback;
 
 	private void Flag(List<string> args, string key, string flag)
 	{
-		if (Ini.GetBool(Global, key, false)) args.Add(flag);
+		if (Bool(key, false)) args.Add(flag);
 	}
 
 	private void Optional(List<string> args, string key, string flag)
 	{
-		if (Ini.Get(Global, key) is { Length: > 0 } value) args.AddRange([flag, value]);
+		if (Value(key) is { Length: > 0 } value) args.AddRange([flag, value]);
 	}
 }
