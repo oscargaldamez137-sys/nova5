@@ -1621,7 +1621,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 				continue;
 			}
 			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
-			if (memory.planning_only) {
+			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer) {
 				continue;
 			}
 			if (buffer != BufferAccess::None) {

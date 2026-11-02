@@ -132,6 +132,9 @@ BdaReadPlan BuildBdaReadPlan(const Program& program) {
 	if (!program.info.uses_dma) return result;
 	for (const auto* block: program.blocks)
 		for (const auto& inst: block->Instructions()) {
+			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::None &&
+			    program.memory_info.at(inst.Flags<MemoryFlags>().index).kind == ResourceKind::IndirectBuffer)
+				return {};
 			const auto address = AddressOpcodeInfoOf(inst.GetOpcode());
 			if (address.access == AddressAccess::None) continue;
 			const auto index = inst.Flags<MemoryFlags>().index;

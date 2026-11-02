@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -584,7 +585,8 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
-TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+static TranslateResult TranslateProgramImpl(std::span<const uint32_t> code, const CompileOptions& options,
+                                           bool& has_bvh) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -623,6 +625,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, decoded);
 	}
+	has_bvh = std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+		return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY ||
+		       inst.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY;
+	});
 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
 	                  decoded);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
@@ -764,6 +770,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		result.cfg_dump     = CFG::GraphToString(cfg);
 	}
 	return result;
+}
+
+TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	bool has_bvh = false;
+	const auto& rt = GetCodegenOptions();
+	if (!rt.rt_software_auto || !SoftwareRtEnabled() || !rt.rt_stub) {
+		return TranslateProgramImpl(code, options, has_bvh);
+	}
+	try {
+		Common::RecoverableExitScope recover;
+		return TranslateProgramImpl(code, options, has_bvh);
+	} catch (const Common::RecoverableExit& failure) {
+		if (!has_bvh) {
+			EXIT("%s", failure.message.c_str());
+		}
+		LOGF("RT software fallback: hash=0x%016" PRIx64 " stage=%s: %s\n",
+		     options.shader_hash, StageName(options.stage), failure.message.c_str());
+	}
+	const ScopedRtStub stub(true);
+	return TranslateProgramImpl(code, options, has_bvh);
 }
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,

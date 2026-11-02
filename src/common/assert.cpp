@@ -25,16 +25,17 @@
 
 namespace Common {
 
-// RecoverableExitScope: the message of the pending EXIT on this thread.
-static thread_local bool        t_recoverable = false;
+// RecoverableExitScope: the message of the pending EXIT on this thread. A count, not a flag: a scope inside another
+// (the software RT fallback inside table-mode attempts) leaves the outer one recoverable when it ends.
+static thread_local int         t_recoverable = 0;
 static thread_local std::string t_recoverable_message;
 
 RecoverableExitScope::RecoverableExitScope() {
-	t_recoverable = true;
+	++t_recoverable;
 }
 
 RecoverableExitScope::~RecoverableExitScope() {
-	t_recoverable = false;
+	--t_recoverable;
 }
 
 // The raw return addresses of a fatal error (resolve with addr2line against the executable;

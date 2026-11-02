@@ -15,6 +15,7 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode;
 extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #endif
 #include "common/emulatorConfig.h"
+#include "common/guardedCopy.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -46,6 +47,7 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/guestClockTrace.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -54,10 +56,12 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/BvhReference.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -107,6 +111,8 @@ namespace Libs { void InitAgcDriver_1(Loader::SymbolDatabase*); }
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
+#include <spirv/unified1/spirv.hpp>
 #include <semaphore>
 #include <set>
 #include <span>
@@ -133,6 +139,19 @@ namespace Libs { void InitAgcDriver_1(Loader::SymbolDatabase*); }
 #endif
 
 namespace Libs::Graphics {
+
+struct GuestClockTestAccess {
+  static bool ParseScale(const char* text, uint32_t& percent) { return GuestClock::ParseScale(text, percent); }
+  static bool Scale(uint64_t value, uint64_t base, uint32_t percent, uint64_t& result) {
+    return GuestClock::Scale(value, base, percent, result);
+  }
+  static auto ScaleOptions() { return GuestClock::GetScaleOptions(); }
+  struct Counts { uint64_t recorded, published, fallback, failed, conflicts, waits; uint32_t pending; };
+  static Counts Snapshot(const GuestClock& clock) {
+    return {clock.m_recorded, clock.m_published, clock.m_fallback, clock.m_failed,
+            clock.m_conflicts, clock.m_block_waits, clock.m_pending};
+  }
+};
 
 template <typename Cache>
 concept HasGetDownloadBuffer =
@@ -1009,6 +1028,21 @@ void EnsureConfigInitialized() {
   }
 }
 
+void EnsureGuestMemoryFaultHandler(const char* name) {
+  namespace Exception = Common::HostException;
+  Require(name, "guest fault handler",
+          Exception::InstallHandler([](const Exception::ExceptionInfo& info) {
+            if (info.type != Exception::ExceptionType::AccessViolation ||
+                (info.access_violation_type != Exception::AccessViolationType::Read &&
+                 info.access_violation_type != Exception::AccessViolationType::Write)) {
+              return false;
+            }
+            const auto access = info.access_violation_type == Exception::AccessViolationType::Write
+                ? PageFaultAccess::Write : PageFaultAccess::Read;
+            return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+          }), "failed to install the production guest-memory fault route");
+}
+
 void RequireVk(const char *shader_name, const char *stage, vk::Result result,
                const char *action) {
   if (result != vk::Result::eSuccess) {
@@ -1810,7 +1844,10 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  explicit VulkanHarness(bool guest_clocks = false) {
+    m_runtime_context.calibrated_timestamps_enabled = guest_clocks;
+    Init();
+  }
   ~VulkanHarness() { Destroy(); }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -6201,20 +6238,7 @@ public:
     {
       GpuResourceManager resources(m_runtime_context, scheduler);
       resources.SetGpu(&gpu);
-      namespace Exception = Common::HostException;
-      Require(name, "guest fault handler",
-              Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
-                if (info.type != Exception::ExceptionType::AccessViolation ||
-                    (info.access_violation_type != Exception::AccessViolationType::Read &&
-                     info.access_violation_type != Exception::AccessViolationType::Write)) {
-                  return false;
-                }
-                const auto access =
-                    info.access_violation_type == Exception::AccessViolationType::Write
-                        ? PageFaultAccess::Write : PageFaultAccess::Read;
-                return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
-              }),
-              "failed to install the production guest-memory fault route");
+      EnsureGuestMemoryFaultHandler(name);
       LibKernel::Memory::InstallGpuResources(&resources);
       auto &texture_cache = resources.GetTextureCache();
       const auto [narrow_download, narrow_download_offset] =
@@ -16350,7 +16374,7 @@ private:
             "fragment storage atomics are unavailable");
     device_features.fragmentStoresAndAtomics = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char*> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
@@ -16360,8 +16384,10 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    if (m_runtime_context.calibrated_timestamps_enabled)
+      device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -32544,6 +32570,9 @@ namespace Libs::Graphics {
 namespace {
 #include "SamplerPhiTests.inc"
 #include "ShaderGiProbeTests.inc"
+#include "ShaderBvhTests.inc"
+#include "GuestClockTraceTests.inc"
+#include "GuestClockGpuTests.inc"
 }
 }
 
@@ -32556,6 +32585,55 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--guest-clock-only") == 0) {
+    CheckGuestClockPairTrace();
+    CheckGuestClockScale();
+    VulkanHarness vulkan(true);
+    CheckGuestClockGpu(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-clock-trace-only") == 0) {
+    CheckGuestClockPairTrace();
+    CheckGuestClockScale();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-codegen-only") == 0) {
+    BvhTests::CheckDecoder();
+    BvhTests::CheckReferenceDirected();
+    BvhTests::CheckSoftwareCodegen();
+    BvhTests::CheckDynamicDescriptors(nullptr);
+    BvhTests::CheckNodeCountCodegen();
+    BvhTests::CheckTraversalLoopBreakRegion();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-traversal-only") == 0) {
+    BvhTests::CheckTraversalLoopBreakRegion();
+    VulkanHarness vulkan;
+    BvhTests::RunTraversalLoopBreakRegion(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
+    VulkanHarness vulkan;
+    BvhTests::RunAll(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-stub-only") == 0) {
+    BvhTests::CheckDecoder();
+    VulkanHarness vulkan;
+    BvhTests::RunStub(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-budget-only") == 0) {
+    VulkanHarness vulkan;
+    BvhTests::RunNodeBudget(&vulkan);
+    return 0;
+  }
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--bvh-fuzz") == 0) {
+    VulkanHarness vulkan;
+    BvhTests::RunSoftware(&vulkan, static_cast<u32>(std::strtoul(argv[2], nullptr, 0)),
+                         argc == 4 ? static_cast<u32>(std::strtoul(argv[3], nullptr, 0)) : 0u);
+    return 0;
+  }
   if (argc == 2 && (std::strcmp(argv[1], "--gi-probe-codegen-only") == 0 ||
                     std::strcmp(argv[1], "--gi-probe-only") == 0)) {
     GiProbeTests::CheckPixelLiveExecCodegen();

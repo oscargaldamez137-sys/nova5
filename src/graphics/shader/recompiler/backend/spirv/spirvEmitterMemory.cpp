@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterRayTracing.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -220,11 +221,8 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	});
 }
 
-uint32_t LoadBdaEach(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-	             uint32_t bits) {
+uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
 	auto&      state   = ctx.state;
-	const auto address = GuestAddress(ctx, inst, mem);
-	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, OpBitwiseAnd, TypeDeviceAddress(state), address,
 		                            ConstantDeviceAddress(state, ~uint64_t {3}));
@@ -259,6 +257,11 @@ uint32_t LoadBdaEach(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		           : Binary(state, OpBitwiseAnd, TypeU32(state), merged,
 		                    ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
+}
+
+uint32_t LoadBdaEach(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                     uint32_t bits) {
+	return LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1), bits);
 }
 
 // A dword load from an address in a block where a load from the same base (registers, EXEC) walked the page table
@@ -1437,6 +1440,189 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 	    });
 }
 
+uint32_t DescriptorField(EmitterState& state, uint32_t word, uint32_t first, uint32_t count) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitFieldUExtract, TypeU32(state), result, word, first, count});
+	return result;
+}
+
+uint32_t BufferLane(EmitterState& state) {
+	const auto id = state.lane_count == 1 && state.program.lane_local ? EmitLocalInvocationIndex(state)
+	                                                                : EmitSubgroupLocalInvocationId(state);
+	return Binary(state, OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 63));
+}
+
+struct BufferAddress {
+	uint32_t offset;
+	uint32_t byte;
+};
+
+BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32_t offset,
+                                     uint32_t soffset, uint32_t immediate, uint32_t stride,
+                                     uint32_t swizzle, uint32_t index_stride) {
+	const auto zero = ConstantU32(state, 0);
+	const auto one  = ConstantU32(state, 1);
+	const auto add = [&](uint32_t lhs, uint32_t rhs) {
+		return lhs == zero ? rhs : rhs == zero ? lhs
+		                                      : Binary(state, OpIAdd, TypeU32(state), lhs, rhs);
+	};
+	const auto mul = [&](uint32_t lhs, uint32_t rhs) {
+		return lhs == zero || rhs == zero ? zero
+		       : lhs == one              ? rhs
+		       : rhs == one              ? lhs
+		                                 : Binary(state, OpIMul, TypeU32(state), lhs, rhs);
+	};
+	if (immediate != 0u) {
+		offset = add(offset, ConstantU32(state, immediate));
+	}
+	auto address = add(mul(index, stride), offset);
+	if (swizzle != 0u) {
+		const auto index_shift =
+		    Binary(state, OpIAdd, TypeU32(state), index_stride, ConstantU32(state, 3));
+		const auto indices = Binary(state, OpShiftLeftLogical, TypeU32(state),
+		                            ConstantU32(state, 1), index_shift);
+		const auto index_msb =
+		    Binary(state, OpShiftRightLogical, TypeU32(state), index, index_shift);
+		const auto index_lsb =
+		    Binary(state, OpBitwiseAnd, TypeU32(state), index,
+		           Binary(state, OpISub, TypeU32(state), indices, ConstantU32(state, 1)));
+		const auto offset_msb =
+		    Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u));
+		const auto offset_lsb =
+		    Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, 3u));
+		const auto msb = mul(add(mul(index_msb, stride), offset_msb), indices);
+		const auto lsb = add(Binary(state, OpShiftLeftLogical, TypeU32(state), index_lsb,
+		                            ConstantU32(state, 2u)), offset_lsb);
+		address = Select(state, TypeU32(state), swizzle, add(msb, lsb), address);
+	}
+	return {offset, add(address, soffset)};
+}
+
+struct IndirectBufferElement {
+	uint32_t guest     = 0; // U64 guest byte address
+	uint32_t in_bounds = 0; // bool
+};
+
+IndirectBufferElement IndirectBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst,
+                                           uint32_t component_offset, uint32_t payload) {
+	auto&       state   = ctx.state;
+	const auto& handle  = *inst.Arg(0).Resolve().TryInstruction();
+	const auto  word1   = ctx.Arg(handle, 1);
+	const auto  records = ctx.Arg(handle, 2);
+	const auto  word3   = ctx.Arg(handle, 3);
+	const auto  field   = [&](uint32_t word, uint32_t first, uint32_t count) {
+		return DescriptorField(state, word, ConstantU32(state, first),
+		                            ConstantU32(state, count));
+	};
+	const auto nonzero = [&](uint32_t value) {
+		return Binary(state, OpINotEqual, TypeBool(state), value, ConstantU32(state, 0));
+	};
+	const auto bytes    = ConstantU32(state, payload);
+	const auto has_data = [&](uint32_t offset, uint32_t size) {
+		return AndCondition(
+		    state, Binary(state, OpUGreaterThanEqual, TypeBool(state), size, bytes),
+		    Binary(state, OpULessThanEqual, TypeBool(state), offset,
+		           Binary(state, OpISub, TypeU32(state), size, bytes)));
+	};
+	const auto stride       = field(word1, 16, 14);
+	const auto swizzle      = AndCondition(state, nonzero(stride), nonzero(field(word1, 31, 1)));
+	const auto index_stride = field(word3, 21, 2);
+	const auto add_tid      = nonzero(field(word3, 23, 1));
+	const auto index =
+	    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+	           Select(state, TypeU32(state), add_tid, BufferLane(state), ConstantU32(state, 0)));
+	const auto soffset         = ctx.Arg(inst, 3);
+	const auto base            = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
+	const auto valid_format    = nonzero(field(word3, 12, 7));
+	const auto mode            = field(word3, 28, 2);
+	const auto index_in_bounds = Binary(state, OpULessThan, TypeBool(state), index, records);
+	const auto scalar_in_bounds =
+	    Binary(state, OpULessThanEqual, TypeBool(state), soffset, records);
+	const auto raw_records = Binary(state, OpISub, TypeU32(state), records, soffset);
+	const auto raw_index_in_bounds =
+	    Binary(state, OpULessThan, TypeBool(state), index, raw_records);
+	const auto address = CalculateBufferAddress(state, index, ctx.Arg(inst, 2), soffset,
+	                                            ctx.Memory(inst).offset + component_offset, stride,
+	                                            swizzle, index_stride);
+	const auto structured_bounds =
+	    AndCondition(state, index_in_bounds,
+	                 Binary(state, OpULessThan, TypeBool(state), address.offset, stride));
+	const auto raw_bounds = AndCondition(
+	    state, scalar_in_bounds,
+	    Select(state, TypeBool(state), swizzle,
+	           AndCondition(state, raw_index_in_bounds, has_data(address.offset, stride)),
+	           has_data(address.offset, raw_records)));
+	auto in_bounds = Select(state, TypeBool(state),
+	                        Binary(state, OpIEqual, TypeBool(state), mode, ConstantU32(state, 0)),
+	                        structured_bounds, index_in_bounds);
+	in_bounds = Select(
+	    state, TypeBool(state),
+	    Binary(state, OpULessThan, TypeBool(state), mode, ConstantU32(state, 2)), in_bounds,
+	    Select(state, TypeBool(state),
+	           Binary(state, OpIEqual, TypeBool(state), mode, ConstantU32(state, 2)),
+	           nonzero(records), raw_bounds));
+	return {
+	    .guest     = Binary(state, OpIAdd, TypeDeviceAddress(state), base,
+	                        Unary(state, OpUConvert, TypeDeviceAddress(state), address.byte)),
+	    .in_bounds = AndCondition(state, valid_format, in_bounds),
+	};
+}
+
+uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
+                                  const IR::MemoryInfo& mem) {
+	auto&       state   = ctx.state;
+	const auto& handle  = *inst.Arg(0).Resolve().TryInstruction();
+	const auto  word1   = ctx.Arg(handle, 1);
+	const auto  records = ctx.Arg(handle, 2);
+	const auto  field   = [&](uint32_t word, uint32_t first, uint32_t count) {
+		return DescriptorField(state, word, ConstantU32(state, first),
+		                            ConstantU32(state, count));
+	};
+	const auto u64 = [&](uint32_t value) {
+		return Unary(state, OpUConvert, TypeDeviceAddress(state), value);
+	};
+	const auto stride = field(word1, 16, 14);
+	const auto base   = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
+	const auto offset = Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+	                           ConstantU32(state, mem.offset));
+	const auto size   = Select(state, TypeDeviceAddress(state),
+	                           Binary(state, OpIEqual, TypeBool(state), stride,
+	                                  ConstantU32(state, 0)),
+	                           u64(records),
+	                           Binary(state, OpIMul, TypeDeviceAddress(state), u64(stride),
+	                                  u64(records)));
+	const auto dword_end =
+	    Binary(state, OpIAdd, TypeDeviceAddress(state),
+	           u64(Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u))),
+	           ConstantDeviceAddress(state, sizeof(uint32_t)));
+	const auto in_bounds =
+	    Binary(state, OpULessThanEqual, TypeBool(state), dword_end, size);
+	// The ISA drops the two LSBs of the sum, so the dword never straddles (no unaligned merge).
+	const auto guest = Binary(state, OpBitwiseAnd, TypeDeviceAddress(state),
+	                          Binary(state, OpIAdd, TypeDeviceAddress(state), base, u64(offset)),
+	                          ConstantDeviceAddress(state, ~uint64_t {3}));
+	return LoadBda(ctx, guest, in_bounds, 32u);
+}
+
+uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	const auto bits = ctx.Memory(inst).data_bits;
+	return EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1),
+	    components == 1 ? TypeU32(state) : TypeU32Composite(state, components),
+	    components == 1 ? ConstantU32(state, 0) : ConstantU32CompositeZero(state, components), [&]() {
+		std::array<uint32_t, 4> values {};
+		for (uint32_t component = 0; component < components; component++) {
+			const auto access = IndirectBufferAccess(ctx, inst, component * 4u, bits / 8u);
+			// Raw buffer DWORD addressing drops the low two bits.
+			const auto address = bits == 32u ?
+			    Binary(state, OpBitwiseAnd, TypeDeviceAddress(state), access.guest,
+			           ConstantDeviceAddress(state, ~uint64_t {3})) : access.guest;
+			values[component] = LoadBda(ctx, address, access.in_bounds, bits);
+		}
+		return components == 1 ? values[0] : ConstructU32Composite(state, components, values);
+	});
+}
+
 void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -1528,6 +1714,14 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 }
 
 } // namespace
+
+uint32_t EmitDeviceAddressConstant(EmitterState& state, uint64_t value) {
+	return ConstantDeviceAddress(state, value);
+}
+
+uint32_t EmitBdaDeviceAddress(ValueEmitContext& ctx, uint32_t address) {
+	return GetBdaPointer(ctx, address);
+}
 
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
@@ -1661,11 +1855,22 @@ void EmitTableMode(ValueEmitContext& ctx) {
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state             = ctx.state;
 	const auto op                = inst.GetOpcode();
+	if (op == IR::ValueOpcode::BvhIntersectRay) {
+		ctx.Define(inst, EmitBvhIntersectRay(ctx, inst));
+		return true;
+	}
+	if (op == IR::ValueOpcode::BvhIntersectRayStub) {
+		CountBvhStub(state);
+		ctx.Define(inst, EmitBvhIntersectRayStub(state, ctx.Arg(inst, 0)));
+		return true;
+	}
 	const auto buffer_components = IR::BufferComponentCount(op);
 	if (buffer_components > 1u) {
 		const auto access = IR::BufferAccessOf(op);
 		if (access == IR::BufferAccess::Read) {
-			ctx.Define(inst, LoadWideBuffer(ctx, inst, buffer_components));
+			ctx.Define(inst, ctx.Memory(inst).kind == IR::ResourceKind::IndirectBuffer
+			                     ? LoadIndirectBuffer(ctx, inst, buffer_components)
+			                     : LoadWideBuffer(ctx, inst, buffer_components));
 			return true;
 		}
 		if (access == IR::BufferAccess::Write) {
@@ -1709,6 +1914,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (op == IR::ValueOpcode::ReadConstBuffer) {
 		auto mem = ctx.Memory(inst);
+		if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+			ctx.Define(inst, LoadIndirectScalarBuffer(ctx, inst, mem));
+			return true;
+		}
 		mem.kind = IR::ResourceKind::ScalarBuffer;
 		const auto address =
 		    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
@@ -1719,6 +1928,11 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition,
 		                                            [&]() { return LoadWordInBounds(ctx, access, element); }));
+		return true;
+	}
+	if (IR::BufferAccessOf(op) == IR::BufferAccess::Read &&
+	    ctx.Memory(inst).kind == IR::ResourceKind::IndirectBuffer) {
+		ctx.Define(inst, LoadIndirectBuffer(ctx, inst, ctx.Memory(inst).data_dwords));
 		return true;
 	}
 	const auto address_info = IR::AddressOpcodeInfoOf(op);

@@ -39,12 +39,14 @@ internal static class Program
 
 	public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<App>().UsePlatformDetect();
 
-	// --play <game folder or eboot.bin>: starts the game with Nova5's settings and waits for it, so other
+	// --play <game folder, eboot.bin or .zar>: starts the game with Nova5's settings and waits for it, so other
 	// launchers (Nexo) get the same settings, patches and play-time tracking as the Nova5 UI.
 	private static int Play(string target)
 	{
-		var dir  = File.Exists(target) ? Path.GetDirectoryName(Path.GetFullPath(target))! : Path.GetFullPath(target);
-		var game = Services.Library.ReadGame(dir);
+		var full = Path.GetFullPath(target);
+		var game = full.EndsWith(".zar", StringComparison.OrdinalIgnoreCase) && File.Exists(full)
+		    ? Services.Library.ReadArchive(full)
+		    : Services.Library.ReadGame(File.Exists(full) ? Path.GetDirectoryName(full)! : full);
 		if (game is null) return 2;
 		var emulator = new Services.Emulator();
 		if (!emulator.Exists) return 3;

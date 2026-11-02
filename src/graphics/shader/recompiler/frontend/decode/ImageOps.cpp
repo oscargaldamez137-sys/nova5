@@ -233,6 +233,8 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -361,8 +363,20 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
 
+	const bool bvh = opcode == 0xe6u || opcode == 0xe7u;
+	if (bvh) {
+		inst.image_address_components = (opcode == 0xe7u ? 2u : 1u) + 4u + (a16 ? 3u : 6u);
+	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	} else if (bvh && inst.dmask != 0xfu) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect requires DMASK=0xf");
+	} else if (bvh && !r128) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect requires R128=1");
+	} else if (bvh && (word0 & (3u << 16u)) != 0u) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect does not support TFE or LWE");
+	} else if (bvh && nsa_dwords != 0u && 1u + nsa_dwords * 4u < inst.image_address_components) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect NSA form has too few addresses");
 	}
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

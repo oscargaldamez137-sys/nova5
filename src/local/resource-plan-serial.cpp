@@ -191,6 +191,7 @@ void PutInfo(Writer& w, const IR::ShaderInfo& info) {
 	w.Put(info.instance_offset_sgpr);
 	w.Put(info.has_bitwise_xor);
 	w.Put(info.uses_dma);
+	w.Put(info.uses_bvh);
 }
 
 bool GetInfo(Reader& r, IR::ShaderInfo& info) {
@@ -226,7 +227,7 @@ bool GetInfo(Reader& r, IR::ShaderInfo& info) {
 			return false;
 	}
 	return r.Get(info.vertex_fetch_components) && r.Get(info.vertex_offset_sgpr) && r.Get(info.instance_offset_sgpr) &&
-	       r.Get(info.has_bitwise_xor) && r.Get(info.uses_dma);
+	       r.Get(info.has_bitwise_xor) && r.Get(info.uses_dma) && r.Get(info.uses_bvh);
 }
 
 } // namespace

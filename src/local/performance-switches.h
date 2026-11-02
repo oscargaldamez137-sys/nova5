@@ -29,6 +29,7 @@ extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
 extern volatile std::atomic_uint32_t kyty_local_flush_defer;
+extern volatile std::atomic_uint32_t kyty_local_flush_min_work;
 extern volatile std::atomic_uint32_t kyty_local_framegen_sleep;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_draw_batch;
@@ -114,8 +115,10 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
-	    // Submissions the GPU has still to run for a flush nothing waits on to be deferred (0: never).
+	    // Submissions still to run for backlog-based deferral (0: disable this policy).
 	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer, 0, 64},
+	    // Opt-in floor at optional flushes: draw = 1, dispatch = 4; at most seven extra deferred requests.
+	    Switch {"KYTY_FLUSH_MIN_WORK", &kyty_local_flush_min_work, 0, 256},
 	    // DLSS-G frames' Reflex sleep (0: none).
 	    Switch {"KYTY_FRAMEGEN_SLEEP", &kyty_local_framegen_sleep},
 	    // Dispatches recorded per submission.

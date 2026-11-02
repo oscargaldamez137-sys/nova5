@@ -67,6 +67,9 @@ public sealed class Emulator
 			WorkingDirectory = BaseDir, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
 		};
 		foreach (var arg in Arguments(game)) info.ArgumentList.Add(arg);
+		// The GPU time the game measures, in percent (Resolución dinámica in the game's settings): below 100 a game with
+		// dynamic resolution sees a faster GPU and draws more pixels.
+		if (Value("gpu_time_scale") is { Length: > 0 } scale && scale != "100") info.Environment["KYTY_GPU_TIMESTAMP_SCALE"] = scale;
 		DemonsSoulsOptions.Apply(game.TitleId, info.Environment, key => Ini.Get(Global, key));
 		// The recording and render threads on the performance cores (run-windows.ps1's "auto"): +2.5 % in Demon's
 		// Souls; an environment that names them, or ds_affinity_enabled=false for Demon's Souls, leaves them to Windows.

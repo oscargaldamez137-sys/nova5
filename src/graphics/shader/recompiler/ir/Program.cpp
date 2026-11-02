@@ -392,7 +392,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind != ResourceKind::ScalarBuffer) {
+				if (memory.kind != ResourceKind::ScalarBuffer && memory.kind != ResourceKind::IndirectBuffer) {
 					return Fail(fmt::format("{} has an invalid scalar-memory resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
@@ -443,12 +443,12 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if (memory.kind != ResourceKind::Buffer &&
-				    memory.kind != ResourceKind::ScalarBuffer) {
+				    memory.kind != ResourceKind::ScalarBuffer && memory.kind != ResourceKind::IndirectBuffer) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (buffer_components > 1u &&
-				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
+				    ((memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::IndirectBuffer) || memory.data_bits != 32u ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));

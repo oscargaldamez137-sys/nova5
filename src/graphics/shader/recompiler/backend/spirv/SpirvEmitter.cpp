@@ -74,7 +74,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 			uses_gds |= kind == IR::ResourceKind::Gds;
 		}
 	}
-	if (uses_gds) {
+	if (uses_gds || IR::UsesBvhNodeCount(program)) {
 		Expect(Kind::Gds);
 	}
 	if (program.bindings.lod_stats_count != 0) {
@@ -149,6 +149,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 					if (planning_only_handle(inst)) {
 						break;
 					}
+					if (std::ranges::all_of(inst.Uses(), [&](const IR::Use& use) {
+						if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) return false;
+						const auto index = use.user->Flags<IR::MemoryFlags>().index;
+						return index < program.memory_info.size() &&
+						       program.memory_info[index].kind == IR::ResourceKind::IndirectBuffer;
+					})) break;
 					if (dense >= program.info.buffers.size()) {
 						Fail(program, "typed buffer handle has an invalid dense resource");
 					}
@@ -231,6 +237,9 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
+				if (memory.kind == IR::ResourceKind::IndirectBuffer) {
+					requirements.subgroup_local_invocation_id = true;
+				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");

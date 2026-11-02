@@ -64,6 +64,14 @@ New-Item -ItemType Directory -Force (Join-Path $stage 'tools') | Out-Null
 Copy-Item (Join-Path $extractor 'target\release\pkg-to-anyps5.exe') (Join-Path $stage 'tools')
 # .zar packer (Exzap/ZArchive, MIT-0; the zarchive_pack CMake target), run from a game's options.
 if (Test-Path (Join-Path $build 'tools\zarchive.exe')) { Copy-Item (Join-Path $build 'tools\zarchive.exe') (Join-Path $stage 'tools') }
+# Shader preparation (Preparar shaders in a game's options): the kyty_shader_precompile program next to the emulator's
+# DLLs, its script, and the render-pass states and specialization hints it reads.
+if (Test-Path (Join-Path $build 'kyty_shader_precompile.exe')) {
+	Copy-Item (Join-Path $build 'kyty_shader_precompile.exe'), (Join-Path $repo 'precompile-windows.ps1') $stage
+	$prepData = Join-Path $stage 'tools\local\static-precompile'
+	New-Item -ItemType Directory -Force $prepData | Out-Null
+	Copy-Item (Join-Path $repo 'tools\local\static-precompile\pass-states.json'), (Join-Path $repo 'tools\local\static-precompile\hints-*.hints') $prepData
+}
 Copy-Item (Join-Path $extractor 'LICENSE') (Join-Path $licenses 'pkg-to-anyps5-LICENSE.txt')
 Copy-Item (Join-Path $extractor 'README.md') (Join-Path $licenses 'pkg-to-anyps5-README.md')
 Copy-Item (Join-Path $PSScriptRoot 'pkg-to-anyps5.patch') (Join-Path $licenses 'pkg-to-anyps5-changes.patch')

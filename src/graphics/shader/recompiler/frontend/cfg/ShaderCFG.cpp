@@ -2222,6 +2222,92 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 namespace {
 
+// A loop exit can enter a region with its own loop before reaching the outer merge. That
+// branch is a selection, not a direct break. Give it a fresh merge on the region's exit edge,
+// after its nested constructs. If that edge cannot be found, use the dispatcher instead.
+bool StructureBreakRegions(Graph& graph) {
+	const auto budget = static_cast<uint32_t>(graph.blocks.size());
+	for (uint32_t pass = 0; pass <= budget; pass++) {
+		uint32_t header_id  = UINT32_MAX;
+		uint32_t region     = UINT32_MAX;
+		uint32_t loop_merge = UINT32_MAX;
+		for (const auto& block: graph.blocks) {
+			if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
+			    block.terminator.loop_header || block.terminator.merge_block != UINT32_MAX) {
+				continue;
+			}
+			const auto* loop = FindInnermostContainingLoop(graph, block.id);
+			if (loop == nullptr || loop->merge == UINT32_MAX ||
+			    loop->continue_block == UINT32_MAX || block.id == loop->continue_block) {
+				continue;
+			}
+			const auto true_target   = block.terminator.true_block;
+			const auto false_target  = block.terminator.false_block;
+			const bool true_in_body  = ContainsSorted(loop->body_blocks, true_target);
+			const bool false_in_body = ContainsSorted(loop->body_blocks, false_target);
+			const auto outside       = true_in_body ? false_target : true_target;
+			if (true_in_body == false_in_body || outside == loop->merge ||
+			    outside == loop->continue_block) {
+				continue;
+			}
+			header_id  = block.id;
+			region     = outside;
+			loop_merge = loop->merge;
+			break;
+		}
+		if (header_id == UINT32_MAX) {
+			return true;
+		}
+
+		uint32_t              exit_block = UINT32_MAX;
+		std::vector<uint32_t> spine;
+		for (auto current = region;;) {
+			const auto* block = graph.FindBlock(current);
+			if (block == nullptr || Contains(spine, current) ||
+			    !graph.Dominates(header_id, current)) {
+				break;
+			}
+			spine.push_back(current);
+			const auto& terminator = block->terminator;
+			uint32_t    next       = UINT32_MAX;
+			if (terminator.loop_header || terminator.kind == TerminatorKind::ConditionalBranch) {
+				next = terminator.merge_block;
+			} else if (terminator.kind == TerminatorKind::Branch) {
+				next = terminator.true_block;
+			}
+			if (next == loop_merge) {
+				if (terminator.kind == TerminatorKind::Branch && !terminator.loop_header) {
+					exit_block = current;
+				}
+				break;
+			}
+			if (next == UINT32_MAX) {
+				break;
+			}
+			current = next;
+		}
+		if (exit_block == UINT32_MAX) {
+			SetFailure(graph, FailureKind::StructuredControlFlow, header_id,
+			           fmt::format("conditional block {} enters break region {} of the loop with "
+			                       "merge {}, and the region has no structured exit to that merge",
+			                       header_id, region, loop_merge));
+			return false;
+		}
+
+		const auto gateway = AppendSyntheticBranchBlock(graph, loop_merge);
+		auto*      exit    = graph.FindBlock(exit_block);
+		ReplaceValue(exit->successors, loop_merge, gateway);
+		ReplaceTerminatorTarget(exit->terminator, loop_merge, gateway);
+		graph.FindBlock(header_id)->terminator.merge_block = gateway;
+		MoveBlockBefore(graph, gateway, loop_merge);
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
+	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+	           "CFG break-region structuring exceeded its budget");
+	return false;
+}
+
 bool StructurizeImpl(Graph& graph) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
@@ -2300,7 +2386,7 @@ bool StructurizeImpl(Graph& graph) {
 		block.terminator.merge_block = merge;
 	}
 
-	return true;
+	return StructureBreakRegions(graph);
 }
 
 } // namespace

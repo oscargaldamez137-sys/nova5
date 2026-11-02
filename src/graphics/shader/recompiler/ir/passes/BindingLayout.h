@@ -5,6 +5,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+[[nodiscard]] bool UsesBvhNodeCount(const Program& program);
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0, bool enable_lod_stats = false);
 
 // Table mode (Program::table_mode) for a program it can serve: only reads, of buffers whose V#s and of SRT

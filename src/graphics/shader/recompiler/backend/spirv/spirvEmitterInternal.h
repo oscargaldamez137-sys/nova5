@@ -440,6 +440,8 @@ struct EmitterState {
 	uint32_t                   mesh_cull                             = 0;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
+	uint32_t                   bvh_node_test_function                = 0;
+	uint32_t                   bvh_node_count_variable               = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;

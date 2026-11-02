@@ -41,8 +41,8 @@ public static class Library
 				try
 				{
 					foreach (var archive in Directory.GetFiles(dir, "*.zar"))
-						if (Read(GameArchive.Meta(archive), requireEboot: false) is { IsAddon: false } packed)
-							games.TryAdd(Path.GetFullPath(archive), packed with { Archive = archive });
+						if (ReadArchive(archive) is { } packed)
+							games.TryAdd(Path.GetFullPath(archive), packed);
 				}
 				catch (Exception e) when (e is UnauthorizedAccessException or IOException)
 				{
@@ -103,6 +103,10 @@ public static class Library
 	}
 
 	public static Game? ReadGame(string dir) => Read(dir);
+
+	// A game packed into a .zar, from the sce_sys kept beside it.
+	public static Game? ReadArchive(string archive) =>
+	    Read(GameArchive.Meta(archive), requireEboot: false) is { IsAddon: false } packed ? packed with { Archive = archive } : null;
 
 	public static Game? ReadAddon(string dir) => Read(dir, requireEboot: false) is { IsAddon: true } addon ? addon : null;
 

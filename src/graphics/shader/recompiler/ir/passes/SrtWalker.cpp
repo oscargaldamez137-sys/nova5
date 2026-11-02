@@ -493,7 +493,8 @@ private:
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+		    (m_program.info.uses_bvh && !EvaluableBeforeDispatch(inst->Arg(0)))) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
 			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);
@@ -580,6 +581,14 @@ private:
 		}
 	}
 
+	bool EvaluableBeforeDispatch(Value value) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return true;
+		if (const auto found = m_evaluable.find(inst); found != m_evaluable.end()) return found->second;
+		return m_evaluable.emplace(inst, ValidateRuntimeValue(m_program, value)).first->second;
+	}
+
 	static constexpr uint32_t Collected = UINT32_MAX;
 
 	Program&                                                m_program;
@@ -588,6 +597,7 @@ private:
 	std::vector<Patch>                                      m_patches;
 	std::unordered_map<uint64_t, std::vector<uint32_t>>     m_buckets; // srt_reads slots by StructuralHash
 	std::unordered_map<const Inst*, uint64_t>               m_hashes;
+	std::unordered_map<const Inst*, bool>                   m_evaluable;
 };
 
 // Entries live only for one evaluation. Open addressing avoids allocating a

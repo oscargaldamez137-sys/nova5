@@ -2,6 +2,21 @@
   "_comment": "Novedades de cada versión, de la más nueva a la más antigua. Las leen la web (sección Novedades) y el lanzador (cuadro al actualizar y Ajustes > Información de la versión). Añade la versión nueva arriba antes de publicarla.",
   "versions": [
     {
+      "version": "0.7.2",
+      "date": "2026-11-01",
+      "title": "Astro Bot con toda su iluminación y shaders preparados",
+      "items": [
+        "Astro Bot ya funciona en los modos Calidad y Equilibrado: la iluminación global y el trazado de rayos por software ya no cierran el juego después del logo de PlayStation ni al entrar en Sky Garden.",
+        "Astro Bot ya no salta continuamente entre 1080p y 1368p: el juego recibe los tiempos reales de la gráfica y elige su resolución con datos coherentes.",
+        "Nueva opción «Resolución dinámica» en los ajustes de cada juego, para que juegos como Astro Bot dibujen con más resolución.",
+        "Unos 6 % más de FPS en Sky Garden.",
+        "Nueva opción «Preparar shaders» en las opciones de cada juego: compila los shaders por adelantado (rápido o completo) para que el juego no se trabe al llegar a zonas nuevas.",
+        "Ajustes divididos por categorías: Nova5, Gráficos, Sistema, Rendimiento, Mando, Trofeos, Audio y Biblioteca.",
+        "Las opciones de cada juego van por secciones (Gráficos, Mando, Sistema, Rendimiento y Archivos del juego), con vibración, altavoz y luz del mando propios de cada juego.",
+        "Al buscar parches de la comunidad, Nova5 te dice si no hay ninguno o si ya los tienes todos."
+      ]
+    },
+    {
       "version": "0.7.1",
       "date": "2026-11-01",
       "title": "Trofeos, opciones de cada juego y ajustes renovados",

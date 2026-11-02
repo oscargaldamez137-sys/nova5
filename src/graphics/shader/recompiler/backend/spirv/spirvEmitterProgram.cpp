@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterRayTracing.h"
 #include "local/shader-loop-guard.h"
 
 #include <algorithm>
@@ -115,6 +117,7 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+	EmitBvhNodeReport(ctx.state);
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction({OpReturn});
 }
@@ -170,12 +173,15 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			if (term.loop_header && budget.variable != 0 &&
-			    (budget.pc == UINT32_MAX || budget.pc == info.start_pc)) {
+			const bool diagnostic = budget.variable != 0 && (budget.pc == UINT32_MAX || budget.pc == info.start_pc);
+			const bool rt_guard = ctx.state.bvh_node_count_variable != 0 && GetCodegenOptions().rt_node_budget != 0;
+			if (term.loop_header && (diagnostic || rt_guard)) {
 				// The CFG isolates semantic loop headers into a branch-only control node.
 				// Put the terminating selection inside the loop body; record the resume
 				// label as this block's PHI predecessor below.
-				const auto allowed = ConsumeLoopBudget(ctx.state, budget);
+				auto allowed = diagnostic ? ConsumeLoopBudget(ctx.state, budget) : ConstantBool(ctx.state, true);
+				if (rt_guard) allowed = EmitLogicalAndBool(ctx.state, allowed,
+				    EmitLogicalNotBool(ctx.state, BvhBudgetExhausted(ctx.state)));
 				const auto abort = ctx.state.builder.AllocateId();
 				const auto check = ctx.state.builder.AllocateId();
 				const auto resume = ctx.state.builder.AllocateId();
@@ -185,7 +191,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				ctx.state.builder.AddFunction({OpSelectionMerge, resume, SelectionControlNone});
 				ctx.state.builder.AddFunction({OpBranchConditional, allowed, resume, abort});
 				EmitLabel(ctx.state, abort);
-				ctx.state.builder.AddFunction({OpReturn});
+				EmitReturn(ctx);
 				EmitLabel(ctx.state, resume);
 				ctx.state.builder.AddFunction({OpBranch, ctx.Label(target)});
 				return;
@@ -399,6 +405,9 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		state.builder.AddFunction({OpLogicalNot, TypeBool(state), exhausted, allowed});
 		state.builder.AddFunction({OpLogicalOr, TypeBool(state), stop, done, exhausted});
 		done = stop;
+	}
+	if (state.bvh_node_count_variable != 0 && GetCodegenOptions().rt_node_budget != 0) {
+		done = EmitLogicalOrBool(state, done, BvhBudgetExhausted(state));
 	}
 	state.builder.AddFunction(
 	    {OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label, LoopControlNone});
@@ -690,6 +699,10 @@ void EmitProgram(EmitterState& state) {
 	}
 	ValueEmitContext ctx(state);
 	ValueEmitContext high(state);
+	if (IR::UsesBvhNodeCount(program)) {
+		state.bvh_node_count_variable = state.builder.AllocateId();
+		state.builder.AddName(state.bvh_node_count_variable, "bvh_node_count");
+	}
 	if (state.lane_count == 2) {
 		ctx.other_half  = &high;
 		high.other_half = &ctx;
@@ -765,6 +778,7 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DefineGetBdaPointer(state);
+	DefineBvhNodeTestFunction(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32 ||
@@ -782,6 +796,10 @@ void EmitProgram(EmitterState& state) {
 	                           state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                           FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
+	if (state.bvh_node_count_variable != 0) {
+		state.builder.AddFunction({OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)),
+		                           state.bvh_node_count_variable, StorageClassFunction, ConstantU32(state, 0)});
+	}
 	if (budget.variable != 0) {
 		state.builder.AddFunction({OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           budget.variable, StorageClassFunction, ConstantU32(state, 0)});

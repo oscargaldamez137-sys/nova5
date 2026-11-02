@@ -34,7 +34,8 @@ enum class ResourceKind {
 	Lds,
 	Gds,
 	Image,
-	Sampler
+	Sampler,
+	IndirectBuffer
 };
 
 [[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
@@ -496,6 +497,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool                             uses_bvh           = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

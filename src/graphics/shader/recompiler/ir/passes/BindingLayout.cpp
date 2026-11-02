@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -179,6 +180,16 @@ std::optional<uint32_t> ShaderBaseOffset(Value low, Value high) {
 
 } // namespace
 
+bool UsesBvhNodeCount(const Program& program) {
+	const auto& options = GetCodegenOptions();
+	if (options.rt_node_budget == 0 && !options.rt_node_stats) return false;
+	for (const auto* block: program.blocks) for (const auto& inst: *block) {
+		if (inst.GetOpcode() == ValueOpcode::BvhIntersectRay || inst.GetOpcode() == ValueOpcode::BvhIntersectRayStub)
+			return true;
+	}
+	return false;
+}
+
 void EnterTableMode(Program& program) {
 	const auto refuse = [&](const char* reason) {
 		EXIT("table mode refused: hash=0x%016" PRIx64 " %s\n", program.shader_hash, reason);
@@ -188,7 +199,7 @@ void EnterTableMode(Program& program) {
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
 	    (!program.dynamic_reads.empty() && program.stage != ShaderType::Compute))
 		refuse("no complete SRT plan");
-	if (UsesGds(program)) refuse("GDS");
+	if (UsesGds(program) || UsesBvhNodeCount(program)) refuse("GDS");
 	TablePlan plan;
 	plan.global_memory = program.info.uses_dma; // (table mode reads its block by device address in any case)
 	plan.dynamic_reads = !program.dynamic_reads.empty();
@@ -434,7 +445,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	if (UsesGds(program) || UsesBvhNodeCount(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (program.info.uses_dma) {

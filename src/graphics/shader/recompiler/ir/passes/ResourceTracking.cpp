@@ -2061,6 +2061,22 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
+			if (m_program.info.uses_bvh && buffer == BufferAccess::Read && !memory.typed && !memory.formatted) {
+				handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle != nullptr && handle->GetOpcode() == ValueOpcode::GetBufferResource &&
+				    handle->NumArgs() == 4) {
+					DescriptorSource descriptor;
+					MakeSource(*handle, 4, false, false, descriptor, flags.pc);
+					uint32_t bad_dword = 0;
+					std::string reason;
+					if (!ValidateSource(descriptor, bad_dword, reason)) {
+						m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+						m_program.memory_info[flags.index].resource = UINT32_MAX;
+						m_info.uses_dma = true;
+						return;
+					}
+				}
+			}
 			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {

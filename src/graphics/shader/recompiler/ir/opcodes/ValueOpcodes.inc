@@ -213,6 +213,10 @@ VALUE_OPCODE(LoadAddressU32, U32, AddressResource, U32, U32, U1)
 VALUE_OPCODE(StoreAddressU8, Void, AddressResource, U32, U32, U8, U1)
 VALUE_OPCODE(StoreAddressU16, Void, AddressResource, U32, U32, U16, U1)
 VALUE_OPCODE(StoreAddressU32, Void, AddressResource, U32, U32, U32, U1)
+// T# base, four T# words, node lo/hi, extent, origin, direction, inverse direction, EXEC.
+VALUE_OPCODE(BvhIntersectRay, U32x4, AddressResource, U32x4, U32, U32, U32, U32, U32, U32, U32,
+             U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(BvhIntersectRayStub, U32x4, U32)
 VALUE_OPCODE(LoadBufferU8, U8, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU16, U16, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU32, U32, BufferResource, U32, U32, U32, U1)

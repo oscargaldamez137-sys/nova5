@@ -54,6 +54,8 @@ public sealed class MainWindow : Window
 	private readonly StackPanel _stats = new() { Spacing = 0 };
 	private readonly Panel      _gamesPage = new();
 	private readonly StackPanel _settingsList = new() { Spacing = 6 };
+	private readonly StackPanel _settingsCategories = new() { Spacing = 4 };
+	private bool                _settingsOnCategories = true; // The pad is on the category column (left) or on its options (right).
 	private readonly ScrollViewer _settingsScroll = new() { HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
 	private readonly Panel      _settingsPage = new() { IsVisible = false };
 	private readonly StackPanel _notesList = new() { Spacing = 34 };
@@ -73,6 +75,12 @@ public sealed class MainWindow : Window
 	private double              _packProgress;
 	private string?             _confirmDelete;
 	private CancellationTokenSource? _packCancel;
+	private Game?                    _prepping;       // The game whose shaders are being prepared (one at a time).
+	private double                   _prepProgress;
+	private bool                     _prepReady;
+	private CancellationTokenSource? _prepCancel;
+	private readonly TextBlock  _prepText = Text("", 20, FontWeight.SemiBold, Palette.AuroraA);
+	private Border              _prepPill = new();
 	private readonly TextBlock  _packText = Text("", 20, FontWeight.SemiBold, Palette.AuroraA);
 	private Border              _packPill = new();
 	private (string Folder, string Archive)? _zarTest;
@@ -237,6 +245,13 @@ public sealed class MainWindow : Window
 		_packPill.Cursor      = new Cursor(StandardCursorType.Hand);
 		_packPill.PointerPressed += (_, _) => AskCancelPack();
 		status.Children.Add(_packPill);
+		// While a game's shaders are prepared: its progress; a click offers to cancel.
+		_prepPill = Pill(_prepText);
+		_prepPill.IsVisible   = false;
+		_prepPill.BorderBrush = Palette.Aurora();
+		_prepPill.Cursor      = new Cursor(StandardCursorType.Hand);
+		_prepPill.PointerPressed += (_, _) => AskCancelPrep();
+		status.Children.Add(_prepPill);
 		status.Children.Add(Pill(_padStatus));
 		status.Children.Add(_clock);
 		var statusDock = new DockPanel { Width = 1920 - 144, LastChildFill = false };
@@ -293,9 +308,19 @@ public sealed class MainWindow : Window
 		Place(_gamesPage, statsBox, 1920 - 72 - 440, 650);
 		stage.Children.Add(_gamesPage);
 
-		// Settings page: one panel whose list scrolls (pad, keys and wheel), like Nexo's options.
+		// Settings page: categories on the left (as in SharpEmu), the chosen one's options on the right, scrolling like Nexo's.
 		_settingsScroll.Content = _settingsList;
-		var settingsPanel = Sheet("Ajustes", "▲ ▼ elegir     A ▸ cambiar     ◂ valor anterior     B volver", _settingsScroll, () => ShowTab(0), "B  Volver");
+		var settingsBody = new Grid { ColumnDefinitions = new ColumnDefinitions("300,24,*") };
+		var categoriesBox = new Border
+		{
+			Child = _settingsCategories, Padding = new Thickness(10), CornerRadius = new CornerRadius(22),
+			Background = Palette.Brush(Colors.White, 0.04), VerticalAlignment = VerticalAlignment.Top,
+		};
+		Grid.SetColumn(categoriesBox, 0);
+		Grid.SetColumn(_settingsScroll, 2);
+		settingsBody.Children.Add(categoriesBox);
+		settingsBody.Children.Add(_settingsScroll);
+		var settingsPanel = Sheet("Ajustes", "▲ ▼ elegir     A entrar / cambiar     ◂ valor anterior     B volver", settingsBody, () => ShowTab(0), "B  Volver");
 		settingsPanel.Width  = 1320;
 		settingsPanel.Height = 790;
 		Place(_settingsPage, settingsPanel, (1920 - 1320) / 2.0, 186);
@@ -1069,23 +1094,41 @@ public sealed class MainWindow : Window
 		list.Add(new("Buscar parches de la comunidad",
 		    $"Descarga los parches publicados para la versión {game.Version} (colección HEN-Cheats-Collection en GitHub). Llegan desactivados.",
 		    () => _downloadingPatches ? "Buscando…" : "Buscar ›", _ => DownloadPatches(game)));
-		// This game's own settings ([<title id>] in Nova5.ini); "General" follows the general settings.
-		list.Add(Section("Ajustes de este juego"));
+		// This game's own settings ([<title id>] in Nova5.ini), in the general settings' sections; "General" follows those.
 		var id = game.TitleId;
+		list.Add(Section("Gráficos"));
 		list.Add(GameCycle(id, "Resolución", "Resolución a la que se dibuja este juego.", "screen_resolution", "R1920X1080",
 		    Resolutions.Select(r => (r, r.TrimStart('R').Replace('X', '×'))).ToArray()));
+		// Games with dynamic resolution (Astro Bot) pick it from the GPU time they measure; a smaller time lets them draw more.
+		list.Add(GameCycle(id, "Resolución dinámica", "Para juegos que bajan su resolución solos, como Astro Bot: más nítido dibuja más píxeles y puede bajar algo los FPS.",
+		    "gpu_time_scale", "100", ("100", "Normal"), ("75", "Más nítida"), ("50", "Mucho más nítida"), ("33", "Máxima")));
 		list.Add(GameCycle(id, "Frecuencia de pantalla", "120 o 144 Hz si este juego tiene modo de 120 Hz; 60 Hz si va acelerado.", "vblank_frequency", "60",
 		    RefreshRates.Select(hz => (hz.ToString(), $"{hz} Hz")).ToArray()));
 		list.Add(GameCycle(id, "Sincronización (VSync)", "Mailbox: fluido. VSync: sin cortes, algo más de retraso. Sin límite: el menor retraso.", "present_mode", "Mailbox",
 		    ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", "Sin límite")));
-		list.Add(GameToggle(id, "Pantalla completa", "Este juego se abre a pantalla completa o en una ventana.", "fullscreen_enabled", true));
 		list.Add(GameToggle(id, "HDR", "Imagen HDR si tu monitor y el juego lo admiten.", "hdr_enabled", false));
+		list.Add(GameToggle(id, "Pantalla completa", "Este juego se abre a pantalla completa o en una ventana.", "fullscreen_enabled", true));
 		list.Add(GameToggle(id, "Contador de FPS", "Muestra los FPS mientras juegas a este juego.", "perf_overlay_enabled", false));
 		list.Add(GameToggle(id, "Ocultar el cursor", "Oculta el puntero del ratón dentro de este juego.", "hide_cursor_enabled", false));
+		list.Add(Section("Mando"));
+		list.Add(GameCycle(id, "Vibración del mando", "Intensidad de la vibración en este juego (0 % la apaga).", "controller_vibration_intensity", "100",
+		    ("100", "100 %"), ("75", "75 %"), ("50", "50 %"), ("25", "25 %"), ("0", "Apagada")));
+		list.Add(GameCycle(id, "Altavoz del mando", "Volumen del altavoz del DualSense en este juego.", "controller_speaker_volume", "50",
+		    ("100", "100 %"), ("75", "75 %"), ("50", "50 %"), ("25", "25 %"), ("0", "Apagado")));
+		list.Add(GameCycle(id, "Color de la barra de luz", "Color de la luz del DualSense en este juego. Automático: el que pida el juego.", "controller_color", "",
+		    ("", "Automático"), ("#0050FF", "Azul"), ("#5EEAD4", "Aurora"), ("#8B5CF6", "Morado"), ("#FF2D55", "Rojo"), ("#30D158", "Verde"), ("#FFFFFF", "Blanco")));
+		list.Add(Section("Sistema"));
 		list.Add(GameCycle(id, "Idioma de la consola", "El idioma de textos y voces de este juego, si lo tiene.", "console_language", "1", ConsoleLanguages));
 		list.Add(GameToggle(id, "Saltar avisos de inicio", "Pide al juego que se salte los avisos del principio, si lo permite.", "skip_notice_screen", false));
+		list.Add(Section("Rendimiento"));
 		list.Add(GameToggle(id, "Caché de shaders", "Guarda los shaders de este juego para que cargue más rápido.", "shader_cache_enabled", true));
 		list.Add(GameToggle(id, "Compatibilidad de CPU", "Solo si este juego se cierra al arrancar en tu procesador.", "amd_cpu_enabled", false));
+		if (ShaderPrep.Available)
+		{
+			list.Add(new("Preparar shaders", "Compila por adelantado los shaders del juego para que no se trabe un momento en cada zona nueva. Rápido: lo más usado. Completo: todo el juego (horas; ideal de noche).",
+			    () => _prepping == game ? (_prepReady ? $"Listo para jugar · {_prepProgress * 100:0} %" : $"Preparando {_prepProgress * 100:0} %") : _prepping is not null ? "Espera…" : "Preparar ›",
+			    _ => { if (_prepping == game) AskCancelPrep(); else AskPrep(game); }));
+		}
 		// Options that only apply to this game.
 		if (game.TitleId == "PPSA01341")
 		{
@@ -1098,7 +1141,7 @@ public sealed class MainWindow : Window
 			DemonsSoulsToggle("Prioridad de dibujo", "Da más prioridad al hilo de dibujo. Experimental.", "ds_render_priority_enabled"),
 			});
 		}
-		list.Add(Section("Juego"));
+		list.Add(Section("Archivos del juego"));
 		// Additional content: what the emulator will load (installed DLC packages of this game).
 		var addons = Library.Addons(_emulator.GameDirs().Concat(_store.ExtraDirs), game.TitleId);
 		list.Add(addons.Count == 0
@@ -1250,6 +1293,85 @@ public sealed class MainWindow : Window
 			_packCancel = null;
 			if (_zone == Zone.GameOptions) BuildGameRows();
 		}
+	}
+
+	private void AskPrep(Game game)
+	{
+		if (_prepping is not null)
+		{
+			ShowToast($"Ya se están preparando los shaders de {_prepping.Name}");
+			return;
+		}
+		var option = _gameOption;
+		void Back()
+		{
+			if (_optionsGame != game) return;
+			ShowGameOptions(game);
+			_gameOption = option;
+			BuildGameRows();
+		}
+		ShowChoice("Preparar shaders", $"Nova5 compila ahora los shaders de {game.Name} para que no se trabe al llegar a zonas nuevas. Puedes seguir usando el PC; va con prioridad baja.", new()
+		{
+			new("Rápido", "Lo que ya has jugado y lo más usado del juego. Más o menos la mitad del tiempo.", () => "", _ => { Back(); PrepareShaders(game, quick: true); }),
+			new("Completo", "Todos los shaders del juego. Puede tardar horas la primera vez: ideal para dejarlo de noche.", () => "", _ => { Back(); PrepareShaders(game, quick: false); }),
+			new("Ahora no", "", () => "", _ => Back()),
+		});
+	}
+
+	private async void PrepareShaders(Game game, bool quick)
+	{
+		if (_prepping is not null) return;
+		_prepping     = game;
+		_prepProgress = 0;
+		_prepReady    = false;
+		_prepCancel   = new CancellationTokenSource();
+		_prepText.Text      = $"Shaders de {game.Name}: empezando…";
+		_prepPill.IsVisible = true;
+		if (_zone == Zone.GameOptions) BuildGameRows();
+		ShowToast($"Preparando los shaders de {game.Name}. Puedes seguir usando Nova5; no lo cierres hasta que termine.");
+		var started = DateTime.UtcNow;
+		try
+		{
+			var progress = new Progress<(double Done, bool Ready)>(p =>
+			{
+				if (p.Done >= 0) _prepProgress = p.Done;
+				_prepReady = p.Ready;
+				var elapsed = DateTime.UtcNow - started;
+				var left    = _prepProgress > 0.03 ? TimeSpan.FromSeconds(elapsed.TotalSeconds * (1 - _prepProgress) / _prepProgress) : (TimeSpan?)null;
+				_prepText.Text = $"Shaders de {game.Name}: {_prepProgress * 100:0} %" + (_prepReady ? " · ya se puede jugar" : "") +
+				                 (left is { } l ? $" · quedan {(l.TotalHours >= 1 ? $"{l.TotalHours:0.#} h" : $"{Math.Max(1, Math.Round(l.TotalMinutes))} min")}" : "");
+				if (_zone == Zone.GameOptions && _optionsGame == game) BuildGameRows();
+			});
+			ShowToast(await ShaderPrep.RunAsync(game, quick, progress, _prepCancel.Token)
+			    ? $"Shaders de {game.Name} preparados: ya no debería trabarse al llegar a zonas nuevas"
+			    : $"{game.Name} no tiene shaders que preparar por adelantado: los compila el juego al usarlos");
+		}
+		catch (OperationCanceledException)
+		{
+			ShowToast("Preparación de shaders cancelada; lo ya preparado se conserva");
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+		{
+			ShowToast("No se pudieron preparar los shaders: " + e.Message);
+		}
+		finally
+		{
+			_prepping = null;
+			_prepPill.IsVisible = false;
+			_prepCancel?.Dispose();
+			_prepCancel = null;
+			if (_zone == Zone.GameOptions) BuildGameRows();
+		}
+	}
+
+	private void AskCancelPrep()
+	{
+		if (_prepping is not { } game || _zone is Zone.Choice or Zone.TextEntry) return;
+		ShowChoice("¿Cancelar la preparación de shaders?", $"Se están preparando los shaders de {game.Name} ({_prepProgress * 100:0} %). Lo ya preparado se conserva y la próxima vez sigue desde ahí.", new()
+		{
+			new("Seguir preparando", "", () => "", _ => { }),
+			new("Cancelar", "", () => "", _ => _prepCancel?.Cancel()),
+		});
 	}
 
 	private void AskCancelPack()
@@ -1950,6 +2072,7 @@ public sealed class MainWindow : Window
 		if (tab == SettingsTab)
 		{
 			_zone = Zone.Settings;
+			_settingsOnCategories = true;
 			BuildSettings();
 		}
 		else if (tab == TrophiesTab)
@@ -1994,7 +2117,7 @@ public sealed class MainWindow : Window
 			_store.UpdateMode = modes[(Math.Max(Array.IndexOf(modes, _store.UpdateMode), 0) + step + modes.Length) % modes.Length];
 			_store.Save();
 		}),
-		Section("Pantalla"),
+		Section("Gráficos"),
 		Toggle("Pantalla completa al jugar", "Los juegos se abren a pantalla completa; si no, en una ventana.", "fullscreen_enabled", true),
 		new("Resolución", "Resolución a la que se dibujan los juegos. Elige la de tu monitor para que se vean nítidos; más alta exige más a la gráfica.",
 		    () => _emulator.Ini.Get("GlobalConfiguration", "screen_resolution")?.TrimStart('R').Replace('X', '×') ?? "1920×1080",
@@ -2016,7 +2139,7 @@ public sealed class MainWindow : Window
 		Toggle("HDR", "Imagen HDR si tu monitor y el juego lo admiten.", "hdr_enabled", false),
 		Toggle("Contador de FPS en pantalla", "Muestra los FPS y el uso de la gráfica y el procesador mientras juegas.", "perf_overlay_enabled", false),
 		Toggle("Ocultar el cursor", "Oculta el puntero del ratón dentro del juego.", "hide_cursor_enabled", false),
-		Section("Juego"),
+		Section("Sistema"),
 		new("Nombre de usuario", "El nombre que ven los juegos, por ejemplo al guardar o en los marcadores. Se escribe con el teclado.",
 		    () => _emulator.Ini.Get("GlobalConfiguration", "user_name") is { Length: > 0 } name ? name : "Nova5",
 		    _ => AskText("Nombre de usuario", _emulator.Ini.Get("GlobalConfiguration", "user_name") ?? "Nova5", value => SetIni("user_name", value))),
@@ -2112,33 +2235,74 @@ public sealed class MainWindow : Window
 	}
 
 	// Each option: its name and what it does on the left, its value in a pill on the right (filled when on).
+	// The section titles of Settings(), each a category; the options of one run up to the next title.
+	private static List<int> Categories(List<Setting> settings) =>
+	    Enumerable.Range(0, settings.Count).Where(i => settings[i].Header).ToList();
+
+	private static (int Header, int End) CategoryOf(List<Setting> settings, int index)
+	{
+		var headers = Categories(settings);
+		var header  = headers.LastOrDefault(h => h <= index);
+		var end     = headers.FirstOrDefault(h => h > header, settings.Count);
+		return (header, end);
+	}
+
 	private void BuildSettings(bool reveal = false)
 	{
-		_settingsList.Children.Clear();
 		var settings = Settings();
 		_setting = Math.Clamp(_setting, 0, settings.Count - 1);
 		while (settings[_setting].Header && _setting < settings.Count - 1) _setting++;
-		for (var i = 0; i < settings.Count; i++)
+		var (category, end) = CategoryOf(settings, _setting);
+
+		_settingsCategories.Children.Clear();
+		foreach (var header in Categories(settings))
+		{
+			var first = header + 1;
+			var chosen = header == category;
+			var label = new TextBlock
+			{
+				Text = settings[header].Label, FontSize = 23, FontWeight = chosen ? FontWeight.Bold : FontWeight.SemiBold,
+				Foreground = Palette.Brush(chosen ? Palette.Text : Palette.Muted),
+			};
+			var item = new Border
+			{
+				Child = label, Padding = new Thickness(22, 14), CornerRadius = new CornerRadius(16),
+				Background = chosen ? Palette.Brush(Colors.White, _settingsOnCategories ? 0.10 : 0.06) : Brushes.Transparent,
+				BorderBrush = chosen && _settingsOnCategories ? Palette.Aurora() : Brushes.Transparent, BorderThickness = new Thickness(2),
+				Cursor = new Cursor(StandardCursorType.Hand),
+			};
+			item.PointerPressed += (_, _) =>
+			{
+				if (_zone != Zone.Settings) return;
+				_setting = first;
+				_settingsOnCategories = true;
+				_settingsScroll.Offset = default;
+				BuildSettings();
+			};
+			_settingsCategories.Children.Add(item);
+		}
+
+		_settingsList.Children.Clear();
+		_settingsList.Children.Add(SectionTitle(settings[category].Label));
+		Control? focusedRow = null;
+		for (var i = category + 1; i < end; i++)
 		{
 			var index = i;
-			if (settings[i].Header)
-			{
-				_settingsList.Children.Add(SectionTitle(settings[i].Label));
-				continue;
-			}
-			_settingsList.Children.Add(OptionRow(settings[i], i == _setting, step =>
+			var row = OptionRow(settings[i], i == _setting && !_settingsOnCategories, step =>
 			{
 				if (_zone != Zone.Settings) return;
 				_setting = index;
+				_settingsOnCategories = false;
 				Settings()[index].Change(step);
 				if (_zone == Zone.Settings && _tab == SettingsTab) BuildSettings();
-			}));
+			});
+			if (i == _setting) focusedRow = row;
+			_settingsList.Children.Add(row);
 		}
 		// With the pad or the keys, the chosen row always stays in view.
-		if (reveal && _settingsList.Children[_setting] is Control chosen)
-			Dispatcher.UIThread.Post(() => chosen.BringIntoView(), DispatcherPriority.Loaded);
+		if (reveal && !_settingsOnCategories && focusedRow is not null)
+			Dispatcher.UIThread.Post(() => focusedRow.BringIntoView(), DispatcherPriority.Loaded);
 	}
-
 	// One option row: its name and what it does on the left, its value in a pill on the right (filled when on).
 	// A left click passes +1 (next value), a right click -1.
 	private static Border OptionRow(Setting setting, bool focused, Action<int> click)
@@ -2189,20 +2353,37 @@ public sealed class MainWindow : Window
 		Foreground = Palette.Brush(Palette.AuroraA), Margin = new Thickness(26, 18, 0, 2),
 	};
 
+	// On the categories: up and down pick one, A or right enters its options. On the options: up and down move inside
+	// the category, A or right changes the value, left takes the previous one, B goes back to the categories.
 	private void SettingsInput(PadInput input)
 	{
 		var settings = Settings();
-		switch (input)
+		var headers  = Categories(settings);
+		var (category, end) = CategoryOf(settings, _setting);
+		if (_settingsOnCategories)
 		{
-			case PadInput.Up:    _setting = Step(settings, _setting, -1); break;
-			case PadInput.Down:  _setting = Step(settings, _setting, 1); break;
-			case PadInput.Left:  settings[_setting].Change(-1); break;
-			case PadInput.Right or PadInput.Accept: settings[_setting].Change(1); break;
-			case PadInput.Back:  ShowTab(0); return;
+			var at = headers.IndexOf(category);
+			switch (input)
+			{
+				case PadInput.Up when at > 0: _setting = headers[at - 1] + 1; _settingsScroll.Offset = default; break;
+				case PadInput.Down when at < headers.Count - 1: _setting = headers[at + 1] + 1; _settingsScroll.Offset = default; break;
+				case PadInput.Right or PadInput.Accept: _settingsOnCategories = false; break;
+				case PadInput.Back: ShowTab(0); return;
+			}
+		}
+		else
+		{
+			switch (input)
+			{
+				case PadInput.Up:    if (Step(settings, _setting, -1) is var up && up > category) _setting = up; break;
+				case PadInput.Down:  if (Step(settings, _setting, 1) is var down && down < end) _setting = down; break;
+				case PadInput.Left:  settings[_setting].Change(-1); break;
+				case PadInput.Right or PadInput.Accept: settings[_setting].Change(1); break;
+				case PadInput.Back:  _settingsOnCategories = true; break;
+			}
 		}
 		if (_zone == Zone.Settings) BuildSettings(reveal: true);
 	}
-
 	private async void AddFolder()
 	{
 		var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { Title = "Carpeta con tus juegos de PS5", AllowMultiple = false });

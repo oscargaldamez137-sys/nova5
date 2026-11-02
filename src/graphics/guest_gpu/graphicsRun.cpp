@@ -578,7 +578,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto value = Sync::ReadReferenceClock();
+	const auto value = GuestClock::AdjustTimestamp(Sync::ReadReferenceClock());
 	m_renderer.GetGuestClock().Cancel(dst_address, num_bytes);
 	WriteGuestMemory(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
@@ -1310,6 +1310,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 
 bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CheckBuffer();
+	if (args.index_count != 0) m_renderer.GetResolutionTrace().Observe(m_ctx, std::max(args.gpu_args_count, 1u));
 
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -1436,13 +1437,16 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	if (clean && executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
 	                                    uint64_t {m_index_buffer_size} * element,
 	                                    m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
-	                                    nullptr))
+	                                    nullptr)) {
+		m_renderer.GetResolutionTrace().Observe(m_ctx, count);
 		return count * 5u;
+	}
 	// On refusal NativeXprTry has asked the normal path to store when that helps.
 	if (!executor.NativeXprTry(CurrentBuffer(), clean, {commands.data(), count}, m_index_base_addr,
 	                           uint64_t {m_index_buffer_size} * element,
 	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32))
 		return 0;
+	m_renderer.GetResolutionTrace().Observe(m_ctx, count);
 	return count * 5u;
 #else
 	(void)packets;
@@ -1478,11 +1482,14 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 	const auto     index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 	if (DrawStateObserver::g_shadow.last_clean &&
 	    executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
-	                           uint64_t {m_index_buffer_size} * element, index_type, nullptr))
+	                           uint64_t {m_index_buffer_size} * element, index_type, nullptr)) {
+		m_renderer.GetResolutionTrace().Observe(m_ctx, count);
 		return 10;
+	}
 	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {commands.data(), count},
 	                           m_index_base_addr, uint64_t {m_index_buffer_size} * element, index_type))
 		return 0;
+	m_renderer.GetResolutionTrace().Observe(m_ctx, count);
 	return 10;
 #else
 	(void)packet;
@@ -1527,12 +1534,15 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, NumInstances()};
 	const auto index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
 	if (DrawStateObserver::g_shadow.last_clean &&
-	    executor.TableContinue(CurrentBuffer(), {}, index_address, uint64_t {index_count} * element, index_type, &draw))
+	    executor.TableContinue(CurrentBuffer(), {}, index_address, uint64_t {index_count} * element, index_type, &draw)) {
+		m_renderer.GetResolutionTrace().Observe(m_ctx);
 		return size;
+	}
 	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, index_address,
 	                           uint64_t {index_count} * element,
 	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
 		return 0;
+	m_renderer.GetResolutionTrace().Observe(m_ctx);
 	return size;
 #else
 	(void)packet;
@@ -1571,9 +1581,10 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 		else if (HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) scaled.emplace(m_ctx, m_sh_ctx.GetPs());
 	}
 	const RenderExecutor::NativeXprDirectDraw draw {0, packet[1], NumInstances(), false};
-	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
-	           ? 3u
-	           : 0u;
+	if (!m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw))
+		return 0;
+	m_renderer.GetResolutionTrace().Observe(m_ctx);
+	return 3u;
 #else
 	(void)packet;
 	return 0;
@@ -1641,6 +1652,7 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 	                                                    {argument_addresses.data(), count})) {
 		return 0;
 	}
+	m_renderer.GetResolutionTrace().Observe(m_ctx, active);
 	m_pending_instances_address = 0;
 	m_num_instances = last_instances;
 	m_draw_run_skip = 0;
@@ -1896,6 +1908,7 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
 
 bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	CheckBuffer();
+	if (args.vertex_count != 0) m_renderer.GetResolutionTrace().Observe(m_ctx, std::max(args.gpu_args_count, 1u));
 
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -2153,10 +2166,11 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					    });
 					return;
 				}
-				const auto clock = Sync::ReadReferenceClock();
+				const auto clock = GuestClock::AdjustTimestamp(Sync::ReadReferenceClock());
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
 				m_renderer.GetGuestClock().Cancel(reinterpret_cast<uint64_t>(dst), sizeof(clock));
 				WriteGuestMemory(dst, &clock, sizeof(clock));
+				m_renderer.GetGuestClock().TraceCpuWrite(reinterpret_cast<uint64_t>(dst));
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -2370,6 +2384,8 @@ void CommandProcessor::Flip() {
 	}
 
 	auto& command = CurrentBuffer();
+	m_renderer.GetResolutionTrace().OnFlip();
+	m_renderer.GetGuestClock().TraceFrame();
 	HudAnchor::NoteFlip();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -2391,6 +2407,8 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
+	m_renderer.GetResolutionTrace().OnFlip();
+	m_renderer.GetGuestClock().TraceFrame();
 	HudAnchor::NoteFlip();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -2419,6 +2437,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	}
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
+	m_renderer.GetResolutionTrace().OnFlip();
+	m_renderer.GetGuestClock().TraceFrame();
 	HudAnchor::NoteFlip();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -2441,6 +2461,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	LiveTrace::Event(LiveTrace::FlipSubmit, request_id, 1);
+	m_renderer.GetResolutionTrace().OnFlip();
+	m_renderer.GetGuestClock().TraceFrame();
 	HudAnchor::NoteFlip();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 	GetScheduler().Flush();

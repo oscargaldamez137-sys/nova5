@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 #include "graphics/host_gpu/renderer/guestClock.h"
+#include "graphics/host_gpu/renderer/resolutionTrace.h"
 
 #include <memory>
 #include <vector>
@@ -104,6 +105,7 @@ public:
 	RenderMutex&        GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	GuestClock&         GetGuestClock() { return m_guest_clock; }
+	ResolutionTrace&    GetResolutionTrace() { return m_resolution_trace; }
 	bool HasGpu() const { return m_gpu != nullptr; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
@@ -129,6 +131,7 @@ private:
 	GraphicContext&           m_graphics;
 	RenderMutex               m_mutex;
 	GuestClock                m_guest_clock;
+	ResolutionTrace           m_resolution_trace;
 	RenderExecutor            m_render_executor;
 	RenderExecutor            m_compute_render_executor;
 	CommandScheduler          m_command_scheduler;

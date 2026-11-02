@@ -251,6 +251,8 @@ private:
 	bool EmitVector(const Decoder::Instruction& inst);
 	bool EmitInterpolation(const Decoder::Instruction& inst);
 	bool EmitMemory(const Decoder::Instruction& inst);
+	IR::U32 ReadBvhAddress(const Decoder::Instruction& inst, uint32_t index);
+	bool IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
 
 	IR::Program&    program;
 	IR::IREmitter   ir;

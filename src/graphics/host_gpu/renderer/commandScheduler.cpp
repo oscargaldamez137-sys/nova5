@@ -14,6 +14,7 @@
 #include "device-fault.h"
 #endif
 #include "live-trace-gpu.h"
+#include "live-counters.h"
 #include "local-platform.h"
 
 #include <algorithm>
@@ -34,8 +35,11 @@ volatile std::atomic_uint32_t kyty_local_draw_batch {256};
 //    operation lock. Draws and dispatches call this with nothing to retire.
 volatile std::atomic<uint32_t> kyty_local_pending_drain_mode {1};
 // Flush points nothing waits on (a label without an interrupt, the end of a queue's slice) leave the open buffer open
-// while the GPU still runs work it was handed (CommandScheduler::DeferrableFlush; KYTY_FLUSH_DEFER=0: flush at once).
+// while the GPU still runs work it was handed (CommandScheduler::DeferrableFlush; KYTY_FLUSH_DEFER=0 disables this
+// backlog policy; KYTY_FLUSH_MIN_WORK is an independent, opt-in floor).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_defer {2};
+// Opt-in minimum work at optional flush points (draw = 1, dispatch = 4). Zero keeps the old policy.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_min_work {0};
 }
 
 namespace Libs::Graphics {
@@ -274,11 +278,28 @@ bool CommandScheduler::GpuBusy() {
 // (Ended as a submission ends it: the render pass and a compute chain's pending barrier, so the commands after it are
 // recorded as they would be into the next buffer.)
 void CommandScheduler::DeferrableFlush() {
+	LiveCounters::Add(LiveCounters::OptionalFlushRequests);
+	// Sky Garden submits hundreds of very short buffers per frame. The backlog-only policy
+	// submits each optional boundary again as soon as those buffers drain. Allow a small
+	// amount of work to accumulate even then. Eight requests bound a run of labels/slices
+	// without draws; mandatory flushes and the CP's idle/blocked drains still submit at once.
+	const auto minimum = kyty_local_flush_min_work.load(std::memory_order_relaxed);
+	const bool below_minimum = minimum != 0 && m_recorded_work < minimum;
+	if (below_minimum && m_small_flush_requests < 8) ++m_small_flush_requests;
+	const bool defer = below_minimum && m_small_flush_requests < 8; // (not "small": a macro of the Windows headers)
+	if (defer && !m_command.IsInvalid()) {
+		m_command.EndRendering();
+		(void)m_command.Handle(); // Preserve the compute-chain barrier at the original boundary.
+		m_flush_deferred = true;
+		LiveCounters::Add(LiveCounters::SmallFlushDeferrals);
+		return;
+	}
 	if (const auto backlog = kyty_local_flush_defer.load(std::memory_order_relaxed);
 	    backlog != 0 && !m_command.IsInvalid() && BacklogAtLeast(backlog)) {
 		m_command.EndRendering();
 		(void)m_command.Handle();
 		m_flush_deferred = true;
+		LiveCounters::Add(LiveCounters::BacklogFlushDeferrals);
 		return;
 	}
 	Flush();
@@ -289,11 +310,14 @@ void CommandScheduler::FlushDeferred() {
 }
 
 // While a flush is deferred, every 16 draws (or 4 dispatches: `weight`) whether the GPU is down to its last submission:
-// then the open buffer is submitted (true).
+// then the open buffer is submitted (true), subject to the opt-in minimum work floor.
 bool CommandScheduler::FlushedDeferred(uint32_t weight) {
+	m_recorded_work += weight;
 	if (!m_flush_deferred) return false;
 	if ((m_deferred_checks += weight) < 16) return false;
 	m_deferred_checks = 0;
+	if (m_recorded_work < kyty_local_flush_min_work.load(std::memory_order_relaxed) &&
+	    m_small_flush_requests < 8) return false;
 	if (BacklogAtLeast(2)) return false;
 	Flush();
 	return true;
@@ -709,14 +733,18 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (!m_prologue.IsInvalid()) entries[n++] = ClosePrologue();
 	entries[n++]          = {m_command.m_buffer, m_command.m_timestamp_slot};
 	const auto tick       = SubmitBuffers({entries.data(), n}, submit);
-	m_command.m_buffer    = nullptr;
-	m_recorded_dispatches = 0;
-	m_recorded_draws      = 0;
-	m_flush_deferred      = false;
+	LiveTrace::Event(LiveTrace::SubmitWork, tick, m_recorded_work);
+	m_command.m_buffer     = nullptr;
+	m_recorded_dispatches  = 0;
+	m_recorded_draws       = 0;
+	m_recorded_work        = 0;
+	m_small_flush_requests = 0;
+	m_flush_deferred       = false;
 	return tick;
 }
 
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+	LiveCounters::Add(LiveCounters::SchedulerSubmits);
 	// The work may run once submitted: the pages it writes are read-protected first.
 	PageManager::FlushDeferredProtection();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||

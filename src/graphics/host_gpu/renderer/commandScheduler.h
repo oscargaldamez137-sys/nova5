@@ -35,7 +35,7 @@ public:
 	void           CompleteDispatch();
 	// Finish `draws` complete draws; may submit (KYTY_DRAW_BATCH), but never waits for the GPU.
 	void           CompleteDraws(uint32_t draws);
-	// A flush nothing waits on: deferred while the GPU has KYTY_FLUSH_DEFER submissions to run.
+	// A flush nothing waits on: deferred by the backlog or opt-in KYTY_FLUSH_MIN_WORK policy.
 	void           DeferrableFlush();
 	// The deferred flush, if one is pending (before the GPU thread waits for work).
 	void           FlushDeferred();
@@ -142,6 +142,8 @@ private:
 	uint32_t                     m_recorded_draws      = 0;
 	bool                         m_flush_deferred      = false; // DeferrableFlush left the open buffer open
 	uint32_t                     m_deferred_checks     = 0;
+	uint64_t                     m_recorded_work       = 0; // completed draws + 4 * dispatches this tick
+	uint32_t                     m_small_flush_requests = 0; // bounds optional small-work deferrals
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};
 	std::queue<PendingOperation> m_pending_operations;

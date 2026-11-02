@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "resource-plan-serial.h"
@@ -532,10 +533,12 @@ struct PipelineCache::ProgramCache {
 	}
 	size_t reuse_bytes = 0;
 	uint64_t reuse_calls = 0, reuse_hits = 0, reuse_misses = 0, reuse_bypass = 0, reuse_checks = 0, reuse_uncertified = 0;
+	// Off by default (KYTY_RESOURCE_REUSE=1 turns it on): in Astro Bot's Sky Garden it hit 5 % of calls and every miss
+	// paid the certificate's full evaluation besides the guarded one; off ran 18.5 FPS against 17.4 (A-B-B-A, 60 s each).
 	static int ResourceReuseMode() {
 		static const int mode = [] {
 			const char* value = std::getenv("KYTY_RESOURCE_REUSE");
-			return value ? std::atoi(value) : 1;
+			return value ? std::atoi(value) : 0;
 		}();
 		return mode;
 	}
@@ -1029,6 +1032,7 @@ struct PipelineCache::ProgramCache {
 		}
 		auto key = fmt::format("{}|{}|features {}|subgroup {}", identity, build,
 		                       ShaderRecompiler::Frontend::TranslatorFeatureSet(), host_subgroup_size);
+		key += fmt::format("|rt-v2 {}", ShaderRecompiler::RtCodegenFingerprint());
 		for (const char* name: {"KYTY_LANE_LOCAL", "KYTY_PS_WAVE_OR", "KYTY_PS_WAVE64", "KYTY_COMPUTE_WAVE64"}) {
 			const char* value = std::getenv(name);
 			key += fmt::format("|{}={}", name, value != nullptr ? value : "");

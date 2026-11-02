@@ -45,6 +45,7 @@ enum Type : uint32_t {
 	RbEnqueue     = 38, // a readback copy for the copy engine (ReadbackQueue::Copy): a: its value, b: graphics tick it waits for
 	RbSubmit      = 39, // that copy handed to the driver (recording worker or GPU thread): a: its value
 	GpuMarkCaller = 40, // follows GpuMark of a barrier: a: mark slot, b: return address of the code that recorded it
+	SubmitWork    = 41, // a: scheduler tick, b: completed draws + 4 * dispatches (zero may still have copies/barriers)
 };
 
 // SlowOsCall ids: address-space calls that hold the process's memory locks (a page fault anywhere
